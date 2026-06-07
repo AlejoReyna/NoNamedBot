@@ -234,6 +234,64 @@ def test_scalping_consecutive_loss_cooldown() -> None:
     assert guardrails.check_consecutive_loss_cooldown() is True
 
 
+def test_scalping_evaluate_universe_rejects_pengu_without_verified_contract() -> None:
+    settings = _settings()
+    cache = PriceCache()
+    engine = ScalpingEngine(settings, cache)
+    candidate = engine.evaluate_universe(
+        {
+            "PENGU": _token_payload(
+                price=0.05,
+                market_cap=500_000_000.0,
+                volume_24h=20_000_000.0,
+            )
+        },
+        10_000.0,
+        _regime(),
+        _risk_decision(),
+        sentiment_result=_sentiment(gas_price_gwei=1.0),
+    )
+    assert candidate is None
+
+
+def test_scalping_evaluate_universe_accepts_trx_with_verified_contract() -> None:
+    settings = _settings()
+    cache = PriceCache()
+    _seed_price_cache(cache, "TRX", price=0.12, volume=200_000.0)
+    engine = ScalpingEngine(settings, cache)
+    candidate = engine.evaluate_universe(
+        {
+            "TRX": _token_payload(
+                price=0.12,
+                market_cap=55_000_000.0,
+                volume_24h=6_000_000.0,
+            )
+        },
+        10_000.0,
+        _regime(),
+        _risk_decision(),
+        sentiment_result=_sentiment(gas_price_gwei=1.0),
+    )
+    assert candidate is not None
+    assert candidate.symbol == "TRX"
+
+
+def test_scalping_evaluate_universe_accepts_cake_with_verified_contract() -> None:
+    settings = _settings()
+    cache = PriceCache()
+    _seed_price_cache(cache, "CAKE", price=10.0, volume=200_000.0)
+    engine = ScalpingEngine(settings, cache)
+    candidate = engine.evaluate_universe(
+        {"CAKE": _token_payload()},
+        10_000.0,
+        _regime(),
+        _risk_decision(),
+        sentiment_result=_sentiment(gas_price_gwei=1.0),
+    )
+    assert candidate is not None
+    assert candidate.symbol == "CAKE"
+
+
 def test_scalping_micro_momentum_uses_volume_24h_proxy_with_realistic_threshold() -> None:
     settings = _settings()
     cache = PriceCache()

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from src.config.settings import Settings
-from src.config.tokens import has_bsc_contract, is_liquid, is_tradable_symbol
+from src.config.tokens import has_verified_bsc_contract, is_liquid, is_tradable_symbol
 from src.execution.twak_interface import TWAKInterface
 from src.strategy.candidate_adapter import decimal_div, first_market_number, maybe_number
 from src.strategy.entry_types import EntryCandidate
@@ -246,7 +246,7 @@ class ScalpingEngine:
         risk_decision: RiskDecision,
         sentiment_result: SentimentResult | None,
     ) -> EntryCandidate | None:
-        if not is_tradable_symbol(symbol) or not has_bsc_contract(symbol) or not is_liquid(data):
+        if not is_tradable_symbol(symbol) or not has_verified_bsc_contract(symbol) or not is_liquid(data):
             return None
         price = maybe_number(data.get("price"))
         if price is None or price <= 0:

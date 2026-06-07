@@ -192,7 +192,7 @@ TOKEN_CONTRACTS_BSC: dict[str, str] = {
     "LINK": "0xF8A0BF9cF54Bb92F17374d9e9A321E6a111a51bD",
     "AAVE": "0xfb6115445Bff7b52FeB98650C87f44907E58f802",
     "UNI": "0xBf5140A22578168FD562DCcF235E5D43A02ce9B1",
-    "INJ": "0xa2B726B1145A4773F68593CF171187d8EBe4d495",
+    "INJ": "0xa2B726B114b60ceCcb8aF0bC6F6602c51928564c",
     "SHIB": "0x2859e4544C4bB03966803b044A93563Bd2D0DD4D",
     "DOGE": "0xbA2aE424d960c26247Dd6c32edC70B295c744C43",
     "BONK": "0xa697e272a73744b343528c3bc4702f2565b2f422",
@@ -205,6 +205,9 @@ TOKEN_CONTRACTS_BSC: dict[str, str] = {
     "LTC": "0x4338665CBB7B2485A8855A139b75D5e34AB0DB94",
     "ATOM": "0x0Eb3a705fc54725037CC9e008bDede697f62F335",
     "FIL": "0x0D8Ce2A99Bb6e3B7Db580ED848240e4a0F9aE153",
+    "TRX": "0x85EAC5Ac2F758618dFa09bDbe0cf174e7d574D5B",
+    "TON": "0x76A797A59bA2C17726896976B7B3747bfD1d220f",
+    "AVAX": "0x1CE0c2827e2eF14D5C4f29a091d735A204794041",
 }
 
 # TWAK/LiquidMesh token identifiers (symbols resolved to BSC contract addresses).
@@ -235,6 +238,9 @@ CMC_IDS_BY_SYMBOL: dict[str, str] = {
     "LTC": "2",
     "ATOM": "3794",
     "FIL": "2280",
+    "TRX": "1958",
+    "TON": "11419",
+    "AVAX": "5805",
 }
 
 LIQUIDITY_BLACKLIST: set[str] = {
@@ -308,6 +314,13 @@ def has_bsc_contract(symbol: str) -> bool:
     if normalized in TOKEN_CONTRACTS_BSC or normalized == "BNB":
         return True
     return is_tradable_symbol(normalized)
+
+
+def has_verified_bsc_contract(symbol: str) -> bool:
+    """Return True only when a verified BEP-20 address exists for live TWAK execution."""
+
+    normalized = symbol.strip().upper()
+    return normalized in TOKEN_CONTRACTS_BSC or normalized == "BNB"
 
 
 def resolve_twak_token(symbol: str) -> str:

@@ -27,7 +27,7 @@ from src.config.settings import Settings, load_settings
 from src.config.tokens import (
     TARGET_SYMBOLS,
     TRADABLE_TARGET_SYMBOLS,
-    has_bsc_contract,
+    has_verified_bsc_contract,
     is_liquid,
     is_tradable_symbol,
 )
@@ -867,7 +867,7 @@ def _minimum_trade_candidate(
         if decision.symbol is not None and normalized != decision.symbol.upper():
             continue
         payload = {"symbol": normalized, **data}
-        if not is_tradable_symbol(normalized) or not has_bsc_contract(normalized) or not is_liquid(payload):
+        if not is_tradable_symbol(normalized) or not has_verified_bsc_contract(normalized) or not is_liquid(payload):
             continue
         price = _maybe_number(payload.get("price"))
         if price is None or price <= 0:
@@ -1526,7 +1526,7 @@ def _reconstruct_positions_from_balances(
 
     reconstructed = 0
     for symbol in TRADABLE_TARGET_SYMBOLS:
-        if not has_bsc_contract(symbol):
+        if not has_verified_bsc_contract(symbol):
             continue
         balance_response = toolkit.get_balance(symbol)
         amount_tokens = _extract_symbol_balance(balance_response, symbol)

@@ -13,6 +13,7 @@ from src.config.tokens import (
     TOKEN_CONTRACTS_BSC,
     TRADABLE_TARGET_SYMBOLS,
     has_bsc_contract,
+    has_verified_bsc_contract,
 )
 from src.execution import bnb_toolkit_wrapper as wrapper_module
 from src.execution.bnb_toolkit_wrapper import BnbToolkitWrapper
@@ -131,7 +132,18 @@ def test_configured_contracts_belong_to_target_universe() -> None:
 def test_hackathon_tradable_symbols_count_as_bsc_even_without_static_address() -> None:
     assert has_bsc_contract("PENGU") is True
     assert has_bsc_contract("CAKE") is True
-    assert has_bsc_contract("USDC") is False
+    assert has_verified_bsc_contract("PENGU") is False
+
+
+def test_verified_bsc_contract_requires_static_address() -> None:
+    assert has_verified_bsc_contract("CAKE") is True
+    assert has_verified_bsc_contract("LTC") is True
+    assert has_verified_bsc_contract("BNB") is True
+    assert has_verified_bsc_contract("TRX") is True
+    assert has_verified_bsc_contract("TON") is True
+    assert has_verified_bsc_contract("AVAX") is True
+    assert has_verified_bsc_contract("U") is False
+    assert has_verified_bsc_contract("PENGU") is False
 
 
 def test_stables_remain_available_but_not_directionally_tradable() -> None:
