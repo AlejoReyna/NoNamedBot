@@ -41,10 +41,14 @@ def breakout_decision_to_candidate(
     portfolio_value: float,
     settings: Settings,
     risk_decision: RiskDecision,
+    *,
+    for_telemetry: bool = False,
 ) -> EntryCandidate | None:
     """Convert a BreakoutDecision into an EntryCandidate when signal is present."""
 
-    if not decision.should_enter or decision.symbol is None:
+    if decision.symbol is None:
+        return None
+    if not for_telemetry and not decision.should_enter:
         return None
     symbol = decision.symbol.upper()
     token_data = market_snapshot.get(symbol, {})
@@ -54,6 +58,8 @@ def breakout_decision_to_candidate(
     position_size = decision.position_size_usdc
     if position_size <= 0:
         position_size = portfolio_value * settings.max_position_pct * risk_decision.position_multiplier
+    if for_telemetry and not decision.should_enter:
+        position_size = 0.0
     slippage_normal = decision.estimated_slippage_pct
     slippage_small = maybe_number(token_data.get("estimated_slippage_small_pct"))
     if slippage_small is None and slippage_normal is not None:

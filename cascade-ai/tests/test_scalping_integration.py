@@ -232,3 +232,22 @@ def test_scalping_consecutive_loss_cooldown() -> None:
             exit_reason="sl",
         )
     assert guardrails.check_consecutive_loss_cooldown() is True
+
+
+def test_scalping_best_near_miss_returns_scored_symbol_when_entry_threshold_not_met() -> None:
+    settings = _settings(scalping_entry_score_min=60.0)
+    cache = PriceCache()
+    _seed_price_cache(cache, "CAKE", price=10.0, volume=200_000.0)
+    engine = ScalpingEngine(settings, cache)
+    near_miss = engine.best_near_miss(
+        {"CAKE": _token_payload(estimated_slippage_pct=0.002, percent_change_1h=0.01)},
+        10_000.0,
+        _regime(),
+        _risk_decision(),
+        sentiment_result=_sentiment(gas_price_gwei=8.0),
+    )
+    assert near_miss is not None
+    assert near_miss.symbol == "CAKE"
+    assert near_miss.factor_scores
+    assert (near_miss.entry_score or 0.0) < 60.0
+    assert "scalping score" in near_miss.reason

@@ -41,9 +41,18 @@ from src.execution.execution_reconciler import ExecutionReconciler, Reconciliati
 from src.execution.swap_router import PancakeSwapRouter
 from src.execution.twak_interface import TWAKInterface
 from src.strategy.breakout_engine import BreakoutDecision, BreakoutEngine
-from src.strategy.candidate_adapter import coerce_entry_candidate, decimal_div as _decimal_div
+import importlib
+
+from src.strategy.candidate_adapter import (
+    breakout_decision_to_candidate,
+    coerce_entry_candidate,
+    decimal_div as _decimal_div,
+)
 from src.strategy.entry_types import EntryCandidate
 from src.strategy.factory import create_strategy_bundle, fallback_evaluate_universe
+
+_fallback_scorer = importlib.import_module("src.strategy.6falgorithm.fallback_scorer")
+fallback_best_near_miss = _fallback_scorer.fallback_best_near_miss
 from src.strategy.scalping_guardrails import ScalpingGuardrails
 from src.strategy.scalping_position_manager import ScalpingPositionManager
 from src.strategy.guardrails import Guardrails, RiskDecision, RiskState, TradeRecord
@@ -583,15 +592,31 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             decision_reasons,
             risk_state_changed,
         )
+        open_symbols = {position.symbol for position in position_manager.list_open_positions()}
+        telemetry_candidate = _telemetry_candidate_for_log(
+            settings,
+            strategy_bundle,
+            market_snapshot,
+            portfolio_value,
+            regime_result,
+            risk_decision,
+            twak_interface,
+            open_symbols,
+            sentiment_result,
+            candidate,
+        )
+        legacy_reason = decision_reasons[-1] if decision_reasons else "ok"
+        if candidate is None and telemetry_candidate is not None:
+            legacy_reason = telemetry_candidate.reason
         _log_legacy_cycle_from_v25(
             settings,
             cycle_number,
             market_snapshot,
             portfolio_value,
-            candidate,
+            telemetry_candidate,
             entries_allowed=entries_allowed,
             action="ENTER" if action == "ENTER" else ("WAIT" if entries_allowed else "BLOCKED"),
-            reason=decision_reasons[-1] if decision_reasons else "ok",
+            reason=legacy_reason,
             position_pct=entry_position_pct,
             liquidity=liquidity,
             position_count=len(position_manager.list_open_positions()),
@@ -1157,6 +1182,63 @@ def _write_v25_cycle_logs(
 
 def _guardrail_all_time_high(guardrails: Guardrails) -> float:
     return float(getattr(guardrails, "_all_time_high_usdc", getattr(guardrails, "_all_time_high", 0.0)))
+
+
+def _telemetry_candidate_for_log(
+    settings: Settings,
+    strategy_bundle: Any,
+    market_snapshot: dict[str, dict[str, Any]],
+    portfolio_value: float,
+    regime_result: RegimeResult,
+    risk_decision: RiskDecision,
+    twak_interface: TWAKInterface,
+    exclude_symbols: set[str],
+    sentiment_result: SentimentResult | None,
+    selected: EntryCandidate | None,
+) -> EntryCandidate | None:
+    """Return the best evaluated symbol for dashboard telemetry when no entry triggers."""
+
+    if selected is not None:
+        return selected
+
+    if settings.strategy_mode == "scalping" and strategy_bundle.scalping_engine is not None:
+        cooldown_checker = getattr(strategy_bundle.position_manager, "is_symbol_on_cooldown", None)
+        return strategy_bundle.scalping_engine.best_near_miss(
+            market_snapshot,
+            portfolio_value,
+            regime_result,
+            risk_decision,
+            sentiment_result=sentiment_result,
+            exclude_symbols=exclude_symbols,
+            cooldown_checker=cooldown_checker,
+        )
+
+    engine = BreakoutEngine(settings, twak_interface)
+    filtered_snapshot = {
+        symbol: data
+        for symbol, data in market_snapshot.items()
+        if symbol.upper() not in {item.upper() for item in exclude_symbols}
+    }
+    decision = engine.evaluate_universe(filtered_snapshot, portfolio_value)
+    telemetry = breakout_decision_to_candidate(
+        decision,
+        market_snapshot,
+        portfolio_value,
+        settings,
+        risk_decision,
+        for_telemetry=True,
+    )
+    if telemetry is not None:
+        return telemetry
+
+    return fallback_best_near_miss(
+        market_snapshot,
+        portfolio_value,
+        regime_result,
+        risk_decision,
+        settings=settings,
+        exclude_symbols=exclude_symbols,
+    )
 
 
 def _log_legacy_cycle_from_v25(

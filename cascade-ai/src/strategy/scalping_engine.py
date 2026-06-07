@@ -91,6 +91,113 @@ class ScalpingEngine:
             return None
         return best
 
+    def best_near_miss(
+        self,
+        snapshot: dict[str, dict[str, Any]],
+        portfolio_value: float,
+        regime_result: RegimeResult,
+        risk_decision: RiskDecision,
+        *,
+        sentiment_result: SentimentResult | None = None,
+        exclude_symbols: set[str] | None = None,
+        cooldown_checker: Any | None = None,
+    ) -> EntryCandidate | None:
+        """Return the highest-scoring symbol for operator telemetry when no entry triggers."""
+
+        excluded = {symbol.upper() for symbol in (exclude_symbols or set())}
+        ranked: list[tuple[float, float, EntryCandidate]] = []
+
+        for raw_symbol, raw_data in snapshot.items():
+            symbol = str(raw_symbol).upper()
+            if symbol in excluded:
+                continue
+            if cooldown_checker is not None and cooldown_checker(symbol):
+                continue
+            candidate = self._score_symbol_for_telemetry(
+                symbol,
+                {"symbol": symbol, **raw_data},
+                portfolio_value,
+                regime_result,
+                risk_decision,
+                sentiment_result,
+            )
+            if candidate is None:
+                continue
+            ranked.append(
+                (
+                    candidate.entry_score or 0.0,
+                    first_market_number(raw_data, ("volume_24h", "market_cap"), 0.0),
+                    candidate,
+                )
+            )
+
+        if not ranked:
+            return None
+
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        best = ranked[0][2]
+        score = best.entry_score or 0.0
+        minimum = self.settings.scalping_entry_score_min
+        if score >= minimum:
+            return best
+        return EntryCandidate(
+            symbol=best.symbol,
+            price=best.price,
+            position_size_usdc=0.0,
+            expected_amount_out=best.expected_amount_out,
+            slippage_small=best.slippage_small,
+            slippage_normal=best.slippage_normal,
+            reason=f"best {best.symbol} scalping score {score:.0f}/100 < {minimum:.0f}",
+            factor_scores=best.factor_scores,
+            true_factor_count=best.true_factor_count,
+            source=best.source,
+            entry_score=score,
+            strategy_mode=best.strategy_mode,
+        )
+
+    def _score_symbol_for_telemetry(
+        self,
+        symbol: str,
+        data: dict[str, Any],
+        portfolio_value: float,
+        regime_result: RegimeResult,
+        risk_decision: RiskDecision,
+        sentiment_result: SentimentResult | None,
+    ) -> EntryCandidate | None:
+        if not is_tradable_symbol(symbol) or not has_bsc_contract(symbol) or not is_liquid(data):
+            return None
+        price = maybe_number(data.get("price"))
+        if price is None or price <= 0:
+            return None
+
+        slippage_normal = maybe_number(data.get("estimated_slippage_pct"))
+        score, factor_scores = self.score_token(
+            symbol,
+            data,
+            regime_result,
+            sentiment_result,
+            slippage_normal=slippage_normal,
+        )
+        position_size = portfolio_value * self.settings.scalping_position_pct * risk_decision.position_multiplier
+        slippage_small = maybe_number(data.get("estimated_slippage_small_pct"))
+        if slippage_small is None and slippage_normal is not None:
+            slippage_small = max(0.0, slippage_normal * 0.5)
+
+        return EntryCandidate(
+            symbol=symbol,
+            price=price,
+            position_size_usdc=position_size,
+            expected_amount_out=decimal_div(position_size, price),
+            slippage_small=slippage_small,
+            slippage_normal=slippage_normal,
+            reason=f"scalping score {score:.0f}/100",
+            factor_scores=factor_scores,
+            true_factor_count=int(score // 20),
+            source="scalping_engine",
+            entry_score=score,
+            strategy_mode="scalping",
+        )
+
     def score_token(
         self,
         symbol: str,
