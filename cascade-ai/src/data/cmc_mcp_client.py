@@ -439,10 +439,13 @@ class CMCMCPClient:
             return {}
 
         try:
+            headers = {"Accept": "application/json"}
+            if self.settings.cmc_api_key:
+                headers["X-CMC_PRO_API_KEY"] = self.settings.cmc_api_key
             response = requests.get(
                 f"{self.settings.cmc_keyless_base_url}{path}",
                 params=params,
-                headers={"Accept": "application/json"},
+                headers=headers,
                 timeout=15,
             )
             response.raise_for_status()

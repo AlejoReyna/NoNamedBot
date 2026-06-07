@@ -131,6 +131,25 @@ def test_keyless_primary_uses_symbol_query(monkeypatch: Any) -> None:
     assert calls[0]["url"].endswith("/cryptocurrency/quotes/latest")
     assert calls[0]["params"]["symbol"] == "CAKE"
     assert calls[0]["params"]["convert"] == "USD"
+    assert "X-CMC_PRO_API_KEY" not in calls[0]["headers"]
+
+
+def test_keyless_primary_sends_cmc_pro_api_key_when_configured(monkeypatch: Any) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_get(*args: Any, **kwargs: Any) -> FakeKeylessResponse:
+        calls.append({"url": args[0], **kwargs})
+        return FakeKeylessResponse()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    client = CMCMCPClient(
+        Settings(use_keyless_primary=True, cmc_api_key="secret"),
+        x402_client=FakeX402Client(),  # type: ignore[arg-type]
+    )
+
+    client.get_crypto_quotes_latest(["CAKE"])
+
+    assert calls[0]["headers"]["X-CMC_PRO_API_KEY"] == "secret"
 
 
 def test_x402_failure_uses_keyless_fallback(monkeypatch: Any) -> None:
