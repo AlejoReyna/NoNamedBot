@@ -40,7 +40,7 @@ class CmcMcpClient:
         self.url = url
         self.timeout_s = timeout_s
         if signer is not None:
-            LOGGER.warning("CmcMcpClient ignores direct x402 signers; use TWAK-native X402Client for paid requests")
+            LOGGER.warning("CmcMcpClient ignores direct x402 signers; use X402Client for paid requests")
         self._session_id: str | None = None
 
     async def initialize(self, client: httpx.AsyncClient) -> dict[str, Any]:
@@ -127,7 +127,7 @@ class CmcMcpClient:
         if response.status_code == 402:
             artifact_path = write_402_response(response)
             raise CmcMcpError(
-                "CMC MCP requires x402 payment; use TWAK-native X402Client for paid requests. "
+                "CMC MCP requires x402 payment; use X402Client (official SDK + CDP settlement). "
                 f"Saved 402 details to {artifact_path}"
             )
 
@@ -233,6 +233,7 @@ class CMCMCPClient:
             endpoint=settings.cmc_x402_endpoint,
             default_amount=str(settings.cmc_x402_amount),
             default_asset=settings.cmc_x402_asset,
+            chain_id=settings.cmc_x402_chain_id,
         )
 
     def get_crypto_quotes_latest(self, symbols: list[str]) -> dict[str, Any]:
@@ -374,7 +375,7 @@ class CMCMCPClient:
             try:
                 self.x402_client.request_with_x402("POST", envelope, headers=headers)
             except Exception as exc:
-                LOGGER.debug("TWAK x402 shadow request failed: %s", exc)
+                LOGGER.debug("x402 SDK shadow request failed: %s", exc)
             return keyless_data
 
         try:
@@ -407,8 +408,8 @@ class CMCMCPClient:
         tool_name: str,
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
-        # Keyless remains the fail-open data fallback when TWAK-native x402 is
-        # unavailable or CMC rejects the generic TWAK request shape.
+        # Keyless remains the fail-open data fallback when x402 SDK payment is
+        # unavailable or CMC rejects the request shape.
         path: str
         params: dict[str, str]
         if tool_name in {"get_crypto_quotes_latest", "get_crypto_market_metrics"}:

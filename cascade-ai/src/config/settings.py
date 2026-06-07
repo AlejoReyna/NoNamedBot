@@ -31,6 +31,7 @@ class Settings(BaseModel):
     cmc_x402_max_usdc_per_call: float = 0.01
     use_keyless_primary: bool = True
     cmc_keyless_base_url: str = "https://pro-api.coinmarketcap.com/trial-pro-api/v3"
+    cmc_snapshot_ttl_seconds: int = 7200
     paper_trade: bool = True
     loop_seconds: int = 300
     price_cache_maxlen: int = 2880
@@ -152,6 +153,7 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
             "CMC_KEYLESS_BASE_URL",
             "https://pro-api.coinmarketcap.com/trial-pro-api/v3",
         ),
+        "cmc_snapshot_ttl_seconds": _get_int("CMC_SNAPSHOT_TTL_SECONDS", 7200),
         "paper_trade": _get_bool("PAPER_TRADE", True),
         "loop_seconds": _get_int("LOOP_SECONDS", 300),
         "price_cache_maxlen": _get_int("PRICE_CACHE_MAXLEN", 2880),

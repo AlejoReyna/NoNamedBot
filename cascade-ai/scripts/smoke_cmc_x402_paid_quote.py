@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke test a paid CMC MCP quote request through TWAK-native x402."""
+"""Smoke test a paid CMC MCP quote request through the official x402 SDK."""
 
 from __future__ import annotations
 
@@ -17,14 +17,29 @@ sys.path.insert(0, str(ROOT))
 from src.data.x402_client import CMC_X402_ENDPOINT, DEFAULT_PAYMENT_ASSET, X402Client  # noqa: E402
 
 
+def _payment_key_configured() -> bool:
+    return bool(
+        os.getenv("CMC_X402_EPHEMERAL_KEY", "").strip()
+        or os.getenv("EVM_PRIVATE_KEY", "").strip()
+    )
+
+
 def run() -> int:
     os.chdir(ROOT)
     load_dotenv(ROOT / ".env")
+
+    if not _payment_key_configured():
+        print(
+            "x402_paid_quote_skipped=true reason=missing CMC_X402_EPHEMERAL_KEY or EVM_PRIVATE_KEY",
+            file=sys.stderr,
+        )
+        return 2
 
     client = X402Client(
         endpoint=os.getenv("CMC_MCP_URL", os.getenv("CMC_X402_ENDPOINT", CMC_X402_ENDPOINT)),
         default_amount=os.getenv("CMC_X402_AMOUNT", "0.01"),
         default_asset=os.getenv("CMC_X402_ASSET", DEFAULT_PAYMENT_ASSET),
+        chain_id=int(os.getenv("CMC_X402_CHAIN_ID", "8453")),
     )
     envelope = {
         "jsonrpc": "2.0",
@@ -35,19 +50,20 @@ def run() -> int:
             "arguments": {"symbol": "BNB", "convert": "USD"},
         },
     }
-    result = client.request_with_x402(
-        "POST",
-        envelope,
-        headers={"MCP-Protocol-Version": "2024-11-05"},
-    )
+    headers = {"MCP-Protocol-Version": "2024-11-05"}
+    cmc_api_key = os.getenv("CMC_API_KEY", "").strip()
+    if cmc_api_key:
+        headers["X-CMC-MCP-API-KEY"] = cmc_api_key
+
+    result = client.request_with_x402("POST", envelope, headers=headers)
     if result is None:
-        print("twak_x402_paid_quote_failed=true", file=sys.stderr)
+        print("x402_paid_quote_failed=true", file=sys.stderr)
         return 1
 
-    output_path = ROOT / "artifacts" / "x402_twak_paid_quote_success.json"
+    output_path = ROOT / "artifacts" / "x402_sdk_paid_quote_success.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, indent=2, sort_keys=True, default=str), encoding="utf-8")
-    print(f"twak_x402_paid_quote_success={output_path}")
+    print(f"x402_paid_quote_success={output_path}")
     return 0
 
 

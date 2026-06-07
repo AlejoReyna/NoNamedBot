@@ -60,6 +60,26 @@ def test_load_settings_reads_demo_mode(monkeypatch: object, tmp_path: Path) -> N
     assert settings.demo_mode is True
 
 
+def test_load_settings_reads_cmc_snapshot_ttl_seconds(monkeypatch: object, tmp_path: Path) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text("CMC_SNAPSHOT_TTL_SECONDS=3600\n", encoding="utf-8")
+    monkeypatch.delenv("CMC_SNAPSHOT_TTL_SECONDS", raising=False)  # type: ignore[attr-defined]
+
+    settings = load_settings(str(env_path))
+
+    assert settings.cmc_snapshot_ttl_seconds == 3600
+
+
+def test_load_settings_defaults_cmc_snapshot_ttl_to_two_hours(monkeypatch: object, tmp_path: Path) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.delenv("CMC_SNAPSHOT_TTL_SECONDS", raising=False)  # type: ignore[attr-defined]
+
+    settings = load_settings(str(env_path))
+
+    assert settings.cmc_snapshot_ttl_seconds == 7200
+
+
 def test_load_settings_does_not_expose_cmc_ephemeral_key(monkeypatch: object, tmp_path: Path) -> None:
     env_path = tmp_path / ".env"
     env_path.write_text("CMC_X402_EPHEMERAL_KEY=0xabc\n", encoding="utf-8")

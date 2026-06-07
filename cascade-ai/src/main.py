@@ -32,6 +32,7 @@ from src.config.tokens import (
     is_tradable_symbol,
 )
 from src.data.cmc_mcp_client import CMCMCPClient
+from src.data.market_snapshot_cache import get_market_snapshot_cache
 from src.execution import liquidity_analyzer as liquidity_analyzer_module
 from src.execution.bnb_toolkit_wrapper import BnbToolkitWrapper
 from src.execution.decision_log import DecisionAction, log_decision
@@ -1291,9 +1292,13 @@ if not hasattr(scoring, "evaluate_universe"):
 def _fetch_snapshot(settings: Settings, cmc_client: CMCMCPClient) -> dict[str, dict[str, Any]]:
     if settings.paper_trade:
         return _paper_market_snapshot()
-    snapshot = cmc_client.fetch_market_snapshot(TARGET_SYMBOLS)
-    _ensure_bnb_reference(snapshot, cmc_client)
-    return snapshot
+
+    def _load() -> dict[str, dict[str, Any]]:
+        snapshot = cmc_client.fetch_market_snapshot(TARGET_SYMBOLS)
+        _ensure_bnb_reference(snapshot, cmc_client)
+        return snapshot
+
+    return get_market_snapshot_cache().get_or_fetch(settings.cmc_snapshot_ttl_seconds, _load)
 
 
 def _ensure_bnb_reference(snapshot: dict[str, dict[str, Any]], cmc_client: CMCMCPClient) -> None:
