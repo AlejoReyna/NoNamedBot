@@ -34,6 +34,10 @@ class DecisionLogger:
         factor_scores: dict[str, bool] | None = None,
         true_factor_count: int = 0,
         estimated_slippage_pct: float | None = None,
+        strategy_mode: str | None = None,
+        entry_score: float | None = None,
+        exit_reason: str | None = None,
+        hold_time_seconds: int | None = None,
     ) -> dict[str, Any]:
         """Append one strategy decision record and return it."""
 
@@ -53,6 +57,14 @@ class DecisionLogger:
             "reason": reason,
             "priced_target_count": priced_target_count,
         }
+        if strategy_mode is not None:
+            record["strategy_mode"] = strategy_mode
+        if entry_score is not None:
+            record["entry_score"] = entry_score
+        if exit_reason is not None:
+            record["exit_reason"] = exit_reason
+        if hold_time_seconds is not None:
+            record["hold_time_seconds"] = hold_time_seconds
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as handle:
@@ -76,6 +88,10 @@ def log_decision(
     factor_scores: dict[str, bool] | None = None,
     true_factor_count: int = 0,
     estimated_slippage_pct: float | None = None,
+    strategy_mode: str | None = None,
+    entry_score: float | None = None,
+    exit_reason: str | None = None,
+    hold_time_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Append a strategy decision record using the configured settings path."""
 
@@ -94,4 +110,8 @@ def log_decision(
         factor_scores=factor_scores,
         true_factor_count=true_factor_count,
         estimated_slippage_pct=estimated_slippage_pct,
+        strategy_mode=strategy_mode,
+        entry_score=entry_score,
+        exit_reason=exit_reason,
+        hold_time_seconds=hold_time_seconds,
     )

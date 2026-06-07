@@ -81,29 +81,20 @@ def test_run_agent_logs_evaluated_wait_decision(
     tmp_path: Path,
     caplog: Any,
 ) -> None:
-    decision = main_module.BreakoutDecision(
-        should_enter=False,
-        symbol="CAKE",
-        position_size_usdc=0.0,
-        factor_scores={"volume_breakout": False, "slippage_under_cap": False},
-        true_factor_count=2,
-        reason="insufficient signal: 2/4 core factors passed (need 4)",
-        estimated_slippage_pct=None,
-    )
     settings = _settings(tmp_path)
-    _patch_run_agent_dependencies(monkeypatch, decision=decision)
+    _patch_run_agent_dependencies(monkeypatch, decision=None)
     caplog.set_level(logging.INFO, logger=main_module.LOGGER.name)
 
     main_module.run_agent(settings, max_cycles=1)
 
     record = _read_decision(Path(settings.decision_log_path))
     assert record["action"] == "WAIT"
-    assert record["symbol"] == "CAKE"
-    assert record["factor_scores"] == {"slippage_under_cap": False, "volume_breakout": False}
-    assert record["true_factor_count"] == 2
+    assert record["symbol"] is None
+    assert record["factor_scores"] == {}
+    assert record["true_factor_count"] == 0
     assert record["priced_target_count"] == 1
-    assert record["reason"] == "insufficient signal: 2/4 core factors passed (need 4)"
-    assert 'Decision cycle=1 action=WAIT symbol=CAKE factors=2/6 slippage=- reason="' in caplog.text
+    assert record["reason"] == "No candidate passed gates"
+    assert 'Decision cycle=1 action=WAIT symbol=- factors=- slippage=- reason="' in caplog.text
 
 
 def test_run_agent_logs_guardrail_blocked_cycle(monkeypatch: Any, tmp_path: Path) -> None:
@@ -116,7 +107,7 @@ def test_run_agent_logs_guardrail_blocked_cycle(monkeypatch: Any, tmp_path: Path
     assert record["action"] == "BLOCKED"
     assert record["entries_allowed"] is False
     assert record["symbol"] is None
-    assert record["reason"] == "guardrails blocked new entries"
+    assert record["reason"] == "daily trade limit reached"
 
 
 def test_run_agent_logs_drawdown_halt_cycle(monkeypatch: Any, tmp_path: Path) -> None:

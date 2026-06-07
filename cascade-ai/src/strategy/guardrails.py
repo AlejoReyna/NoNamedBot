@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Literal
 
@@ -23,6 +24,25 @@ class TradeRecord:
     timestamp: datetime
 
 
+class RiskState(Enum):
+    NORMAL = "normal"
+    REDUCED_RISK = "reduced_risk"
+    PAUSED_STREAK = "paused_streak"
+    PAUSED_DAILY = "paused_daily"
+    KILL_SWITCH = "kill_switch"
+
+
+@dataclass(frozen=True)
+class RiskDecision:
+    state: RiskState
+    allow_new_entries: bool
+    position_multiplier: float
+    max_slippage_pct: float
+    max_daily_trades: int
+    base_risk_per_trade_pct: float
+    reasons: list[str]
+
+
 class Guardrails:
     """Enforce non-negotiable trading limits."""
 
@@ -36,6 +56,10 @@ class Guardrails:
         self._paused_until: datetime | None = None
         self._all_time_high_usdc = 0.0
         self._kill_switch = False
+        self._state = RiskState.NORMAL
+        self._daily_loss_pct = 0.0
+        self._loss_streak = 0
+        self._last_trade_day: datetime | None = None
         self._load_state()
         self._reset_daily_if_needed()
 
@@ -85,6 +109,58 @@ class Guardrails:
             self._paused_until = self._now() + timedelta(hours=24)
         self._save_state()
 
+    def update_ath(self, portfolio_value_usdc: float) -> None:
+        if portfolio_value_usdc > self._all_time_high_usdc:
+            self._all_time_high_usdc = portfolio_value_usdc
+            self._save_state()
+
+    def evaluate(
+        self,
+        portfolio_value: float,
+        regime_result: object,
+        volatility_breaker: bool | None = None,
+    ) -> RiskDecision:
+        self._reset_daily_if_needed()
+        self._reset_recorded_loss_day_if_needed()
+        self.update_ath(portfolio_value)
+        drawdown = self._drawdown_pct(portfolio_value)
+        reasons: list[str] = []
+        inferred_breaker = "volatility_breaker_reported" in getattr(regime_result, "reasons", [])
+        has_breaker = inferred_breaker if volatility_breaker is None else volatility_breaker
+
+        state = RiskState.NORMAL
+        if drawdown >= self.settings.drawdown_kill_switch_pct:
+            state = RiskState.KILL_SWITCH
+            reasons.append("drawdown_kill_switch")
+            self._kill_switch = True
+        elif self._daily_loss_limit_hit(portfolio_value):
+            state = RiskState.PAUSED_DAILY
+            reasons.append("daily_loss_limit")
+        elif self._loss_streak >= self.settings.loss_streak_pause:
+            state = RiskState.PAUSED_STREAK
+            reasons.append("loss_streak_pause")
+        else:
+            reduced_reasons = self._reduced_risk_reasons(drawdown, regime_result, has_breaker)
+            if reduced_reasons:
+                state = RiskState.REDUCED_RISK
+                reasons.extend(reduced_reasons)
+
+        self._state = state
+        self._save_state()
+        return self._risk_decision(state, reasons)
+
+    def record_trade_result(self, realized_pnl_pct: float) -> None:
+        now = self._now()
+        self._reset_recorded_loss_day_if_needed(now)
+        self._last_trade_day = now
+        if realized_pnl_pct < 0:
+            self._daily_loss_pct += abs(realized_pnl_pct)
+        if realized_pnl_pct < -0.005:
+            self._loss_streak += 1
+        else:
+            self._loss_streak = 0
+        self._save_state()
+
     def can_open_new_trade(self) -> bool:
         """Return whether a new position may be opened now."""
 
@@ -124,10 +200,12 @@ class Guardrails:
     def _reset_daily_if_needed(self, current_time: datetime | None = None) -> None:
         now = current_time or self._now()
         if now.date() == self._daily_date:
+            self._reset_recorded_loss_day_if_needed(now)
             return
         self._daily_date = now.date()
         self._daily_trade_count = 0
         self._daily_realized_loss_usdc = 0.0
+        self._daily_loss_pct = 0.0
         if self._paused_until is not None and self._paused_until <= now:
             self._paused_until = None
         self._save_state()
@@ -145,12 +223,21 @@ class Guardrails:
         self._daily_realized_loss_usdc = float(payload.get("daily_realized_loss", 0.0))
         self._all_time_high_usdc = float(payload.get("portfolio_ath", 0.0))
         self._daily_date = self._date_from_state(payload.get("last_reset_date"))
+        self._daily_loss_pct = float(payload.get("daily_loss_pct", 0.0))
+        self._loss_streak = int(payload.get("loss_streak", 0))
+        last_trade_day = payload.get("last_trade_day")
+        if last_trade_day:
+            parsed_day = datetime.fromisoformat(str(last_trade_day))
+            self._last_trade_day = parsed_day if parsed_day.tzinfo else parsed_day.replace(tzinfo=timezone.utc)
 
     def _save_state(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "daily_trade_count": self._daily_trade_count,
             "daily_realized_loss": self._daily_realized_loss_usdc,
+            "daily_loss_pct": self._daily_loss_pct,
+            "loss_streak": self._loss_streak,
+            "last_trade_day": self._last_trade_day.isoformat() if self._last_trade_day else None,
             "portfolio_ath": self._all_time_high_usdc,
             "last_reset_date": self._daily_date.isoformat(),
         }
@@ -168,3 +255,46 @@ class Guardrails:
     @staticmethod
     def _now() -> datetime:
         return datetime.now(timezone.utc)
+
+    def _drawdown_pct(self, portfolio_value: float) -> float:
+        if self._all_time_high_usdc <= 0:
+            return 0.0
+        return max(0.0, (self._all_time_high_usdc - portfolio_value) / self._all_time_high_usdc)
+
+    def _daily_loss_limit_hit(self, portfolio_value: float) -> bool:
+        if self._daily_loss_pct >= self.settings.max_daily_loss_pct > 0:
+            return True
+        max_loss_usdc = portfolio_value * self.settings.max_daily_loss_pct
+        return max_loss_usdc > 0 and self._daily_realized_loss_usdc >= max_loss_usdc
+
+    def _reduced_risk_reasons(
+        self,
+        drawdown: float,
+        regime_result: object,
+        volatility_breaker: bool,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if drawdown >= self.settings.drawdown_soft_stop_pct:
+            reasons.append("drawdown_soft_stop")
+        if self._loss_streak >= self.settings.loss_streak_reduce_size:
+            reasons.append("loss_streak_reduce")
+        fragility = getattr(regime_result, "sentiment_fragility", "NONE")
+        if fragility in {"CROWDED_LONG", "EXTREME_GREED", "GAS_FOMO"}:
+            reasons.append(f"sentiment_{fragility}")
+        if volatility_breaker:
+            reasons.append("volatility_breaker")
+        return reasons
+
+    def _risk_decision(self, state: RiskState, reasons: list[str]) -> RiskDecision:
+        base_risk = self.settings.base_risk_per_trade_pct
+        strict_slippage = min(self.settings.max_slippage_pct, self.settings.risk_off_max_slippage_pct)
+        if state == RiskState.NORMAL:
+            return RiskDecision(state, True, 1.0, self.settings.max_slippage_pct, self.settings.max_daily_trades, base_risk, reasons)
+        if state == RiskState.REDUCED_RISK:
+            return RiskDecision(state, True, 0.5, strict_slippage, 1, base_risk * 0.5, reasons)
+        return RiskDecision(state, False, 0.0, strict_slippage, 0, 0.0, reasons)
+
+    def _reset_recorded_loss_day_if_needed(self, current_time: datetime | None = None) -> None:
+        now = current_time or self._now()
+        if self._last_trade_day is not None and self._last_trade_day.date() != now.date():
+            self._daily_loss_pct = 0.0

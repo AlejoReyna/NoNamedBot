@@ -8,27 +8,89 @@ import re
 import signal
 import sys
 import time
+import types
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
+import src.strategy as strategy_package
+from src.common.logging_schema import (
+    LiveDecisionLog,
+    PortfolioSnapshotLog,
+    RiskEventLog,
+    SentimentLiveLog,
+    append_to_file,
+)
 from src.config.settings import Settings, load_settings
-from src.config.tokens import TARGET_SYMBOLS, TRADABLE_TARGET_SYMBOLS, has_bsc_contract
+from src.config.tokens import (
+    TARGET_SYMBOLS,
+    TRADABLE_TARGET_SYMBOLS,
+    has_bsc_contract,
+    is_liquid,
+    is_tradable_symbol,
+)
 from src.data.cmc_mcp_client import CMCMCPClient
+from src.execution import liquidity_analyzer as liquidity_analyzer_module
 from src.execution.bnb_toolkit_wrapper import BnbToolkitWrapper
 from src.execution.decision_log import DecisionAction, log_decision
 from src.execution.execution_log import log_execution
+from src.execution.execution_reconciler import ExecutionReconciler, ReconciliationResult
 from src.execution.swap_router import PancakeSwapRouter
 from src.execution.twak_interface import TWAKInterface
 from src.strategy.breakout_engine import BreakoutDecision, BreakoutEngine
-from src.strategy.guardrails import Guardrails, TradeRecord
-from src.strategy.position_manager import Position, PositionManager
+from src.strategy.candidate_adapter import coerce_entry_candidate, decimal_div as _decimal_div
+from src.strategy.entry_types import EntryCandidate
+from src.strategy.factory import create_strategy_bundle, fallback_evaluate_universe
+from src.strategy.scalping_guardrails import ScalpingGuardrails
+from src.strategy.scalping_position_manager import ScalpingPositionManager
+from src.strategy.guardrails import Guardrails, RiskDecision, RiskState, TradeRecord
+from src.strategy.position_manager import Position, PositionManager, calculate_position_pct
+from src.strategy.regime_detector import MarketRegime, RegimeDetector, RegimeResult
+from src.strategy.sentiment_tier1 import SentimentResult, SentimentTier1
+from src.strategy.volatility import PriceCache
 
 LOGGER = logging.getLogger(__name__)
 LIVE_WINDOW_MONTH = 6
 LIVE_WINDOW_START_DAY = 22
 LIVE_WINDOW_END_DAY = 28
 PREFLIGHT_QUOTE_AMOUNT_USDC = 0.5
+SCHEMA_VERSION = "2.6.0"
+
+
+try:
+    from src.strategy import scoring as scoring
+except ImportError:
+    scoring = types.ModuleType("src.strategy.scoring")
+    sys.modules["src.strategy.scoring"] = scoring
+    setattr(strategy_package, "scoring", scoring)
+
+
+if hasattr(liquidity_analyzer_module, "LiquidityAnalyzer"):
+    LiquidityAnalyzer = liquidity_analyzer_module.LiquidityAnalyzer
+else:
+
+    class LiquidityAnalyzer:
+        """Compatibility adapter for the function-only liquidity module."""
+
+        def analyze_liquidity(
+            self,
+            symbol: str,
+            position_usd: float,
+            twak_quote_small: float | None,
+            twak_quote_normal: float | None,
+            max_slippage_pct: float,
+        ) -> liquidity_analyzer_module.LiquidityResult:
+            return liquidity_analyzer_module.analyze_liquidity(
+                symbol=symbol,
+                position_usd=position_usd,
+                twak_quote_small=twak_quote_small,
+                twak_quote_normal=twak_quote_normal,
+                max_slippage_pct=max_slippage_pct,
+            )
+
+    liquidity_analyzer_module.LiquidityAnalyzer = LiquidityAnalyzer
 
 
 @dataclass(frozen=True)
@@ -38,6 +100,26 @@ class PreflightCheck:
     name: str
     passed: bool
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class MinimumTradeDecision:
+    """Daily minimum-trade compliance request."""
+
+    symbol: str | None
+    size_pct: float
+    reason: str
+
+
+@dataclass(frozen=True)
+class EntryAttempt:
+    """Result of a reconciled entry attempt."""
+
+    entered: bool
+    reason: str
+    position_pct: float
+    liquidity: Any | None
+    reconcile_result: ReconciliationResult | None = None
 
 
 def emergency_liquidate(
@@ -268,21 +350,35 @@ def _print_preflight_report(checks: list[PreflightCheck]) -> None:
 
 
 def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
-    """Run the 5-minute trading loop."""
+    """Run the v2.5 live/paper trading loop."""
 
+    run_id = f"run-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+    Path("logs").mkdir(parents=True, exist_ok=True)
     cmc_client = CMCMCPClient(settings)
     toolkit = BnbToolkitWrapper(settings)
     twak_interface = TWAKInterface(paper_trade=settings.paper_trade)
     router = PancakeSwapRouter(twak_interface)
-    engine = BreakoutEngine(settings, twak_interface)
-    position_manager = PositionManager(settings)
-    guardrails = Guardrails(settings)
+    price_cache = PriceCache(maxlen=getattr(settings, "price_cache_maxlen", 2880) or 2880)
+    sentiment = SentimentTier1(
+        cmc_keyless_base=settings.cmc_keyless_base_url,
+        bsc_rpc_url=settings.bsc_rpc_url or "",
+        cache_ttl_seconds=_sentiment_cache_ttl(settings),
+    )
+    regime_detector = RegimeDetector(price_cache, sentiment, settings)
+    liquidity_analyzer = LiquidityAnalyzer()
+    execution_reconciler = ExecutionReconciler(toolkit)
+    strategy_bundle = create_strategy_bundle(settings, price_cache, twak_interface)
+    position_manager = strategy_bundle.position_manager
+    guardrails = strategy_bundle.guardrails
+    scoring.evaluate_universe = strategy_bundle.evaluate_universe
+    shadow_logger = _build_shadow_logger(price_cache, settings)
     positions_loaded = position_manager.load_positions()
     needs_balance_reconstruction = not positions_loaded and not settings.paper_trade
     if positions_loaded:
         LOGGER.info("Loaded %s persisted open positions", len(position_manager.list_open_positions()))
     running = True
     cycles_completed = 0
+    previous_risk_state: RiskState | None = None
 
     def _stop(_signum: int, _frame: Any) -> None:
         nonlocal running
@@ -293,7 +389,9 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
 
     while running:
         cycle_number = cycles_completed + 1
+        now_utc = datetime.now(timezone.utc)
         market_snapshot = _fetch_snapshot(settings, cmc_client)
+        _update_price_cache(price_cache, market_snapshot, now_utc)
         if needs_balance_reconstruction:
             reconstructed = _reconstruct_positions_from_balances(
                 position_manager,
@@ -304,18 +402,60 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             LOGGER.info("Reconstructed %s open positions from wallet balances", reconstructed)
             needs_balance_reconstruction = False
         portfolio_value = _portfolio_value_usdc(toolkit, settings, market_snapshot, position_manager)
-        if guardrails.update_portfolio_value(portfolio_value):
-            LOGGER.critical("Drawdown kill switch triggered; liquidating open positions")
-            _log_cycle_decision(
+        regime_result, sentiment_result = _detect_regime_with_sentiment_fallback(
+            regime_detector,
+            sentiment,
+            market_snapshot,
+            settings,
+        )
+        risk_decision = guardrails.evaluate(portfolio_value, regime_result)
+        risk_state_changed = previous_risk_state != risk_decision.state
+        previous_risk_state = risk_decision.state
+
+        candidate: EntryCandidate | None = None
+        liquidity: Any | None = None
+        action = "WAIT"
+        entry_position_pct = 0.0
+        entries_allowed = _risk_allows_new_entries(guardrails, risk_decision, portfolio_value, settings)
+        decision_reasons = list(risk_decision.reasons)
+        cycle_status = "ok"
+
+        if risk_decision.state == RiskState.KILL_SWITCH:
+            LOGGER.critical("Kill switch active. Liquidating.")
+            action = "HALT"
+            cycle_status = "kill switch"
+            decision_reasons = decision_reasons or ["drawdown_kill_switch"]
+            _write_v25_cycle_logs(
+                settings,
+                run_id,
+                cycle_number,
+                action,
+                market_snapshot,
+                portfolio_value,
+                price_cache,
+                regime_result,
+                sentiment_result,
+                risk_decision,
+                position_manager,
+                guardrails,
+                candidate,
+                liquidity,
+                entry_position_pct,
+                decision_reasons,
+                risk_state_changed,
+            )
+            _log_legacy_cycle_from_v25(
                 settings,
                 cycle_number,
                 market_snapshot,
                 portfolio_value,
-                decision=None,
+                candidate,
                 entries_allowed=False,
-                position_count=len(position_manager.list_open_positions()),
                 action="HALT",
                 reason="drawdown kill switch",
+                position_pct=entry_position_pct,
+                liquidity=liquidity,
+                position_count=len(position_manager.list_open_positions()),
             )
             emergency_liquidate(position_manager, router, guardrails)
             if settings.demo_mode:
@@ -326,56 +466,141 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                     decision=None,
                     entries_allowed=False,
                     position_count=len(position_manager.list_open_positions()),
-                    status="drawdown kill switch",
+                    status=cycle_status,
+                    settings=settings,
                 )
             break
 
-        _process_position_exits(position_manager, router, guardrails, market_snapshot, portfolio_value)
-        decision: BreakoutDecision | None = None
-        entries_allowed = guardrails.can_open_new_trade()
-        if entries_allowed:
-            decision = engine.evaluate_universe(market_snapshot, portfolio_value)
-            _log_cycle_decision(
-                settings,
-                cycle_number,
-                market_snapshot,
-                portfolio_value,
-                decision,
-                entries_allowed,
-                len(position_manager.list_open_positions()),
-            )
-            _maybe_enter_position(
-                decision,
-                position_manager,
-                router,
-                guardrails,
-                market_snapshot,
-                portfolio_value,
-                twak_interface,
-            )
+        _process_position_exits(position_manager, router, guardrails, market_snapshot, portfolio_value, price_cache)
+        _monitor_position_exits_if_needed(
+            position_manager,
+            router,
+            guardrails,
+            market_snapshot,
+            portfolio_value,
+            settings,
+            price_cache,
+        )
+
+        if not entries_allowed:
+            LOGGER.info("Risk state currently blocks new entries: %s", risk_decision.state.value)
+            if risk_decision.allow_new_entries:
+                decision_reasons = decision_reasons or ["daily trade limit reached"]
+            else:
+                decision_reasons = decision_reasons or [f"Risk state: {risk_decision.state.value}"]
         else:
-            LOGGER.info("Guardrails currently block new entries")
-            _log_cycle_decision(
-                settings,
-                cycle_number,
-                market_snapshot,
-                portfolio_value,
-                decision=None,
-                entries_allowed=False,
-                position_count=len(position_manager.list_open_positions()),
-                action="BLOCKED",
-                reason="guardrails blocked new entries",
+            skip_entries = (
+                settings.strategy_mode == "scalping"
+                and len(position_manager.list_open_positions()) >= 1
             )
+            if skip_entries:
+                decision_reasons.append("Scalping mode: monitoring open position")
+            else:
+                candidate = _evaluate_universe_v25(
+                    market_snapshot,
+                    portfolio_value,
+                    regime_result,
+                    risk_decision,
+                    settings,
+                    twak_interface,
+                    exclude_symbols={position.symbol for position in position_manager.list_open_positions()},
+                    sentiment_result=sentiment_result,
+                )
+                if candidate is None and settings.strategy_mode != "scalping":
+                    minimum_trade = check_daily_minimum_compliance(
+                        guardrails, regime_result, cycle_number, now_utc, settings
+                    )
+                    if minimum_trade is not None:
+                        candidate = _minimum_trade_candidate(
+                            minimum_trade,
+                            market_snapshot,
+                            portfolio_value,
+                            settings,
+                            risk_decision,
+                        )
+
+            if not skip_entries:
+                if candidate is None:
+                    decision_reasons.append("No candidate passed gates")
+                else:
+                    attempt = _attempt_entry_v25(
+                        settings,
+                        toolkit,
+                        router,
+                        execution_reconciler,
+                        liquidity_analyzer,
+                        position_manager,
+                        guardrails,
+                        price_cache,
+                        regime_result,
+                        risk_decision,
+                        candidate,
+                        portfolio_value,
+                    )
+                    liquidity = attempt.liquidity
+                    entry_position_pct = attempt.position_pct
+                    decision_reasons.extend([candidate.reason, attempt.reason])
+                    if attempt.entered:
+                        action = "ENTER"
 
         if settings.demo_mode:
+            demo_decision = _breakout_decision_from_candidate(
+                candidate,
+                action == "ENTER",
+                entry_position_pct * portfolio_value,
+                liquidity,
+                decision_reasons[-1] if decision_reasons else "ok",
+            )
             _print_demo_cycle_summary(
                 cycle_number,
                 market_snapshot,
                 portfolio_value,
-                decision,
+                demo_decision,
                 entries_allowed,
                 len(position_manager.list_open_positions()),
+                status=cycle_status,
+                settings=settings,
+                entry_score=candidate.entry_score if candidate is not None else None,
             )
+
+        _write_v25_cycle_logs(
+            settings,
+            run_id,
+            cycle_number,
+            action,
+            market_snapshot,
+            portfolio_value,
+            price_cache,
+            regime_result,
+            sentiment_result,
+            risk_decision,
+            position_manager,
+            guardrails,
+            candidate,
+            liquidity,
+            entry_position_pct,
+            decision_reasons,
+            risk_state_changed,
+        )
+        _log_legacy_cycle_from_v25(
+            settings,
+            cycle_number,
+            market_snapshot,
+            portfolio_value,
+            candidate,
+            entries_allowed=entries_allowed,
+            action="ENTER" if action == "ENTER" else ("WAIT" if entries_allowed else "BLOCKED"),
+            reason=decision_reasons[-1] if decision_reasons else "ok",
+            position_pct=entry_position_pct,
+            liquidity=liquidity,
+            position_count=len(position_manager.list_open_positions()),
+        )
+        if shadow_logger is not None:
+            try:
+                shadow_logger.log_all_variants(cycle_number, market_snapshot, regime_result)
+            except Exception as exc:
+                LOGGER.warning("Shadow logging failed: %s", exc)
+
         _log_live_window_warning(guardrails)
         cycles_completed += 1
         if max_cycles is not None and cycles_completed >= max_cycles:
@@ -387,10 +612,716 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             time.sleep(min(1.0, sleep_until - time.monotonic()))
 
 
+def _sentiment_cache_ttl(settings: Settings) -> int:
+    return int(
+        getattr(
+            settings,
+            "sentiment_cache_ttl",
+            getattr(settings, "sentiment_cache_ttl_seconds", 300),
+        )
+        or 300
+    )
+
+
+def _build_shadow_logger(price_cache: PriceCache, settings: Settings) -> Any | None:
+    try:
+        from src.research.shadow_decisions import ShadowDecisionsLogger
+        from src.strategy.jump_model_detector import JumpModelDetector
+
+        return ShadowDecisionsLogger(
+            jump_model=JumpModelDetector(price_cache),
+            settings=settings,
+            decision_log_path="logs/decision_shadow.jsonl",
+        )
+    except ImportError:
+        return None
+
+
+def _detect_regime_with_sentiment_fallback(
+    regime_detector: RegimeDetector,
+    sentiment: SentimentTier1,
+    snapshot: dict[str, dict[str, Any]],
+    settings: Settings,
+) -> tuple[RegimeResult, SentimentResult]:
+    try:
+        regime_result = regime_detector.detect(snapshot)
+    except Exception as exc:
+        LOGGER.warning("Regime detection failed; using neutral fallback: %s", exc)
+        sentiment_result = _neutral_sentiment_result()
+        return _fallback_regime_result(snapshot, settings, sentiment_result), sentiment_result
+    try:
+        sentiment_result = sentiment.compute_sentiment()
+    except Exception as exc:
+        LOGGER.warning("Sentiment logging failed; using neutral fallback: %s", exc)
+        sentiment_result = SentimentResult(
+            fear_greed_index=None,
+            fear_greed_classification=None,
+            funding_rate_btc=None,
+            open_interest_btc=None,
+            gas_price_gwei=None,
+            gas_avg_24h_gwei=None,
+            sentiment_delta=regime_result.sentiment_delta,
+            regime_fragility=regime_result.sentiment_fragility,
+        )
+    return regime_result, sentiment_result
+
+
+def _neutral_sentiment_result() -> SentimentResult:
+    return SentimentResult(
+        fear_greed_index=None,
+        fear_greed_classification=None,
+        funding_rate_btc=None,
+        open_interest_btc=None,
+        gas_price_gwei=None,
+        gas_avg_24h_gwei=None,
+        sentiment_delta=0.0,
+        regime_fragility="NONE",
+    )
+
+
+def _fallback_regime_result(
+    snapshot: dict[str, dict[str, Any]],
+    settings: Settings,
+    sentiment_result: SentimentResult,
+) -> RegimeResult:
+    bnb = snapshot.get("BNB", {})
+    positive_count = sum(
+        1
+        for key in ("percent_change_1h", "percent_change_6h", "percent_change_24h")
+        if _number(bnb.get(key), 0.0) > 0
+    )
+    if positive_count >= 2:
+        regime = MarketRegime.RANGING
+        score = 1.0
+        position_multiplier = 0.5
+        max_slippage = min(settings.max_slippage_pct, 0.0075)
+    else:
+        regime = MarketRegime.RISK_OFF
+        score = 0.0
+        position_multiplier = 0.1
+        max_slippage = min(settings.max_slippage_pct, 0.005)
+    return RegimeResult(
+        regime=regime,
+        score=score,
+        reasons=["regime_detection_fallback"],
+        position_multiplier=position_multiplier,
+        min_entry_factors=5,
+        max_slippage_pct=max_slippage,
+        sentiment_delta=sentiment_result.sentiment_delta,
+        sentiment_fragility=sentiment_result.regime_fragility,
+    )
+
+
+def _update_price_cache(
+    price_cache: PriceCache,
+    snapshot: dict[str, dict[str, Any]],
+    timestamp: datetime,
+) -> None:
+    for symbol, data in snapshot.items():
+        if not isinstance(data, dict):
+            continue
+        price = _maybe_number(data.get("price"))
+        if price is None:
+            continue
+        high = _first_market_number(data, ("high_24h", "high_6h", "high_3h"), price)
+        low = _first_market_number(data, ("low_24h", "low_6h", "low_3h"), price)
+        open_price = _first_market_number(data, ("open_24h", "open", "open_price"), price)
+        volume = _first_market_number(data, ("volume_24h", "volume"), 0.0)
+        price_cache.add_ohlcv(
+            symbol=symbol,
+            open_price=open_price,
+            high=high,
+            low=low,
+            close=price,
+            volume=volume,
+            timestamp=timestamp,
+        )
+
+
+def _risk_allows_new_entries(
+    guardrails: Guardrails,
+    risk_decision: RiskDecision,
+    portfolio_value: float,
+    settings: Settings,
+) -> bool:
+    if not risk_decision.allow_new_entries:
+        return False
+    if settings.strategy_mode == "scalping" and isinstance(guardrails, ScalpingGuardrails):
+        return guardrails.scalping_entries_allowed(portfolio_value)
+    daily_count = int(getattr(guardrails, "_daily_trade_count", 0))
+    return daily_count < risk_decision.max_daily_trades
+
+
+def _evaluate_universe_v25(
+    snapshot: dict[str, dict[str, Any]],
+    portfolio_value: float,
+    regime_result: RegimeResult,
+    risk_decision: RiskDecision,
+    settings: Settings,
+    twak_interface: TWAKInterface | None = None,
+    exclude_symbols: set[str] | None = None,
+    sentiment_result: SentimentResult | None = None,
+) -> EntryCandidate | None:
+    evaluate = getattr(scoring, "evaluate_universe", None)
+    if evaluate is not None and evaluate is not fallback_evaluate_universe:
+        try:
+            candidate = evaluate(
+                snapshot,
+                portfolio_value,
+                regime_result,
+                risk_decision,
+                settings=settings,
+                twak_interface=twak_interface,
+                exclude_symbols=exclude_symbols or set(),
+                sentiment_result=sentiment_result,
+            )
+        except TypeError:
+            try:
+                candidate = evaluate(
+                    snapshot,
+                    portfolio_value,
+                    regime_result,
+                    risk_decision,
+                    settings=settings,
+                    twak_interface=twak_interface,
+                    exclude_symbols=exclude_symbols or set(),
+                )
+            except TypeError:
+                candidate = evaluate(snapshot, portfolio_value, regime_result, risk_decision)
+        return coerce_entry_candidate(candidate, portfolio_value, settings, risk_decision)
+    return fallback_evaluate_universe(
+        snapshot,
+        portfolio_value,
+        regime_result,
+        risk_decision,
+        settings=settings,
+        twak_interface=twak_interface,
+        exclude_symbols=exclude_symbols or set(),
+    )
+
+
+def check_daily_minimum_compliance(
+    guardrails: Guardrails,
+    regime_result: RegimeResult,
+    cycle_id: int,
+    now_utc: datetime,
+    settings: Settings,
+) -> MinimumTradeDecision | None:
+    """Return a small forced-entry request near UTC day-end when no trade happened."""
+
+    del cycle_id
+    if int(getattr(guardrails, "_daily_trade_count", 0)) >= 1:
+        return None
+    hours_left = 24 - now_utc.hour
+    if hours_left > 4:
+        return None
+    if regime_result.regime == MarketRegime.RISK_OFF:
+        return MinimumTradeDecision(
+            symbol=None,
+            size_pct=min(0.005, settings.max_position_pct),
+            reason="daily_minimum_compliance_risk_off",
+        )
+    return MinimumTradeDecision(
+        symbol=None,
+        size_pct=min(0.01, settings.max_position_pct),
+        reason="daily_minimum_compliance",
+    )
+
+
+def _minimum_trade_candidate(
+    decision: MinimumTradeDecision,
+    snapshot: dict[str, dict[str, Any]],
+    portfolio_value: float,
+    settings: Settings,
+    risk_decision: RiskDecision,
+) -> EntryCandidate | None:
+    ranked_symbols: list[tuple[float, str, dict[str, Any]]] = []
+    for symbol, data in snapshot.items():
+        normalized = symbol.upper()
+        if decision.symbol is not None and normalized != decision.symbol.upper():
+            continue
+        payload = {"symbol": normalized, **data}
+        if not is_tradable_symbol(normalized) or not has_bsc_contract(normalized) or not is_liquid(payload):
+            continue
+        price = _maybe_number(payload.get("price"))
+        if price is None or price <= 0:
+            continue
+        ranked_symbols.append((_first_market_number(payload, ("volume_24h", "market_cap"), 0.0), normalized, payload))
+    if not ranked_symbols:
+        return None
+    ranked_symbols.sort(reverse=True)
+    _, symbol, data = ranked_symbols[0]
+    price = float(data["price"])
+    position_usd = portfolio_value * decision.size_pct * max(0.0, risk_decision.position_multiplier)
+    return EntryCandidate(
+        symbol=symbol,
+        price=price,
+        position_size_usdc=position_usd,
+        expected_amount_out=_decimal_div(position_usd, price),
+        slippage_small=_maybe_number(data.get("estimated_slippage_small_pct")),
+        slippage_normal=_maybe_number(data.get("estimated_slippage_pct")),
+        reason=decision.reason,
+        factor_scores={"daily_minimum": True},
+        true_factor_count=1,
+        source="daily_minimum",
+    )
+
+
+def _attempt_entry_v25(
+    settings: Settings,
+    toolkit: BnbToolkitWrapper,
+    router: PancakeSwapRouter,
+    execution_reconciler: ExecutionReconciler,
+    liquidity_analyzer: LiquidityAnalyzer,
+    position_manager: PositionManager,
+    guardrails: Guardrails,
+    price_cache: PriceCache,
+    regime_result: RegimeResult,
+    risk_decision: RiskDecision,
+    candidate: EntryCandidate,
+    portfolio_value: float,
+) -> EntryAttempt:
+    if position_manager.get_position(candidate.symbol) is not None:
+        return EntryAttempt(False, "position already open", 0.0, None)
+
+    liquidity = liquidity_analyzer.analyze_liquidity(
+        symbol=candidate.symbol,
+        position_usd=candidate.position_size_usdc,
+        twak_quote_small=candidate.slippage_small,
+        twak_quote_normal=candidate.slippage_normal,
+        max_slippage_pct=risk_decision.max_slippage_pct,
+    )
+    if getattr(liquidity, "recommendation", "") == "REJECT":
+        return EntryAttempt(False, f"Liquidity: {liquidity.recommendation}", 0.0, liquidity)
+
+    atr_pct = price_cache.get_atr_pct(candidate.symbol, 14)
+    if settings.strategy_mode == "scalping":
+        position_usd = candidate.position_size_usdc
+        position_pct = position_usd / portfolio_value if portfolio_value > 0 else 0.0
+    else:
+        position_pct = calculate_position_pct(
+            equity_usd=portfolio_value,
+            atr_pct=atr_pct,
+            regime_multiplier=regime_result.position_multiplier,
+            risk_state_multiplier=risk_decision.position_multiplier,
+            loss_streak=int(getattr(guardrails, "_loss_streak", 0)),
+            max_position_pct=settings.max_position_pct,
+            base_risk_per_trade_pct=settings.base_risk_per_trade_pct,
+        )
+        if getattr(liquidity, "recommendation", "") == "REDUCE_SIZE":
+            position_pct *= 0.5
+        position_usd = portfolio_value * position_pct
+    if position_usd <= 0:
+        return EntryAttempt(False, "position size is zero", position_pct, liquidity)
+
+    expected_amount_out = _decimal_div(position_usd, candidate.price)
+    balance_before = _balance_before_for_reconciliation(toolkit, candidate.symbol)
+    try:
+        swap_result = _execute_logged_swap(
+            settings,
+            router,
+            "entry",
+            settings.default_stable_symbol,
+            candidate.symbol,
+            position_usd,
+            risk_decision.max_slippage_pct,
+            expected_amount_out=float(expected_amount_out),
+        )
+    except Exception as exc:
+        return EntryAttempt(False, f"swap failed: {exc}", position_pct, liquidity)
+
+    reconciled_tx = _tx_for_reconciliation(
+        swap_result,
+        candidate.symbol,
+        expected_amount_out,
+        balance_before,
+        settings.paper_trade,
+    )
+    reconcile_result = execution_reconciler.reconcile(
+        tx_result=reconciled_tx,
+        expected_amount_out=expected_amount_out,
+        slippage_tolerance=Decimal(str(risk_decision.max_slippage_pct)),
+        balance_before=balance_before,
+    )
+    if reconcile_result.status != "SUCCESS":
+        LOGGER.error("Execution failed for %s: %s", candidate.symbol, reconcile_result.status)
+        return EntryAttempt(False, f"Execution failed: {reconcile_result.status}", position_pct, liquidity, reconcile_result)
+
+    _open_local_position_v25(
+        position_manager,
+        candidate.symbol,
+        float(reconcile_result.amount_out_actual),
+        candidate.price,
+        position_usd,
+        atr_pct,
+        regime_result.regime,
+    )
+    guardrails.record_trade(
+        TradeRecord(
+            symbol=candidate.symbol,
+            side="buy",
+            value_usdc=position_usd,
+            realized_pnl_usdc=0.0,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        portfolio_value,
+    )
+    guardrails.record_trade_result(realized_pnl_pct=0.0)
+    return EntryAttempt(True, "reconcile success", position_pct, liquidity, reconcile_result)
+
+
+def _open_local_position_v25(
+    position_manager: PositionManager,
+    symbol: str,
+    amount_tokens: float,
+    entry_price: float,
+    position_usd: float,
+    atr_pct: float | None,
+    regime: MarketRegime,
+) -> None:
+    try:
+        position_manager.open_position(
+            symbol=symbol,
+            amount_tokens=amount_tokens,
+            entry_price=entry_price,
+            position_usd=position_usd,
+            atr_pct=atr_pct,
+            regime=regime,
+        )
+    except TypeError:
+        position_manager.open_position(symbol, amount_tokens, entry_price, position_usd)
+
+
+def _monitor_position_exits_if_needed(
+    position_manager: PositionManager,
+    router: PancakeSwapRouter,
+    guardrails: Guardrails,
+    market_snapshot: dict[str, dict[str, Any]],
+    portfolio_value: float,
+    settings: Settings,
+    price_cache: PriceCache | None = None,
+) -> None:
+    if not position_manager.list_open_positions():
+        return
+    last_exit_check = float(getattr(run_agent, "_last_exit_check", 0.0))
+    if time.time() - last_exit_check > getattr(settings, "position_monitor_seconds", 60):
+        _process_position_exits(position_manager, router, guardrails, market_snapshot, portfolio_value, price_cache)
+        setattr(run_agent, "_last_exit_check", time.time())
+
+
+def _compute_expected_breakeven_pct(
+    estimated_slippage_pct: float | None,
+    gas_price_gwei: float | None,
+    bnb_price_usd: float | None,
+    position_size_usd: float,
+    swap_fee_pct: float = 0.0025,
+) -> float | None:
+    """Estimate round-trip cost floor: slippage + gas (as pct of size) + swap fee."""
+
+    try:
+        total = swap_fee_pct
+        if estimated_slippage_pct is not None:
+            total += estimated_slippage_pct
+        if (
+            gas_price_gwei is not None
+            and bnb_price_usd is not None
+            and position_size_usd > 0
+        ):
+            gas_cost_usd = gas_price_gwei * 21000 * 1e-9 * bnb_price_usd
+            total += gas_cost_usd / position_size_usd
+        return total if total > 0 else None
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _write_v25_cycle_logs(
+    settings: Settings,
+    run_id: str,
+    cycle_id: int,
+    action: str,
+    snapshot: dict[str, dict[str, Any]],
+    portfolio_value: float,
+    price_cache: PriceCache,
+    regime_result: RegimeResult,
+    sentiment_result: SentimentResult,
+    risk_decision: RiskDecision,
+    position_manager: PositionManager,
+    guardrails: Guardrails,
+    candidate: EntryCandidate | None,
+    liquidity: Any | None,
+    position_pct: float,
+    reasons: list[str],
+    risk_state_changed: bool,
+) -> None:
+    mode = "paper" if settings.paper_trade else "live"
+    symbol = candidate.symbol if candidate else None
+    exit_meta = getattr(_execute_position_exit, "_last_exit_meta", None)
+    estimated_slippage_pct = (
+        getattr(liquidity, "slippage_normal", None)
+        if liquidity is not None
+        else (candidate.slippage_normal if candidate is not None else None)
+    )
+    position_size_usd = position_pct * portfolio_value
+    bnb_price_usd = _maybe_number(snapshot.get("BNB", {}).get("price"))
+    expected_breakeven_pct = _compute_expected_breakeven_pct(
+        estimated_slippage_pct=estimated_slippage_pct,
+        gas_price_gwei=sentiment_result.gas_price_gwei,
+        bnb_price_usd=bnb_price_usd,
+        position_size_usd=position_size_usd if position_size_usd > 0 else portfolio_value,
+    )
+    append_to_file(
+        "logs/decision_live.jsonl",
+        LiveDecisionLog(
+            schema_version=SCHEMA_VERSION,
+            run_id=run_id,
+            mode=mode,
+            path="live",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            cycle_id=cycle_id,
+            action=action,
+            symbol=symbol,
+            size_pct=position_pct,
+            reasons=[reason for reason in reasons if reason],
+            regime=regime_result.regime.value,
+            regime_score=regime_result.score,
+            ema_72=price_cache.get_ema("BNB", 72),
+            ema_144=price_cache.get_ema("BNB", 144),
+            ema_288=price_cache.get_ema("BNB", 288),
+            atr_pct=price_cache.get_atr_pct(symbol, 14) if symbol else None,
+            position_pct=position_pct,
+            slippage_quote=getattr(liquidity, "slippage_normal", None) if liquidity is not None else None,
+            risk_state=risk_decision.state.value,
+            sentiment_delta=regime_result.sentiment_delta,
+            sentiment_fragility=regime_result.sentiment_fragility,
+            strategy_mode=settings.strategy_mode,
+            entry_score=candidate.entry_score if candidate else None,
+            hold_time_seconds=exit_meta.get("hold_time_seconds") if exit_meta else None,
+            exit_reason=exit_meta.get("exit_reason") if exit_meta else None,
+            expected_breakeven_pct=expected_breakeven_pct,
+        ),
+    )
+    if exit_meta is not None:
+        setattr(_execute_position_exit, "_last_exit_meta", None)
+    append_to_file(
+        "logs/sentiment_live.jsonl",
+        SentimentLiveLog(
+            schema_version=SCHEMA_VERSION,
+            run_id=run_id,
+            mode=mode,
+            path="live",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            cycle_id=cycle_id,
+            fear_greed_index=sentiment_result.fear_greed_index,
+            fear_greed_classification=sentiment_result.fear_greed_classification,
+            funding_rate_btc=sentiment_result.funding_rate_btc,
+            open_interest_btc=sentiment_result.open_interest_btc,
+            gas_price_gwei=sentiment_result.gas_price_gwei,
+            gas_avg_24h_gwei=sentiment_result.gas_avg_24h_gwei,
+            sentiment_delta=sentiment_result.sentiment_delta,
+            regime_fragility=sentiment_result.regime_fragility,
+        ),
+    )
+    if risk_state_changed:
+        append_to_file(
+            "logs/risk_events.jsonl",
+            RiskEventLog(
+                schema_version=SCHEMA_VERSION,
+                run_id=run_id,
+                mode=mode,
+                path="live",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                cycle_id=cycle_id,
+                event_type=risk_decision.state.value,
+                severity="CRITICAL" if risk_decision.state == RiskState.KILL_SWITCH else "WARNING",
+                details={"reasons": risk_decision.reasons, "portfolio_value": portfolio_value},
+            ),
+        )
+    all_time_high = _guardrail_all_time_high(guardrails)
+    append_to_file(
+        "logs/portfolio_snapshots.jsonl",
+        PortfolioSnapshotLog(
+            schema_version=SCHEMA_VERSION,
+            run_id=run_id,
+            mode=mode,
+            path="live",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            cycle_id=cycle_id,
+            portfolio_value_usdc=portfolio_value,
+            all_time_high=all_time_high,
+            drawdown_pct=(all_time_high - portfolio_value) / all_time_high if all_time_high > 0 else 0.0,
+            open_positions=_open_positions_payload(position_manager),
+        ),
+    )
+
+
+def _guardrail_all_time_high(guardrails: Guardrails) -> float:
+    return float(getattr(guardrails, "_all_time_high_usdc", getattr(guardrails, "_all_time_high", 0.0)))
+
+
+def _log_legacy_cycle_from_v25(
+    settings: Settings,
+    cycle_number: int,
+    market_snapshot: dict[str, dict[str, Any]],
+    portfolio_value: float,
+    candidate: EntryCandidate | None,
+    entries_allowed: bool,
+    action: DecisionAction,
+    reason: str,
+    position_pct: float,
+    liquidity: Any | None,
+    position_count: int,
+) -> None:
+    decision = _breakout_decision_from_candidate(
+        candidate,
+        action == "ENTER",
+        portfolio_value * position_pct,
+        liquidity,
+        reason,
+    )
+    exit_meta = getattr(_execute_position_exit, "_last_exit_meta", None)
+    _log_cycle_decision(
+        settings,
+        cycle_number,
+        market_snapshot,
+        portfolio_value,
+        decision,
+        entries_allowed,
+        position_count,
+        action=action,
+        reason=reason,
+        strategy_mode=settings.strategy_mode,
+        entry_score=candidate.entry_score if candidate else None,
+        exit_reason=exit_meta.get("exit_reason") if exit_meta else None,
+        hold_time_seconds=exit_meta.get("hold_time_seconds") if exit_meta else None,
+    )
+
+
+def _breakout_decision_from_candidate(
+    candidate: EntryCandidate | None,
+    should_enter: bool,
+    position_size_usdc: float,
+    liquidity: Any | None,
+    reason: str,
+) -> BreakoutDecision | None:
+    if candidate is None:
+        return None
+    return BreakoutDecision(
+        should_enter=should_enter,
+        symbol=candidate.symbol,
+        position_size_usdc=position_size_usdc if should_enter else 0.0,
+        factor_scores=candidate.factor_scores,
+        true_factor_count=candidate.true_factor_count,
+        reason=reason or candidate.reason,
+        estimated_slippage_pct=getattr(liquidity, "slippage_normal", candidate.slippage_normal),
+    )
+
+
+def _balance_before_for_reconciliation(toolkit: BnbToolkitWrapper, token_out: str) -> dict[str, Decimal]:
+    normalized = token_out.upper()
+    if hasattr(toolkit, "get_balances"):
+        try:
+            payload = toolkit.get_balances()
+            balances = _decimal_balances_from_payload(payload)
+            if balances:
+                return balances
+        except Exception:
+            LOGGER.debug("get_balances failed; falling back to get_balance(%s)", normalized, exc_info=True)
+    payload = toolkit.get_balance(normalized)
+    balances = _decimal_balances_from_payload(payload)
+    if normalized not in balances:
+        balances[normalized] = Decimal(str(_extract_symbol_balance(payload, normalized)))
+    return balances
+
+
+def _decimal_balances_from_payload(payload: Any) -> dict[str, Decimal]:
+    if not isinstance(payload, dict):
+        return {}
+    balances = payload.get("balances")
+    if isinstance(balances, dict):
+        return {str(key).upper(): Decimal(str(value)) for key, value in balances.items()}
+    symbol = payload.get("symbol")
+    amount = payload.get("amount", payload.get("balance"))
+    if symbol is not None and amount is not None and not isinstance(amount, dict):
+        return {str(symbol).upper(): Decimal(str(amount))}
+    return {}
+
+
+def _tx_for_reconciliation(
+    tx_result: dict[str, Any],
+    token_out: str,
+    expected_amount_out: Decimal,
+    balance_before: dict[str, Decimal],
+    paper_trade: bool,
+) -> dict[str, Any]:
+    normalized = token_out.upper()
+    tx = dict(tx_result or {})
+    tx["token_out"] = normalized
+    tx["to_symbol"] = normalized
+    if paper_trade:
+        tx.setdefault("status", 1)
+        tx.setdefault("receipt", {"status": 1, "gasUsed": 0, "blockNumber": 0})
+        after = dict(balance_before)
+        after[normalized] = after.get(normalized, Decimal("0")) + expected_amount_out
+        tx.setdefault("balance_after", {key: str(value) for key, value in after.items()})
+    return tx
+
+
+def _open_positions_payload(position_manager: PositionManager) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for position in position_manager.list_open_positions():
+        payload.append(
+            {
+                "symbol": position.symbol,
+                "amount_tokens": position.amount_tokens,
+                "entry_price": position.entry_price,
+                "entry_value_usdc": position.entry_value_usdc,
+                "highest_price": position.highest_price,
+                "trailing_stop_price": position.trailing_stop_price,
+                "take_profit_price": position.take_profit_price,
+                "opened_at": position.opened_at.isoformat(),
+            }
+        )
+    return payload
+
+
+if not hasattr(scoring, "evaluate_universe"):
+    scoring.evaluate_universe = fallback_evaluate_universe
+
+
 def _fetch_snapshot(settings: Settings, cmc_client: CMCMCPClient) -> dict[str, dict[str, Any]]:
     if settings.paper_trade:
         return _paper_market_snapshot()
-    return cmc_client.fetch_market_snapshot(TARGET_SYMBOLS)
+    snapshot = cmc_client.fetch_market_snapshot(TARGET_SYMBOLS)
+    _ensure_bnb_reference(snapshot, cmc_client)
+    return snapshot
+
+
+def _ensure_bnb_reference(snapshot: dict[str, dict[str, Any]], cmc_client: CMCMCPClient) -> None:
+    if "BNB" in snapshot:
+        return
+    if "WBNB" in snapshot:
+        snapshot["BNB"] = {"symbol": "BNB", **snapshot["WBNB"]}
+        return
+    try:
+        payload = cmc_client._fetch_keyless("get_crypto_quotes_latest", {"symbol": "BNB"})
+        by_symbol = cmc_client._by_symbol(payload)
+        bnb = by_symbol.get("BNB")
+        if isinstance(bnb, dict):
+            volume_24h = _maybe_number(bnb.get("volume_24h"))
+            snapshot["BNB"] = {
+                "symbol": "BNB",
+                "price": _maybe_number(bnb.get("price")),
+                "market_cap": _maybe_number(bnb.get("market_cap")),
+                "volume_24h": volume_24h,
+                "rolling_24h_hourly_volume_avg": volume_24h / 24 if volume_24h else None,
+                "percent_change_1h": _maybe_number(bnb.get("percent_change_1h")),
+                "percent_change_6h": _maybe_number(bnb.get("percent_change_6h")),
+                "percent_change_24h": _maybe_number(bnb.get("percent_change_24h")),
+                "high_24h": _maybe_number(bnb.get("high_24h")),
+                "low_24h": _maybe_number(bnb.get("low_24h")),
+            }
+    except Exception as exc:
+        LOGGER.debug("Could not fetch BNB reference snapshot: %s", exc)
 
 
 def _load_positions_or_reconstruct(
@@ -499,42 +1430,103 @@ def _process_position_exits(
     guardrails: Guardrails,
     market_snapshot: dict[str, dict[str, Any]],
     portfolio_value: float,
+    price_cache: PriceCache | None = None,
 ) -> None:
+    check_exits = getattr(position_manager, "check_exits", None)
+    if callable(check_exits):
+        try:
+            check_exits(market_snapshot, price_cache)
+        except TypeError:
+            check_exits(market_snapshot)
+        if isinstance(position_manager, ScalpingPositionManager):
+            while True:
+                signal = position_manager.pop_pending_exit()
+                if signal is None:
+                    break
+                _execute_position_exit(
+                    position_manager,
+                    router,
+                    guardrails,
+                    signal.symbol,
+                    signal.current_price,
+                    portfolio_value,
+                    exit_reason=signal.reason,
+                )
+        return
+
     for position in list(position_manager.list_open_positions()):
         token_data = market_snapshot.get(position.symbol, {})
         current_price = _number(token_data.get("price"), position.entry_price)
         exit_reason = position_manager.update_price(position.symbol, current_price)
         if exit_reason is None:
             continue
-        LOGGER.info("Exiting %s because %s was hit", position.symbol, exit_reason)
-        execution_slippage = _require_execution_slippage(guardrails.settings.max_slippage_pct)
-        expected_amount_out = current_price * position.amount_tokens
-        result = _execute_logged_swap(
-            guardrails.settings,
+        _execute_position_exit(
+            position_manager,
             router,
-            "exit",
+            guardrails,
             position.symbol,
-            guardrails.settings.default_stable_symbol,
-            position.amount_tokens,
-            execution_slippage,
-            expected_amount_out=expected_amount_out,
+            current_price,
+            portfolio_value,
+            exit_reason=exit_reason,
         )
-        if not _execution_has_tx_hash(result):
-            LOGGER.error("Exit swap for %s returned no tx hash; local position remains open", position.symbol)
-            continue
-        closed = position_manager.close_position(position.symbol)
-        if closed is not None:
-            realized_pnl = (current_price - closed.entry_price) * closed.amount_tokens
-            guardrails.record_trade(
-                TradeRecord(
-                    symbol=closed.symbol,
-                    side="sell",
-                    value_usdc=current_price * closed.amount_tokens,
-                    realized_pnl_usdc=realized_pnl,
-                    timestamp=datetime.now().astimezone(),
-                ),
+
+
+def _execute_position_exit(
+    position_manager: PositionManager,
+    router: PancakeSwapRouter,
+    guardrails: Guardrails,
+    symbol: str,
+    current_price: float,
+    portfolio_value: float,
+    *,
+    exit_reason: str,
+) -> None:
+    LOGGER.info("Exiting %s because %s was hit", symbol, exit_reason)
+    position = position_manager.get_position(symbol)
+    if position is None:
+        return
+    execution_slippage = _require_execution_slippage(guardrails.settings.max_slippage_pct)
+    expected_amount_out = current_price * position.amount_tokens
+    result = _execute_logged_swap(
+        guardrails.settings,
+        router,
+        "exit",
+        symbol,
+        guardrails.settings.default_stable_symbol,
+        position.amount_tokens,
+        execution_slippage,
+        expected_amount_out=expected_amount_out,
+    )
+    if not _execution_has_tx_hash(result):
+        LOGGER.error("Exit swap for %s returned no tx hash; local position remains open", symbol)
+        return
+    hold_time_seconds = None
+    if isinstance(position_manager, ScalpingPositionManager):
+        hold_time_seconds = position_manager.hold_time_seconds(symbol)
+    closed = position_manager.close_position(symbol)
+    if closed is not None:
+        realized_pnl = (current_price - closed.entry_price) * closed.amount_tokens
+        trade = TradeRecord(
+            symbol=closed.symbol,
+            side="sell",
+            value_usdc=current_price * closed.amount_tokens,
+            realized_pnl_usdc=realized_pnl,
+            timestamp=datetime.now().astimezone(),
+        )
+        if isinstance(guardrails, ScalpingGuardrails):
+            guardrails.record_scalping_trade(
+                trade,
                 portfolio_value,
+                exit_reason=exit_reason,
             )
+        else:
+            guardrails.record_trade(trade, portfolio_value)
+        if hold_time_seconds is not None:
+            setattr(_execute_position_exit, "_last_exit_meta", {
+                "symbol": closed.symbol,
+                "exit_reason": exit_reason,
+                "hold_time_seconds": hold_time_seconds,
+            })
 
 
 def _maybe_enter_position(
@@ -640,10 +1632,28 @@ def _portfolio_value_usdc(
 
 def _paper_market_snapshot() -> dict[str, dict[str, Any]]:
     baseline: dict[str, dict[str, Any]] = {}
+    baseline["BNB"] = {
+        "symbol": "BNB",
+        "price": 600.0,
+        "open_24h": 594.0,
+        "high_24h": 606.0,
+        "low_24h": 588.0,
+        "volume_1h": 50_000_000.0,
+        "rolling_24h_hourly_volume_avg": 45_000_000.0,
+        "volume_24h": 1_080_000_000.0,
+        "market_cap": 90_000_000_000.0,
+        "percent_change_1h": 0.004,
+        "percent_change_6h": 0.011,
+        "percent_change_24h": 0.018,
+        "estimated_slippage_pct": 0.001,
+    }
     for symbol in TARGET_SYMBOLS:
         baseline[symbol] = {
             "symbol": symbol,
             "price": 1.0,
+            "open_24h": 0.99,
+            "high_24h": 1.02,
+            "low_24h": 0.98,
             "volume_1h": 100.0,
             "rolling_24h_hourly_volume_avg": 100.0,
             "volume_24h": 10_000_000.0,
@@ -651,6 +1661,9 @@ def _paper_market_snapshot() -> dict[str, dict[str, Any]]:
             "high_6h": 1.1,
             "high_3h": 1.1,
             "bnb_1h_trend_pct": 0.1,
+            "percent_change_1h": 0.003,
+            "percent_change_6h": 0.01,
+            "percent_change_24h": 0.02,
             "token_percent_change_1h": 0.003,
             "token_percent_change_24h": 0.02,
             "rsi": 50.0,
@@ -662,10 +1675,16 @@ def _paper_market_snapshot() -> dict[str, dict[str, Any]]:
     baseline["CAKE"] = {
         **baseline["CAKE"],
         "price": 2.16,
+        "open_24h": 2.05,
+        "high_24h": 2.18,
+        "low_24h": 2.01,
         "volume_1h": 2600.0,
         "rolling_24h_hourly_volume_avg": 1000.0,
         "high_6h": 2.10,
         "high_3h": 2.10,
+        "percent_change_1h": 0.006,
+        "percent_change_6h": 0.018,
+        "percent_change_24h": 0.04,
         "rsi": 62.0,
     }
     return baseline
@@ -679,6 +1698,8 @@ def _print_demo_cycle_summary(
     entries_allowed: bool,
     position_count: int,
     status: str = "ok",
+    settings: Settings | None = None,
+    entry_score: float | None = None,
 ) -> None:
     """Print one compact operator-facing cycle summary for demos."""
 
@@ -703,7 +1724,15 @@ def _print_demo_cycle_summary(
     print(f"  Status: {status}")
     print(f"  Portfolio: ${portfolio_value:,.2f}")
     print(f"  Market: {priced_targets} priced target(s)")
-    print(f"  Signal: {action} {symbol} factors={factors} slippage={slippage}")
+    if settings is not None and settings.strategy_mode == "scalping":
+        score_label = f"{int(entry_score)}/100" if entry_score is not None else "-/100"
+        tp_pct = settings.scalping_take_profit_pct * 100
+        sl_pct = settings.scalping_stop_loss_pct * 100
+        max_hold = settings.scalping_max_hold_minutes
+        print(f"  [SCALP] Score: {score_label} | Symbol: {symbol} | Action: {action}")
+        print(f"  [SCALP] TP: +{tp_pct:.1f}% | SL: -{sl_pct:.1f}% | Max Hold: {max_hold}min")
+    else:
+        print(f"  Signal: {action} {symbol} factors={factors} slippage={slippage}")
     print(f"  Positions: {position_count} open")
     print(f"  Reason: {reason}")
 
@@ -718,6 +1747,10 @@ def _log_cycle_decision(
     position_count: int,
     action: DecisionAction | None = None,
     reason: str | None = None,
+    strategy_mode: str | None = None,
+    entry_score: float | None = None,
+    exit_reason: str | None = None,
+    hold_time_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Persist and print the operator-facing decision for one cycle."""
 
@@ -758,6 +1791,10 @@ def _log_cycle_decision(
         factor_scores=factor_scores,
         true_factor_count=true_factor_count,
         estimated_slippage_pct=estimated_slippage,
+        strategy_mode=strategy_mode,
+        entry_score=entry_score,
+        exit_reason=exit_reason,
+        hold_time_seconds=hold_time_seconds,
     )
 
     factors = f"{true_factor_count}/6" if decision is not None else "-"
@@ -804,6 +1841,18 @@ def _maybe_number(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _first_market_number(
+    payload: dict[str, Any],
+    keys: tuple[str, ...],
+    default: float,
+) -> float:
+    for key in keys:
+        value = _maybe_number(payload.get(key))
+        if value is not None:
+            return value
+    return default
 
 
 def _require_execution_slippage(slippage_pct: float | None) -> float:

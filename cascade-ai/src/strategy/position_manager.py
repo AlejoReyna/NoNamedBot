@@ -165,3 +165,51 @@ class PositionManager:
             take_profit_price=float(payload["take_profit_price"]),
             opened_at=opened_at,
         )
+
+
+def calculate_position_pct(
+    equity_usd: float,
+    atr_pct: float | None,
+    regime_multiplier: float,
+    risk_state_multiplier: float,
+    loss_streak: int,
+    max_position_pct: float = 0.05,
+    base_risk_per_trade_pct: float = 0.0035,
+) -> float:
+    """Calculate volatility-scaled position size as a decimal percentage."""
+
+    if equity_usd <= 0 or max_position_pct <= 0:
+        return 0.0
+    regime_mult = max(0.0, float(regime_multiplier))
+    risk_mult = max(0.0, float(risk_state_multiplier))
+    if atr_pct is None or atr_pct <= 0:
+        fallback = min(0.01, max_position_pct) * regime_mult * risk_mult
+        return max(0.0, min(fallback, max_position_pct))
+
+    stop_distance_pct = max(0.015, min(0.08, float(atr_pct) * 2.0))
+    raw_position_pct = base_risk_per_trade_pct / stop_distance_pct
+    position_pct = min(max_position_pct, raw_position_pct)
+    if loss_streak >= 2:
+        position_pct *= 0.5
+    position_pct *= regime_mult * risk_mult
+    return max(0.0, min(position_pct, max_position_pct))
+
+
+def calculate_exit_levels(
+    entry_price: float,
+    atr_pct: float | None,
+    regime: object,
+) -> tuple[float, float]:
+    """Return trailing-stop and take-profit percentages for a regime."""
+
+    regime_value = getattr(regime, "value", str(regime))
+    if regime_value == "risk_off":
+        return 0.025, 0.05
+    if atr_pct is None or atr_pct <= 0:
+        return 0.035, 0.08
+
+    trailing_stop_pct = max(0.035, min(0.10, float(atr_pct) * 1.5))
+    take_profit_pct = max(0.08, min(0.20, float(atr_pct) * 3.0))
+    if regime_value == "trending_up":
+        return trailing_stop_pct, take_profit_pct
+    return min(trailing_stop_pct, 0.06), min(take_profit_pct, 0.12)
