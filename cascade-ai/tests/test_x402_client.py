@@ -24,42 +24,59 @@ def test_request_with_x402_posts_with_cmc_headers() -> None:
         payment_private_key=TEST_PRIVATE_KEY,
         sdk_client=FakeSdkClient(),
     )
+    client._mcp_session_id = "session-123"
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.text = '{"jsonrpc":"2.0","result":{"ok":true}}'
+    mock_response.headers = {}
 
-    mock_session = MagicMock()
-    mock_session.post.return_value = mock_response
-    mock_session.__enter__ = MagicMock(return_value=mock_session)
-    mock_session.__exit__ = MagicMock(return_value=False)
-
-    with patch("src.data.x402_client.x402_requests", return_value=mock_session):
+    with patch.object(client, "_post_with_sdk", return_value=mock_response) as post:
         payload = client.request_with_x402(
             "POST",
-            {"jsonrpc": "2.0"},
-            {"MCP-Protocol-Version": "2024-11-05", "X-CMC-MCP-API-KEY": "secret"},
+            {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "x"}},
+            {"X-CMC-MCP-API-KEY": "secret"},
         )
 
     assert payload == {"jsonrpc": "2.0", "result": {"ok": True}}
-    mock_session.post.assert_called_once_with(
-        ENDPOINT,
-        json={"jsonrpc": "2.0"},
-        headers={"MCP-Protocol-Version": "2024-11-05", "X-CMC-MCP-API-KEY": "secret"},
-        timeout=15.0,
-    )
+    assert post.call_count == 1
+    _, call_headers = post.call_args[0]
+    assert call_headers["X-CMC-MCP-API-KEY"] == "secret"
+    assert call_headers["Accept"] == "application/json, text/event-stream"
+    assert call_headers["Mcp-Session-Id"] == "session-123"
+
+
+def test_request_with_x402_initializes_mcp_session_before_tools_call() -> None:
+    client = X402Client(endpoint=ENDPOINT, payment_private_key=TEST_PRIVATE_KEY, sdk_client=FakeSdkClient())
+    init_response = MagicMock()
+    init_response.status_code = 200
+    init_response.text = '{"jsonrpc":"2.0","result":{"protocolVersion":"2025-03-26"}}'
+    init_response.headers = {"mcp-session-id": "session-abc"}
+
+    tool_response = MagicMock()
+    tool_response.status_code = 200
+    tool_response.text = '{"jsonrpc":"2.0","result":{"content":[]}}'
+    tool_response.headers = {}
+
+    with patch.object(client, "_post_with_sdk", side_effect=[init_response, tool_response]) as post:
+        payload = client.request_with_x402(
+            "POST",
+            {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "get_crypto_quotes_latest"}},
+            {},
+        )
+
+    assert payload == {"jsonrpc": "2.0", "result": {"content": []}}
+    assert post.call_count == 2
+    assert post.call_args_list[0][0][0]["method"] == "initialize"
+    assert post.call_args_list[1][0][0]["method"] == "tools/call"
+    assert post.call_args_list[1][0][1]["Mcp-Session-Id"] == "session-abc"
 
 
 def test_request_with_x402_returns_none_when_payment_fails() -> None:
     from x402.http.clients.requests import PaymentError
 
     client = X402Client(endpoint=ENDPOINT, payment_private_key=TEST_PRIVATE_KEY, sdk_client=FakeSdkClient())
-    mock_session = MagicMock()
-    mock_session.post.side_effect = PaymentError("payment rejected")
-    mock_session.__enter__ = MagicMock(return_value=mock_session)
-    mock_session.__exit__ = MagicMock(return_value=False)
-
-    with patch("src.data.x402_client.x402_requests", return_value=mock_session):
-        assert client.request_with_x402("POST", {"a": 1}, {}) is None
+    with patch.object(client, "_post_with_sdk", side_effect=PaymentError("payment rejected")):
+        assert client.request_with_x402("POST", {"method": "initialize"}, {}) is None
 
 
 def test_request_with_x402_requires_post() -> None:
@@ -89,11 +106,23 @@ def test_build_sdk_client_registers_base_mainnet_policy() -> None:
     assert len(sdk._policies) >= 2  # prefer_network + max_amount
 
 
+def test_normalize_private_key_adds_0x_prefix() -> None:
+    from src.data.x402_client import _normalize_private_key
+
+    assert _normalize_private_key("abc").startswith("0x")
+
+
 def test_resolve_payment_private_key_prefers_ephemeral_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CMC_X402_EPHEMERAL_KEY", TEST_PRIVATE_KEY)
     monkeypatch.setenv("EVM_PRIVATE_KEY", "0x" + "22" * 32)
     client = X402Client()
     assert client._resolve_payment_private_key() == TEST_PRIVATE_KEY
+
+
+def test_resolve_payment_private_key_accepts_key_without_0x_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CMC_X402_EPHEMERAL_KEY", "b" * 64)
+    client = X402Client()
+    assert client._resolve_payment_private_key().startswith("0x")
 
 
 def test_resolve_payment_private_key_falls_back_to_evm_private_key(monkeypatch: pytest.MonkeyPatch) -> None:

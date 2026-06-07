@@ -54,6 +54,8 @@ def run() -> int:
     cmc_api_key = os.getenv("CMC_API_KEY", "").strip()
     if cmc_api_key:
         headers["X-CMC-MCP-API-KEY"] = cmc_api_key
+    else:
+        print("warning: CMC_API_KEY not set; paid MCP may return HTTP 400", file=sys.stderr)
 
     result = client.request_with_x402("POST", envelope, headers=headers)
     if result is None:

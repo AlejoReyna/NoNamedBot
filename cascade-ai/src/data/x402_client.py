@@ -24,6 +24,9 @@ DEFAULT_PAYMENT_METHOD = "eip3009"
 DEFAULT_MAX_PAYMENT_USDC = "0.01"
 DEFAULT_CHAIN_ID = 8453
 CDP_FACILITATOR_URL = "https://api.cdp.coinbase.com/platform/v2/x402"
+MCP_PROTOCOL_VERSION = "2025-03-26"
+MCP_HTTP_PROTOCOL_VERSION = "2024-11-05"
+MCP_METHODS_REQUIRING_SESSION = frozenset({"tools/call", "tools/list"})
 
 
 class X402Client:
@@ -58,6 +61,7 @@ class X402Client:
         self.chain_id = chain_id
         self._payment_private_key = payment_private_key
         self._sdk_client = sdk_client
+        self._mcp_session_id: str | None = None
 
     def request_with_x402(self, method: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any] | None:
         """Pay and fetch an x402-gated CMC MCP request via the official SDK."""
@@ -65,14 +69,18 @@ class X402Client:
         try:
             if method.upper() != "POST":
                 raise ValueError("CMC MCP x402 client only supports POST requests")
-            client = self._sdk_client or self._build_sdk_client()
-            with x402_requests(client) as session:
-                response = session.post(
-                    self.endpoint,
-                    json=payload,
-                    headers=dict(headers),
-                    timeout=self.timeout_seconds,
-                )
+            merged_headers = _merge_mcp_headers(headers)
+            rpc_method = str(payload.get("method") or "")
+            if rpc_method in MCP_METHODS_REQUIRING_SESSION and not self._mcp_session_id:
+                if not self._initialize_mcp_session(merged_headers):
+                    return None
+            if self._mcp_session_id:
+                merged_headers["Mcp-Session-Id"] = self._mcp_session_id
+
+            response = self._post_with_sdk(payload, merged_headers)
+            if response is None:
+                return None
+            self._capture_mcp_session_id(response.headers)
             if response.status_code < 200 or response.status_code >= 300:
                 LOGGER.warning(
                     "x402 SDK request to %s returned HTTP %s: %s",
@@ -93,6 +101,57 @@ class X402Client:
             LOGGER.warning("x402 SDK request failed: %s", exc)
             return None
 
+    def _initialize_mcp_session(self, headers: dict[str, str]) -> bool:
+        init_payload = {
+            "jsonrpc": "2.0",
+            "id": "initialize",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "cascade-ai-trading-agent",
+                    "version": "0.1.0",
+                },
+            },
+        }
+        response = self._post_with_sdk(init_payload, dict(headers))
+        if response is None:
+            return False
+        self._capture_mcp_session_id(response.headers)
+        if response.status_code < 200 or response.status_code >= 300:
+            LOGGER.warning(
+                "CMC MCP initialize returned HTTP %s: %s",
+                response.status_code,
+                _short_text(response.text),
+            )
+            return False
+        if not self._mcp_session_id:
+            LOGGER.warning("CMC MCP initialize succeeded but no Mcp-Session-Id header was returned")
+            return False
+        LOGGER.debug("CMC MCP session established")
+        return True
+
+    def _post_with_sdk(self, payload: dict[str, Any], headers: dict[str, str]) -> Any | None:
+        client = self._sdk_client or self._build_sdk_client()
+        with x402_requests(client) as session:
+            return session.post(
+                self.endpoint,
+                json=payload,
+                headers=headers,
+                timeout=self.timeout_seconds,
+            )
+
+    def _capture_mcp_session_id(self, headers: Any) -> None:
+        if headers is None:
+            return
+        getter = getattr(headers, "get", None)
+        if not callable(getter):
+            return
+        session_id = getter("mcp-session-id") or getter("Mcp-Session-Id")
+        if session_id:
+            self._mcp_session_id = str(session_id)
+
     def _build_sdk_client(self) -> x402ClientSync:
         private_key = self._resolve_payment_private_key()
         account = Account.from_key(private_key)
@@ -111,11 +170,11 @@ class X402Client:
 
     def _resolve_payment_private_key(self) -> str:
         if self._payment_private_key and self._payment_private_key.strip():
-            return self._payment_private_key.strip()
+            return _normalize_private_key(self._payment_private_key.strip())
         for env_name in ("CMC_X402_EPHEMERAL_KEY", "EVM_PRIVATE_KEY"):
             value = os.getenv(env_name)
             if value and value.strip():
-                return value.strip()
+                return _normalize_private_key(value.strip())
         raise ValueError(
             "x402 payment key missing: set CMC_X402_EPHEMERAL_KEY or EVM_PRIVATE_KEY "
             "(Base mainnet via CDP; TWAK wallet cannot sign EIP-712 for MCP headers)"
@@ -135,6 +194,23 @@ class X402Client:
             raise ValueError("CMC x402 payment amount must be greater than zero")
         decimals = 6 if _is_six_decimal_asset(self.default_asset) else 18
         return str(int(amount * (Decimal(10) ** decimals)))
+
+
+def _normalize_private_key(key: str) -> str:
+    normalized = key.strip()
+    if not normalized.startswith("0x"):
+        normalized = f"0x{normalized}"
+    return normalized
+
+
+def _merge_mcp_headers(headers: dict[str, str]) -> dict[str, str]:
+    merged = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": MCP_HTTP_PROTOCOL_VERSION,
+    }
+    merged.update(headers)
+    return merged
 
 
 def _network_caip2(chain_id: int, chain_name: str) -> str:

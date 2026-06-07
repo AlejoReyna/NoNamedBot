@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from typing import Any
 
@@ -372,10 +373,11 @@ class CMCMCPClient:
 
         if self.settings.use_keyless_primary:
             keyless_data = self._fetch_keyless(tool_name, arguments)
-            try:
-                self.x402_client.request_with_x402("POST", envelope, headers=headers)
-            except Exception as exc:
-                LOGGER.debug("x402 SDK shadow request failed: %s", exc)
+            if self._x402_shadow_enabled():
+                try:
+                    self.x402_client.request_with_x402("POST", envelope, headers=headers)
+                except Exception as exc:
+                    LOGGER.debug("x402 SDK shadow request failed: %s", exc)
             return keyless_data
 
         try:
@@ -402,6 +404,13 @@ class CMCMCPClient:
             return result
         LOGGER.warning("CMC MCP call %s returned an unexpected result shape; using empty fallback", tool_name)
         return {}
+
+    @staticmethod
+    def _x402_shadow_enabled() -> bool:
+        return bool(
+            os.getenv("CMC_X402_EPHEMERAL_KEY", "").strip()
+            or os.getenv("EVM_PRIVATE_KEY", "").strip()
+        )
 
     def _fetch_keyless(
         self,
