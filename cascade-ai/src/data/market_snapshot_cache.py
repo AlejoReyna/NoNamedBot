@@ -18,6 +18,7 @@ HOT_SNAPSHOT_FIELDS = (
     "percent_change_24h",
     "rolling_24h_hourly_volume_avg",
     "bnb_1h_trend_pct",
+    "estimated_slippage_pct",
 )
 
 

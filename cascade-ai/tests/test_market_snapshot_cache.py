@@ -89,7 +89,7 @@ def test_merge_market_snapshots_overlays_hot_fields_only() -> None:
 
     assert merged["CAKE"]["price"] == 2.0
     assert merged["CAKE"]["percent_change_1h"] == 0.01
-    assert merged["CAKE"]["estimated_slippage_pct"] == 0.002
+    assert merged["CAKE"]["estimated_slippage_pct"] == 0.9
     assert merged["CAKE"]["rsi"] == 55.0
 
 

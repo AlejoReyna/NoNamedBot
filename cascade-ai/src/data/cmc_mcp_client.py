@@ -410,10 +410,11 @@ class CMCMCPClient:
             metric_data = metrics_by_symbol.get(symbol, {})
             combined = [quote_data, technical_data, metric_data, derivatives]
             volume_24h = self._first_number_from_many(combined, ("volume_24h", "volume_24h_usd"))
+            market_cap = self._first_number_from_many(combined, ("market_cap", "quote.USD.market_cap"))
             snapshot[symbol] = {
                 "symbol": symbol,
                 "price": self._first_number_from_many(combined, ("price", "last_price", "quote.USD.price")),
-                "market_cap": self._first_number_from_many(combined, ("market_cap", "quote.USD.market_cap")),
+                "market_cap": market_cap,
                 "volume_1h": self._first_number_from_many(combined, ("volume_1h", "volume_1h_usd")),
                 "volume_24h": volume_24h,
                 "percent_change_1h": self._first_number_from_many(
@@ -439,9 +440,10 @@ class CMCMCPClient:
                 "bnb_1h_trend_pct": bnb_trend,
                 "rsi": self._first_number_from_many(combined, ("rsi", "rsi_14", "technical.rsi")),
                 "macd": self._first_number_from_many(combined, ("macd", "technical.macd")),
-                "estimated_slippage_pct": self._first_number_from_many(
-                    combined,
-                    ("estimated_slippage_pct", "slippage_pct"),
+                "estimated_slippage_pct": self._resolve_estimated_slippage_pct(
+                    combined=combined,
+                    volume_24h=volume_24h,
+                    market_cap=market_cap,
                 ),
                 "funding_rate": self._first_number_from_many(
                     combined,
@@ -472,12 +474,11 @@ class CMCMCPClient:
             quote_data = quotes_by_symbol.get(symbol, {})
             volume_24h = self._first_number_from_many([quote_data], ("volume_24h", "volume_24h_usd"))
             market_cap = self._first_number_from_many([quote_data], ("market_cap", "quote.USD.market_cap"))
-            estimated_slippage_pct = self._first_number_from_many(
-                [quote_data],
-                ("estimated_slippage_pct", "slippage_pct"),
+            estimated_slippage_pct = self._resolve_estimated_slippage_pct(
+                combined=[quote_data],
+                volume_24h=volume_24h,
+                market_cap=market_cap,
             )
-            if estimated_slippage_pct is None:
-                estimated_slippage_pct = self._estimate_slippage_from_liquidity(volume_24h, market_cap)
             snapshot[symbol] = {
                 "symbol": symbol,
                 "price": self._first_number_from_many([quote_data], ("price", "last_price", "quote.USD.price")),
@@ -548,6 +549,8 @@ class CMCMCPClient:
             return {}
         parsed = CmcMcpClient._extract_tool_result(payload)
         if isinstance(parsed, dict):
+            if tool_name in {"get_crypto_quotes_latest", "get_crypto_market_metrics"}:
+                parsed = self._normalize_keyless_quotes_payload(parsed)
             return parsed
         LOGGER.warning("CMC MCP call %s returned an unexpected result shape; using empty fallback", tool_name)
         return {}
@@ -589,6 +592,8 @@ class CMCMCPClient:
             return {}
         parsed = CmcMcpClient._extract_tool_result(payload)
         if isinstance(parsed, dict):
+            if tool_name in {"get_crypto_quotes_latest", "get_crypto_market_metrics"}:
+                parsed = self._normalize_keyless_quotes_payload(parsed)
             return parsed
         LOGGER.warning("CMC MCP x402 call %s returned an unexpected result shape; using empty fallback", tool_name)
         return {}
@@ -680,6 +685,18 @@ class CMCMCPClient:
             if isinstance(value, dict):
                 return list(value.values())
         return []
+
+    def _resolve_estimated_slippage_pct(
+        self,
+        *,
+        combined: list[dict[str, Any]],
+        volume_24h: float | None,
+        market_cap: float | None,
+    ) -> float | None:
+        slippage = self._first_number_from_many(combined, ("estimated_slippage_pct", "slippage_pct"))
+        if slippage is not None:
+            return slippage
+        return self._estimate_slippage_from_liquidity(volume_24h, market_cap)
 
     @staticmethod
     def _estimate_slippage_from_liquidity(
