@@ -409,11 +409,23 @@ class CMCMCPClient:
             technical_data = technicals_by_symbol.get(symbol, {})
             metric_data = metrics_by_symbol.get(symbol, {})
             combined = [quote_data, technical_data, metric_data, derivatives]
-            volume_24h = self._first_number_from_many(combined, ("volume_24h", "volume_24h_usd"))
-            market_cap = self._first_number_from_many(combined, ("market_cap", "quote.USD.market_cap"))
+            volume_24h = self._first_number_from_many(
+                combined,
+                ("volume_24h", "volume_24h_usd"),
+                skip_zero=True,
+            )
+            market_cap = self._first_number_from_many(
+                combined,
+                ("market_cap", "quote.USD.market_cap"),
+                skip_zero=True,
+            )
             snapshot[symbol] = {
                 "symbol": symbol,
-                "price": self._first_number_from_many(combined, ("price", "last_price", "quote.USD.price")),
+                "price": self._first_number_from_many(
+                    combined,
+                    ("price", "last_price", "quote.USD.price"),
+                    skip_zero=True,
+                ),
                 "market_cap": market_cap,
                 "volume_1h": self._first_number_from_many(combined, ("volume_1h", "volume_1h_usd")),
                 "volume_24h": volume_24h,
@@ -472,8 +484,16 @@ class CMCMCPClient:
         snapshot: dict[str, Any] = {}
         for symbol in normalized_symbols:
             quote_data = quotes_by_symbol.get(symbol, {})
-            volume_24h = self._first_number_from_many([quote_data], ("volume_24h", "volume_24h_usd"))
-            market_cap = self._first_number_from_many([quote_data], ("market_cap", "quote.USD.market_cap"))
+            volume_24h = self._first_number_from_many(
+                [quote_data],
+                ("volume_24h", "volume_24h_usd"),
+                skip_zero=True,
+            )
+            market_cap = self._first_number_from_many(
+                [quote_data],
+                ("market_cap", "quote.USD.market_cap"),
+                skip_zero=True,
+            )
             estimated_slippage_pct = self._resolve_estimated_slippage_pct(
                 combined=[quote_data],
                 volume_24h=volume_24h,
@@ -481,7 +501,11 @@ class CMCMCPClient:
             )
             snapshot[symbol] = {
                 "symbol": symbol,
-                "price": self._first_number_from_many([quote_data], ("price", "last_price", "quote.USD.price")),
+                "price": self._first_number_from_many(
+                    [quote_data],
+                    ("price", "last_price", "quote.USD.price"),
+                    skip_zero=True,
+                ),
                 "market_cap": market_cap,
                 "volume_1h": self._first_number_from_many([quote_data], ("volume_1h", "volume_1h_usd")),
                 "volume_24h": volume_24h,
@@ -665,11 +689,15 @@ class CMCMCPClient:
             symbol = str(item.get("symbol") or item.get("base_symbol") or "").upper()
             if symbol:
                 by_symbol[symbol] = item
+        if "WBNB" in by_symbol and "BNB" not in by_symbol:
+            by_symbol["BNB"] = by_symbol["WBNB"]
         if not by_symbol and isinstance(payload, dict):
             for key, value in payload.items():
                 if isinstance(value, dict):
                     symbol = str(value.get("symbol") or key).upper()
                     by_symbol[symbol] = value
+        if "WBNB" in by_symbol and "BNB" not in by_symbol:
+            by_symbol["BNB"] = by_symbol["WBNB"]
         return by_symbol
 
     @classmethod
@@ -705,8 +733,18 @@ class CMCMCPClient:
     ) -> float | None:
         """Heuristic slippage proxy when CMC keyless/quotes payloads omit slippage."""
 
-        if volume_24h is None or market_cap is None or market_cap <= 0:
+        if volume_24h is None or volume_24h <= 0:
             return None
+
+        if market_cap is None or market_cap <= 0:
+            if volume_24h >= 10_000_000_000:
+                return 0.001
+            if volume_24h >= 1_000_000_000:
+                return 0.002
+            if volume_24h >= 100_000_000:
+                return 0.003
+            return 0.005
+
         liquidity_score = volume_24h / market_cap
         if liquidity_score > 0.1:
             return 0.001
@@ -720,9 +758,10 @@ class CMCMCPClient:
         payloads: list[dict[str, Any]],
         keys: tuple[str, ...],
         default: float | None = None,
+        skip_zero: bool = False,
     ) -> float | None:
         for payload in payloads:
-            value = cls._first_number(payload, keys, default=None)
+            value = cls._first_number(payload, keys, default=None, skip_zero=skip_zero)
             if value is not None:
                 return value
         return default
@@ -733,19 +772,26 @@ class CMCMCPClient:
         payload: dict[str, Any],
         keys: tuple[str, ...],
         default: float | None = None,
+        skip_zero: bool = False,
     ) -> float | None:
         for key in keys:
             found = cls._read_path(payload, key)
             if found is not None:
                 try:
-                    return float(found)
+                    val = float(found)
+                    if skip_zero and val == 0:
+                        continue
+                    return val
                 except (TypeError, ValueError):
                     continue
         for key in keys:
             found = cls._recursive_lookup(payload, key.split(".")[-1])
             if found is not None:
                 try:
-                    return float(found)
+                    val = float(found)
+                    if skip_zero and val == 0:
+                        continue
+                    return val
                 except (TypeError, ValueError):
                     continue
         return default

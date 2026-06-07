@@ -40,7 +40,7 @@ def merge_market_snapshots(
             combined = copy.deepcopy(existing)
             for field in hot_fields:
                 value = overlay_data.get(field)
-                if value is not None:
+                if value is not None and value != 0 and value != "":
                     combined[field] = value
             combined["symbol"] = normalized
         else:
