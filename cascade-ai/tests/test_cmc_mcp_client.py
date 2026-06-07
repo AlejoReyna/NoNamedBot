@@ -278,6 +278,7 @@ def test_fetch_keyless_quotes_snapshot_without_api_key(monkeypatch: Any) -> None
     snapshot = client.fetch_keyless_quotes_snapshot(["CAKE"])
 
     assert snapshot["CAKE"]["price"] == 10.0
+    assert snapshot["CAKE"]["estimated_slippage_pct"] == 0.001
     assert calls[0]["params"]["symbol"] == "CAKE"
     assert "X-CMC_PRO_API_KEY" not in calls[0]["headers"]
 

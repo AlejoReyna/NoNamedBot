@@ -295,6 +295,8 @@ class CMCMCPClient:
             return {}
 
         if not self.settings.use_keyless_primary:
+            if self.settings.use_dual_market_data:
+                return self.fetch_x402_enriched_snapshot(normalized_symbols)
             return self._snapshot_from_quotes(normalized_symbols, quotes)
 
         technicals = self._fetch_combined_payload(
@@ -469,10 +471,17 @@ class CMCMCPClient:
         for symbol in normalized_symbols:
             quote_data = quotes_by_symbol.get(symbol, {})
             volume_24h = self._first_number_from_many([quote_data], ("volume_24h", "volume_24h_usd"))
+            market_cap = self._first_number_from_many([quote_data], ("market_cap", "quote.USD.market_cap"))
+            estimated_slippage_pct = self._first_number_from_many(
+                [quote_data],
+                ("estimated_slippage_pct", "slippage_pct"),
+            )
+            if estimated_slippage_pct is None:
+                estimated_slippage_pct = self._estimate_slippage_from_liquidity(volume_24h, market_cap)
             snapshot[symbol] = {
                 "symbol": symbol,
                 "price": self._first_number_from_many([quote_data], ("price", "last_price", "quote.USD.price")),
-                "market_cap": self._first_number_from_many([quote_data], ("market_cap", "quote.USD.market_cap")),
+                "market_cap": market_cap,
                 "volume_1h": self._first_number_from_many([quote_data], ("volume_1h", "volume_1h_usd")),
                 "volume_24h": volume_24h,
                 "percent_change_1h": self._first_number_from_many(
@@ -490,6 +499,7 @@ class CMCMCPClient:
                 ),
                 "rolling_24h_hourly_volume_avg": volume_24h / 24 if volume_24h else None,
                 "bnb_1h_trend_pct": bnb_trend,
+                "estimated_slippage_pct": estimated_slippage_pct,
             }
         LOGGER.info("Built x402 quotes-only snapshot for %d symbols", len(snapshot))
         return snapshot
@@ -670,6 +680,22 @@ class CMCMCPClient:
             if isinstance(value, dict):
                 return list(value.values())
         return []
+
+    @staticmethod
+    def _estimate_slippage_from_liquidity(
+        volume_24h: float | None,
+        market_cap: float | None,
+    ) -> float | None:
+        """Heuristic slippage proxy when CMC keyless/quotes payloads omit slippage."""
+
+        if volume_24h is None or market_cap is None or market_cap <= 0:
+            return None
+        liquidity_score = volume_24h / market_cap
+        if liquidity_score > 0.1:
+            return 0.001
+        if liquidity_score > 0.01:
+            return 0.002
+        return 0.005
 
     @classmethod
     def _first_number_from_many(

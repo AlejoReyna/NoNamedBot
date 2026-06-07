@@ -32,6 +32,10 @@ SCALPING_FACTOR_WEIGHTS = {
 }
 
 
+def _true_factor_count(factor_scores: dict[str, bool]) -> int:
+    return sum(1 for passed in factor_scores.values() if passed)
+
+
 class ScalpingEngine:
     """Evaluate tokens using a weighted score instead of boolean gates."""
 
@@ -193,7 +197,7 @@ class ScalpingEngine:
             slippage_normal=slippage_normal,
             reason=f"scalping score {score:.0f}/100",
             factor_scores=factor_scores,
-            true_factor_count=int(score // 20),
+            true_factor_count=_true_factor_count(factor_scores),
             source="scalping_engine",
             entry_score=score,
             strategy_mode="scalping",
@@ -211,17 +215,7 @@ class ScalpingEngine:
 
         price = maybe_number(token_data.get("price"))
         ema_9 = self.price_cache.get_ema(symbol, 9) if price is not None else None
-        volume_5m = self._latest_volume(symbol)
-        avg_volume_1h = self._average_hourly_volume(symbol)
-        micro_momentum = (
-            price is not None
-            and ema_9 is not None
-            and price > ema_9
-            and volume_5m is not None
-            and avg_volume_1h is not None
-            and avg_volume_1h > 0
-            and volume_5m > avg_volume_1h * 1.5
-        )
+        micro_momentum = self._micro_momentum(symbol, token_data, price, ema_9)
         if slippage_normal is None:
             slippage_normal = maybe_number(token_data.get("estimated_slippage_pct"))
         slippage_ok = slippage_normal is not None and slippage_normal < 0.003
@@ -263,7 +257,7 @@ class ScalpingEngine:
             return None
 
         slippage_normal = maybe_number(data.get("estimated_slippage_pct"))
-        if slippage_normal is None or slippage_normal > self.settings.scalping_max_slippage_pct:
+        if slippage_normal is not None and slippage_normal > self.settings.scalping_max_slippage_pct:
             return None
 
         if self._pumped_recently(symbol, price):
@@ -294,11 +288,34 @@ class ScalpingEngine:
             slippage_normal=slippage_normal,
             reason=f"scalping score {score:.0f}/100 >= {self.settings.scalping_entry_score_min:.0f}",
             factor_scores=factor_scores,
-            true_factor_count=int(score // 20),
+            true_factor_count=_true_factor_count(factor_scores),
             source="scalping_engine",
             entry_score=score,
             strategy_mode="scalping",
         )
+
+    def _micro_momentum(
+        self,
+        symbol: str,
+        token_data: dict[str, Any],
+        price: float | None,
+        ema_9: float | None,
+    ) -> bool:
+        if price is None or ema_9 is None or price <= ema_9:
+            return False
+
+        volume_1h = maybe_number(token_data.get("volume_1h"))
+        volume_24h = maybe_number(token_data.get("volume_24h"))
+        if volume_1h is not None and volume_24h is not None and volume_24h > 0:
+            hourly_avg = volume_24h / 24
+            return hourly_avg > 0 and volume_1h > hourly_avg * 1.5
+
+        volume_latest = self._latest_volume(symbol)
+        avg_volume = self._average_hourly_volume(symbol)
+        if volume_latest is not None and avg_volume is not None and avg_volume > 0:
+            return volume_latest > avg_volume * 1.02
+
+        return False
 
     def _latest_volume(self, symbol: str) -> float | None:
         points = list(self.price_cache._data.get(symbol.upper(), ()))

@@ -234,13 +234,33 @@ def test_scalping_consecutive_loss_cooldown() -> None:
     assert guardrails.check_consecutive_loss_cooldown() is True
 
 
+def test_scalping_true_factor_count_matches_factor_booleans() -> None:
+    settings = _settings()
+    cache = PriceCache()
+    _seed_price_cache(cache, "CAKE", price=10.0, volume=200_000.0)
+    engine = ScalpingEngine(settings, cache)
+    score, factors = engine.score_token(
+        "CAKE",
+        _token_payload(),
+        _regime(),
+        _sentiment(gas_price_gwei=1.0),
+    )
+    assert _true_factor_count_from_engine(factors) == sum(1 for passed in factors.values() if passed)
+
+
+def _true_factor_count_from_engine(factors: dict[str, bool]) -> int:
+    from src.strategy.scalping_engine import _true_factor_count
+
+    return _true_factor_count(factors)
+
+
 def test_scalping_best_near_miss_returns_scored_symbol_when_entry_threshold_not_met() -> None:
     settings = _settings(scalping_entry_score_min=60.0)
     cache = PriceCache()
     _seed_price_cache(cache, "CAKE", price=10.0, volume=200_000.0)
     engine = ScalpingEngine(settings, cache)
     near_miss = engine.best_near_miss(
-        {"CAKE": _token_payload(estimated_slippage_pct=0.002, percent_change_1h=0.01)},
+        {"CAKE": _token_payload(estimated_slippage_pct=0.004, percent_change_1h=0.01)},
         10_000.0,
         _regime(),
         _risk_decision(),
