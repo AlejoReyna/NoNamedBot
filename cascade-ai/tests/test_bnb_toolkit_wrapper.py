@@ -198,6 +198,18 @@ def test_live_get_balance_accepts_explicit_account_and_contract_token() -> None:
     assert result["balances"] == {"USDC": 2.5}
 
 
+def test_live_get_balance_symbol_without_verified_contract_returns_zero() -> None:
+    wrapper = _wrapper_with_web3(FakeWeb3())
+
+    result = wrapper.get_balance("U")
+
+    assert result["mode"] == "live"
+    assert result["symbol"] == "U"
+    assert result["token"] == "U"
+    assert result["balance"] == 0.0
+    assert result["balances"] == {"U": 0.0}
+
+
 def test_agentkit_swap_path_is_disabled() -> None:
     tool = FakeTool("swap", {"amount_out": 99.0})
     wrapper = _wrapper_with_tools(tool)

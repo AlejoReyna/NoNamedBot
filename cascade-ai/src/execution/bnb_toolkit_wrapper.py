@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import Any
 
 from src.config.settings import Settings, load_settings
-from src.config.tokens import TOKEN_CONTRACTS_BSC, get_bsc_token_address
+from src.config.tokens import TOKEN_CONTRACTS_BSC, resolve_twak_token
+
+LOGGER = logging.getLogger(__name__)
 
 try:
     from web3 import Web3
@@ -189,7 +192,16 @@ class BnbToolkitWrapper:
             amount = float(w3.from_wei(raw_balance, "ether"))
             return self._balance_payload(account, symbol, token, amount, raw_balance, 18)
 
-        checksum_token = w3.to_checksum_address(token)
+        contract_address = self._resolve_erc20_contract_address(symbol, token)
+        if contract_address is None:
+            LOGGER.warning(
+                "No verified BSC contract for %s (%s); reporting zero balance for reconciliation",
+                symbol,
+                token,
+            )
+            return self._balance_payload(account, symbol, token, 0.0, 0, 18)
+
+        checksum_token = w3.to_checksum_address(contract_address)
         contract = w3.eth.contract(address=checksum_token, abi=ERC20_BALANCE_ABI)
         decimals = int(contract.functions.decimals().call())
         raw_balance = int(contract.functions.balanceOf(checksum_account).call())
@@ -264,6 +276,16 @@ class BnbToolkitWrapper:
         }
 
     @staticmethod
+    def _resolve_erc20_contract_address(symbol: str, token: str) -> str | None:
+        if BnbToolkitWrapper._is_hex_address(token):
+            return token.strip()
+        for key in (symbol.upper(), token.upper()):
+            address = TOKEN_CONTRACTS_BSC.get(key)
+            if address:
+                return address
+        return None
+
+    @staticmethod
     def _symbol_to_agentkit_token(symbol: str) -> str:
         token = symbol.strip()
         if BnbToolkitWrapper._is_hex_address(token):
@@ -271,7 +293,7 @@ class BnbToolkitWrapper:
         normalized = token.upper()
         if normalized == "BNB":
             return "BNB"
-        return get_bsc_token_address(normalized)
+        return resolve_twak_token(normalized)
 
     @staticmethod
     def _display_symbol_for_token(token_or_symbol: str) -> str:
