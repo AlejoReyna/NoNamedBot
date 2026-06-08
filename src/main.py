@@ -973,11 +973,16 @@ def _attempt_entry_v25(
         LOGGER.error("Execution failed for %s: %s", candidate.symbol, reconcile_result.status)
         return EntryAttempt(False, f"Execution failed: {reconcile_result.status}", position_pct, liquidity, reconcile_result)
 
+    amount_out = float(reconcile_result.amount_out_actual)
+    entry_price = candidate.price
+    if amount_out > 0:
+        entry_price = position_usd / amount_out
+
     _open_local_position_v25(
         position_manager,
         candidate.symbol,
-        float(reconcile_result.amount_out_actual),
-        candidate.price,
+        amount_out,
+        entry_price,
         position_usd,
         atr_pct,
         regime_result.regime,
