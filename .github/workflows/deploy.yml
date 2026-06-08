@@ -1,0 +1,75 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        required: true
+        default: production
+        type: choice
+        options:
+          - production
+          - staging
+      restart_only:
+        description: Skip git pull and pip install; only restart systemd
+        required: false
+        default: false
+        type: boolean
+      skip_pre_live_check:
+        description: Skip pre_live_check.py (emergency override)
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
+            if [ -z "$DEPLOY_PATH" ]; then
+              DEPLOY_PATH="/home/ubuntu/planb-plus"
+            fi
+            cd "$DEPLOY_PATH"
+
+            if [ "${{ inputs.restart_only }}" != "true" ]; then
+              git fetch origin
+              git checkout main
+              git pull --ff-only
+              source .venv/bin/activate
+              pip install -r requirements.txt -r requirements-ml.txt
+            fi
+
+            source .venv/bin/activate
+            python scripts/verify_twak_unlock.py
+
+            if [ "${{ inputs.skip_pre_live_check }}" != "true" ]; then
+              python scripts/pre_live_check.py
+            fi
+
+            systemctl --user daemon-reload
+            systemctl --user restart planb-plus
+
+            for i in $(seq 1 12); do
+              if curl -sf http://localhost:8080/health > /dev/null; then
+                echo "Health check passed"
+                exit 0
+              fi
+              echo "Waiting for health endpoint (attempt $i/12)..."
+              sleep 5
+            done
+
+            echo "Health check failed after restart"
+            exit 1
