@@ -6,7 +6,7 @@ GitHub Actions workflows live under `.github/workflows/`.
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `ci.yml` | Push and PR to `main` | Install deps and run `pytest` |
+| `ci.yml` | Push and PR to `main` | Install deps (`requirements.txt` + `requirements-ml.txt`) and run `python -m pytest` |
 | `deploy.yml` | Manual (`workflow_dispatch`) | SSH deploy to EC2 and restart `planb-plus` systemd user service |
 | `ml-retrain.yml` | Manual or weekly (Sunday 06:00 UTC) | Fetch data, train ML model, upload artifacts |
 

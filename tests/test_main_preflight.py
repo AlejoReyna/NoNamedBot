@@ -180,5 +180,5 @@ def test_live_preflight_fails_without_priced_target_snapshot(monkeypatch: Any, c
     assert main_module.main(["--live", "--preflight"]) == 1
 
     output = capsys.readouterr().out
-    assert "PASS CMC/x402 market snapshot - 1 item(s)" in output
+    assert "PASS CMC x402 market snapshot - 1 item(s)" in output
     assert "FAIL snapshot target price - none" in output
