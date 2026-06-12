@@ -238,6 +238,23 @@ TOKEN_CONTRACTS: dict[str, str] = {
 }
 
 CMC_IDS_BY_SYMBOL: dict[str, str] = {
+    # Pinned UCIDs disambiguate shared tickers: CMC's symbol lookup can return
+    # dead knockoff listings (e.g. DOGE -> "Doge Grok Companion") with null
+    # quotes. Verify additions with scripts/verify_cmc_ids.py before deploying.
+    # Canonical assets recovered in the June 12 unpriced-tokens audit:
+    "APE": "18876",
+    "BAT": "1697",
+    "BRETT": "29743",
+    "BTT": "16086",
+    "DAI": "4943",
+    "ELF": "2299",
+    "NFT": "9816",
+    "ROSE": "7653",
+    "SNX": "2586",
+    "SUSHI": "6758",
+    "TUSD": "2563",
+    "TWT": "5964",
+    # Original map:
     "ETH": "1027",
     "USDT": "825",
     "USDC": "3408",

@@ -369,22 +369,35 @@ class CMCMCPClient:
         )
 
     def _fetch_keyless_quotes_batch(self, symbols: list[str]) -> dict[str, Any]:
-        return self._fetch_keyless(
-            "get_crypto_quotes_latest",
-            {
-                "id": self._symbols_to_id_arg(symbols),
-                "symbol": self._symbols_to_symbol_arg(symbols),
-            },
-        )
+        return self._fetch_keyless_id_preferred("get_crypto_quotes_latest", symbols)
 
     def _fetch_keyless_market_metrics_batch(self, symbols: list[str]) -> dict[str, Any]:
-        return self._fetch_keyless(
-            "get_crypto_market_metrics",
-            {
-                "id": self._symbols_to_id_arg(symbols),
-                "symbol": self._symbols_to_symbol_arg(symbols),
-            },
-        )
+        return self._fetch_keyless_id_preferred("get_crypto_market_metrics", symbols)
+
+    def _fetch_keyless_id_preferred(self, tool_name: str, symbols: list[str]) -> dict[str, Any]:
+        """Fetch keyless quotes by CMC id when pinned, by ticker otherwise.
+
+        Ticker lookups are ambiguous: CMC resolves shared tickers (DOGE, UNI,
+        TWT, ...) to arbitrary listings, sometimes dead knockoffs with null
+        quotes. Pinned ids in CMC_IDS_BY_SYMBOL always win over ticker results.
+        """
+
+        with_id = [s for s in symbols if resolve_cmc_coin_id(s)]
+        without_id = [s for s in symbols if not resolve_cmc_coin_id(s)]
+        merged: dict[str, Any] = {}
+        if without_id:
+            payload = self._fetch_keyless(
+                tool_name, {"symbol": self._symbols_to_symbol_arg(without_id)}
+            )
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, dict):
+                merged.update(data)
+        if with_id:
+            payload = self._fetch_keyless(tool_name, {"id": self._symbols_to_id_arg(with_id)})
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, dict):
+                merged.update(data)  # id-based results override ticker results
+        return {"data": merged}
 
     def _fetch_x402_quotes_batch(self, symbols: list[str]) -> dict[str, Any]:
         return self._call_tool_x402(
@@ -922,7 +935,15 @@ class CMCMCPClient:
             return payload
 
         normalized: dict[str, Any] = {}
+        flattened: list[Any] = []
         for item in items:
+            # Symbol queries can return a list of every listing sharing the
+            # ticker; flatten so each candidate competes individually.
+            if isinstance(item, list):
+                flattened.extend(item)
+            else:
+                flattened.append(item)
+        for item in flattened:
             if not isinstance(item, dict):
                 continue
             symbol = str(item.get("symbol") or "").upper()
@@ -933,5 +954,24 @@ class CMCMCPClient:
                 flat = {**item, **quote_usd, "symbol": symbol}
             else:
                 flat = {**item, "symbol": symbol}
+            existing = normalized.get(symbol)
+            if existing is not None and cls._quote_rank(existing) >= cls._quote_rank(flat):
+                continue  # never let a dead knockoff overwrite a live listing
             normalized[symbol] = flat
         return {"data": normalized}
+
+    @staticmethod
+    def _quote_rank(row: dict[str, Any]) -> tuple[int, int, float]:
+        """Orderable quality of a quote row: priced > active > bigger market cap."""
+
+        try:
+            price = float(row.get("price"))
+            priced = 1 if price > 0 else 0
+        except (TypeError, ValueError):
+            priced = 0
+        active = 1 if row.get("is_active") in (1, True, None) else 0
+        try:
+            market_cap = float(row.get("market_cap") or 0.0)
+        except (TypeError, ValueError):
+            market_cap = 0.0
+        return (priced, active, market_cap)
