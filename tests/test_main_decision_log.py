@@ -104,7 +104,7 @@ def _read_decision(path: Path) -> dict[str, Any]:
     return json.loads(lines[0])
 
 
-def test_breakout_near_miss_cooldown_rotates_below_floor_symbol(tmp_path: Path) -> None:
+def test_breakout_near_miss_cooldown_rotates_non_entry_symbol(tmp_path: Path) -> None:
     settings = _settings(
         tmp_path,
         strategy_mode="breakout",
@@ -132,7 +132,55 @@ def test_breakout_near_miss_cooldown_rotates_below_floor_symbol(tmp_path: Path) 
         cooldowns=cooldowns,
     )
 
+    assert cooldowns == {"MYX": 9}
+
+    main_module._update_breakout_near_miss_cooldowns(
+        settings,
+        cycle_number=8,
+        action="ENTER",
+        telemetry_candidate=_candidate("MYX", 45.0),
+        cooldowns=cooldowns,
+    )
+
     assert cooldowns == {}
+
+
+def test_breakout_recent_analysis_excludes_survive_agent_restart(tmp_path: Path) -> None:
+    decision_log = tmp_path / "decision_log.jsonl"
+    decision_log.write_text(
+        "\n".join(
+            [
+                json.dumps({"strategy_mode": "breakout", "action": "WAIT", "symbol": "H"}),
+                json.dumps({"strategy_mode": "breakout", "action": "WAIT", "symbol": "MYX"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    settings = _settings(
+        tmp_path,
+        strategy_mode="breakout",
+        decision_log_path=str(decision_log),
+        breakout_near_miss_cooldown_cycles=1,
+    )
+
+    assert main_module._breakout_recent_analysis_excludes_from_log(settings) == {"MYX"}
+
+
+def test_breakout_recent_analysis_excludes_skip_entered_symbols(tmp_path: Path) -> None:
+    decision_log = tmp_path / "decision_log.jsonl"
+    decision_log.write_text(
+        json.dumps({"strategy_mode": "breakout", "action": "ENTER", "symbol": "MYX"}) + "\n",
+        encoding="utf-8",
+    )
+    settings = _settings(
+        tmp_path,
+        strategy_mode="breakout",
+        decision_log_path=str(decision_log),
+        breakout_near_miss_cooldown_cycles=1,
+    )
+
+    assert main_module._breakout_recent_analysis_excludes_from_log(settings) == set()
 
 
 def test_run_agent_logs_evaluated_wait_decision(

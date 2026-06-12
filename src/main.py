@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import re
 import signal
 import sys
 import time
 import types
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -493,6 +495,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             for symbol, until_cycle in breakout_near_miss_cooldowns.items()
             if until_cycle >= cycle_number
         }
+        recent_near_miss_excludes.update(_breakout_recent_analysis_excludes_from_log(settings))
         now_utc = datetime.now(timezone.utc)
         open_positions = position_manager.list_open_positions()
         market_snapshot = _fetch_snapshot(
@@ -974,10 +977,53 @@ def _entries_blocked_reason(
     return None
 
 
-def _breakout_quote_score_floor(settings: Settings) -> float:
-    threshold = float(getattr(settings, "breakout_entry_score_min", 45.0) or 45.0)
-    buffer = max(0.0, float(getattr(settings, "breakout_quote_score_buffer", 5.0) or 0.0))
-    return max(0.0, threshold - buffer)
+def _breakout_recent_analysis_excludes_from_log(settings: Settings) -> set[str]:
+    """Symbols from recent non-entry breakout decisions, persisted across restarts."""
+
+    if settings.strategy_mode != "breakout":
+        return set()
+
+    cooldown_cycles = max(0, int(getattr(settings, "breakout_near_miss_cooldown_cycles", 1) or 0))
+    if cooldown_cycles <= 0:
+        return set()
+
+    path = Path(settings.decision_log_path)
+    if not path.exists():
+        return set()
+
+    lines: deque[str] = deque(maxlen=cooldown_cycles)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    lines.append(line)
+    except OSError as exc:
+        LOGGER.warning("Could not read breakout recent-analysis cooldown log: %s", exc)
+        return set()
+
+    excludes: set[str] = set()
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        symbol = _breakout_cooldown_symbol_from_record(record)
+        if symbol is not None:
+            excludes.add(symbol)
+    return excludes
+
+
+def _breakout_cooldown_symbol_from_record(record: dict[str, Any]) -> str | None:
+    strategy_mode = str(record.get("strategy_mode") or "breakout").lower()
+    if strategy_mode != "breakout":
+        return None
+
+    action = str(record.get("action") or "").upper()
+    if action == "ENTER":
+        return None
+
+    symbol = str(record.get("symbol") or "").upper()
+    return symbol or None
 
 
 def _update_breakout_near_miss_cooldowns(
@@ -987,7 +1033,7 @@ def _update_breakout_near_miss_cooldowns(
     telemetry_candidate: EntryCandidate | None,
     cooldowns: dict[str, int],
 ) -> None:
-    """Temporarily rotate away from below-floor breakout telemetry symbols."""
+    """Temporarily rotate away from non-entry breakout telemetry symbols."""
 
     if settings.strategy_mode != "breakout" or telemetry_candidate is None:
         return
@@ -997,11 +1043,6 @@ def _update_breakout_near_miss_cooldowns(
         return
 
     if action == "ENTER":
-        cooldowns.pop(symbol, None)
-        return
-
-    score = telemetry_candidate.entry_score
-    if score is None or score >= _breakout_quote_score_floor(settings):
         cooldowns.pop(symbol, None)
         return
 
