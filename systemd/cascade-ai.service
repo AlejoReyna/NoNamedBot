@@ -7,6 +7,11 @@ StartLimitBurst=10
 
 [Service]
 Type=simple
+# Run as ec2-user: TWAK CLI credentials and npm-global bin live in its home.
+User=ec2-user
+Group=ec2-user
+Environment=HOME=/home/ec2-user
+Environment=PATH=/home/ec2-user/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 # WorkingDirectory is load-bearing: price_cache.json / volume_cache.json /
 # positions.json / guardrail_state.json are all cwd-relative paths.
 WorkingDirectory=/home/ec2-user/cascade-ai
