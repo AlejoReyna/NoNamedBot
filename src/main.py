@@ -1956,6 +1956,7 @@ def _reconstruct_positions_from_balances(
         price = _number(market_snapshot.get(symbol, {}).get("price"), 1.0)
         if price <= 0:
             price = 1.0
+        now = datetime.now(timezone.utc)
         position = Position(
             symbol=symbol,
             amount_tokens=amount_tokens,
@@ -1964,7 +1965,9 @@ def _reconstruct_positions_from_balances(
             highest_price=price,
             trailing_stop_price=price * (1 - settings.trailing_stop_pct),
             take_profit_price=price * (1 + settings.take_profit_pct),
-            opened_at=datetime.now(timezone.utc),
+            opened_at=now,
+            current_price=price,
+            current_price_at=now,
         )
         position_manager.restore_position(position)
         reconstructed += 1

@@ -38,6 +38,13 @@ def test_positions_persist_and_reload(tmp_path: object) -> None:
     assert position is not None
     assert position.amount_tokens == 4.0
     assert position.entry_price == 2.5
+    assert position.current_price == 2.5
+    assert position.current_price_at is not None
+
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    persisted = payload["positions"][0]
+    assert persisted["current_price"] == 2.5
+    assert persisted["current_price_at"] is not None
 
 
 def test_missing_position_state_initializes_empty_file(tmp_path: object) -> None:
@@ -47,6 +54,52 @@ def test_missing_position_state_initializes_empty_file(tmp_path: object) -> None
 
     assert manager.load_positions() is False
     assert json.loads(state_path.read_text(encoding="utf-8")) == {"positions": []}
+
+
+def test_old_position_state_without_current_price_loads(tmp_path: object) -> None:
+    state_path = tmp_path / "positions.json"  # type: ignore[operator]
+    state_path.write_text(
+        json.dumps(
+            {
+                "positions": [
+                    {
+                        "symbol": "CAKE",
+                        "amount_tokens": 4.0,
+                        "entry_price": 2.5,
+                        "entry_value_usdc": 10.0,
+                        "highest_price": 2.5,
+                        "trailing_stop_price": 2.35,
+                        "take_profit_price": 2.7,
+                        "opened_at": "2026-06-05T15:10:44Z",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = Settings(position_state_path=str(state_path))
+    manager = PositionManager(settings)
+
+    assert manager.load_positions() is True
+    position = manager.get_position("CAKE")
+    assert position is not None
+    assert position.current_price is None
+    assert position.current_price_at is None
+
+
+def test_update_price_persists_current_price_without_new_high(tmp_path: object) -> None:
+    state_path = tmp_path / "positions.json"  # type: ignore[operator]
+    settings = Settings(position_state_path=str(state_path))
+    manager = PositionManager(settings)
+    manager.open_position("CAKE", amount_tokens=4.0, entry_price=2.5, entry_value_usdc=10.0)
+
+    assert manager.update_price("CAKE", 2.45) is None
+
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    persisted = payload["positions"][0]
+    assert persisted["current_price"] == 2.45
+    assert persisted["current_price_at"] is not None
+    assert persisted["highest_price"] == 2.5
 
 
 def test_missing_state_reconstructs_positions_from_wallet_balances(tmp_path: object) -> None:

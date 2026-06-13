@@ -38,6 +38,7 @@ class ScalpingPositionManager(PositionManager):
         normalized = symbol.upper()
         if self.is_symbol_on_cooldown(normalized):
             raise ValueError(f"{normalized} is on post-close cooldown")
+        now = datetime.now(timezone.utc)
         position = Position(
             symbol=normalized,
             amount_tokens=amount_tokens,
@@ -46,7 +47,9 @@ class ScalpingPositionManager(PositionManager):
             highest_price=entry_price,
             trailing_stop_price=entry_price * (1 - self.settings.scalping_stop_loss_pct),
             take_profit_price=entry_price * (1 + self.settings.scalping_take_profit_pct),
-            opened_at=datetime.now(timezone.utc),
+            opened_at=now,
+            current_price=entry_price,
+            current_price_at=now,
         )
         self._positions[normalized] = position
         self.persist_positions()
@@ -77,9 +80,13 @@ class ScalpingPositionManager(PositionManager):
         del price_cache
         self._pending_exits.clear()
         now = datetime.now(timezone.utc)
+        should_persist = False
         for position in list(self.list_open_positions()):
             token_data = market_snapshot.get(position.symbol, {})
             current_price = self._snapshot_price(token_data, position.entry_price)
+            position.current_price = current_price
+            position.current_price_at = now
+            should_persist = True
             exit_reason = self._evaluate_exit(position, current_price, now)
             if exit_reason is not None:
                 self._pending_exits.append(
@@ -89,6 +96,8 @@ class ScalpingPositionManager(PositionManager):
                         current_price=current_price,
                     )
                 )
+        if should_persist:
+            self.persist_positions()
 
     def pop_pending_exit(self) -> ScalpingExitSignal | None:
         if not self._pending_exits:

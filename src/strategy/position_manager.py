@@ -28,6 +28,9 @@ class Position:
     # data. Exit levels are re-anchored from live price on the first update
     # and exits are deferred one cycle (additive field; dashboard Zod ignores it).
     reconstructed: bool = False
+    current_price: float | None = None
+    # ISO 8601 timestamp of when current_price was last refreshed.
+    current_price_at: datetime | None = None
 
 
 class PositionManager:
@@ -51,6 +54,7 @@ class PositionManager:
         assert_tradable_symbol(normalized)
         if normalized in self._positions:
             raise ValueError(f"{normalized} position is already open")
+        now = datetime.now(timezone.utc)
         position = Position(
             symbol=normalized,
             amount_tokens=amount_tokens,
@@ -59,7 +63,9 @@ class PositionManager:
             highest_price=entry_price,
             trailing_stop_price=entry_price * (1 - self.settings.trailing_stop_pct),
             take_profit_price=entry_price * (1 + self.settings.take_profit_pct),
-            opened_at=datetime.now(timezone.utc),
+            opened_at=now,
+            current_price=entry_price,
+            current_price_at=now,
         )
         self._positions[normalized] = position
         self.persist_positions()
@@ -79,6 +85,8 @@ class PositionManager:
         position = self._positions.get(normalized)
         if position is None:
             return None
+        position.current_price = current_price
+        position.current_price_at = datetime.now(timezone.utc)
         if position.reconstructed:
             # First live price for a reconstructed row: re-anchor stops from
             # the observed price (synthetic entries can be 0, which would
@@ -91,10 +99,14 @@ class PositionManager:
             position.reconstructed = False
             self.persist_positions()
             return None
+        needs_persist = True
         if current_price > position.highest_price:
             position.highest_price = current_price
             raised_stop = current_price * (1 - self._active_trailing_stop_pct(position))
             position.trailing_stop_price = max(position.trailing_stop_price, raised_stop)
+            self.persist_positions()
+            needs_persist = False
+        if needs_persist:
             self.persist_positions()
         if current_price >= position.take_profit_price:
             return "take_profit"
@@ -179,14 +191,17 @@ class PositionManager:
             "take_profit_price": position.take_profit_price,
             "opened_at": position.opened_at.isoformat(),
             "reconstructed": position.reconstructed,
+            "current_price": position.current_price,
+            "current_price_at": (
+                position.current_price_at.isoformat() if position.current_price_at else None
+            ),
         }
 
     @staticmethod
     def _position_from_dict(payload: dict[str, Any]) -> Position:
-        opened_at_raw = str(payload["opened_at"])
-        opened_at = datetime.fromisoformat(opened_at_raw.replace("Z", "+00:00"))
-        if opened_at.tzinfo is None:
-            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        opened_at = PositionManager._parse_datetime(payload["opened_at"])
+        if opened_at is None:
+            raise ValueError("Position is missing opened_at")
         return Position(
             symbol=str(payload["symbol"]).upper(),
             amount_tokens=float(payload["amount_tokens"]),
@@ -197,7 +212,22 @@ class PositionManager:
             take_profit_price=float(payload["take_profit_price"]),
             opened_at=opened_at,
             reconstructed=bool(payload.get("reconstructed", False)),
+            current_price=(
+                float(payload["current_price"])
+                if payload.get("current_price") is not None
+                else None
+            ),
+            current_price_at=PositionManager._parse_datetime(payload.get("current_price_at")),
         )
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> datetime | None:
+        if value is None:
+            return None
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
 
 
 def calculate_position_pct(

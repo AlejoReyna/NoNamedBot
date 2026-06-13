@@ -68,9 +68,11 @@ def test_position_manager_tightens_trailing_stop_in_profit_steps(tmp_path: Path)
     assert manager.update_price("CAKE", 108.0) is None
     position = manager.get_position("CAKE")
     assert position is not None
+    assert position.current_price == 108.0
     assert round(position.trailing_stop_price, 2) == 103.68
 
     assert manager.update_price("CAKE", 112.0) is None
     position = manager.get_position("CAKE")
     assert position is not None
+    assert position.current_price == 112.0
     assert round(position.trailing_stop_price, 2) == 108.64
