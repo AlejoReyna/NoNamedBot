@@ -216,7 +216,12 @@ def calculate_position_pct(
     regime_mult = max(0.0, float(regime_multiplier))
     risk_mult = max(0.0, float(risk_state_multiplier))
     if atr_pct is None or atr_pct <= 0:
-        fallback = min(0.01, max_position_pct) * regime_mult * risk_mult
+        # Cold start: the price cache is not yet warm enough to compute ATR.
+        # Deploy at the configured max_position_pct (still scaled by regime and
+        # risk-state multipliers) instead of a hard 1% cap, so capital is
+        # actually put to work while the cache warms up. Drawdown/daily-loss
+        # guardrails still gate entries downstream.
+        fallback = max_position_pct * regime_mult * risk_mult
         return max(0.0, min(fallback, max_position_pct))
 
     stop_distance_pct = max(0.015, min(0.08, float(atr_pct) * 2.0))
