@@ -44,8 +44,12 @@ def test_reduced_risk_state_reduces_size() -> None:
     assert reduced == normal * 0.5
 
 
-def test_missing_atr_uses_one_percent_fallback_edge() -> None:
-    assert calculate_position_pct(1000, None, 1.0, 1.0, 0) == 0.01
+def test_missing_atr_uses_max_position_pct_cold_start() -> None:
+    # Cold start (ATR unavailable) deploys at the configured max_position_pct,
+    # not a hard 1% cap, so capital is used while the price cache warms up.
+    assert calculate_position_pct(1000, None, 1.0, 1.0, 0, max_position_pct=0.05) == 0.05
+    # Regime/risk multipliers still scale the cold-start size down.
+    assert calculate_position_pct(1000, None, 1.0, 0.5, 0, max_position_pct=0.05) == 0.025
 
 
 def test_zero_equity_returns_zero_edge() -> None:
