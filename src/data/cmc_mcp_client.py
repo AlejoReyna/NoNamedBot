@@ -659,10 +659,10 @@ class CMCMCPClient:
             )
             if payload is None:
                 raise RuntimeError("x402 client returned None")
-            self.spend_governor.record_spend()
+            self.spend_governor.record_spend(tool=tool_name)
         except Exception as exc:
             LOGGER.warning("CMC MCP x402 call %s failed: %s", tool_name, exc)
-            self.spend_governor.record_failure()
+            self.spend_governor.record_failure(tool=tool_name, reason=str(exc))
             return self._fetch_keyless(tool_name, arguments)
 
         if not isinstance(payload, dict):
@@ -707,10 +707,10 @@ class CMCMCPClient:
             )
             if payload is None:
                 raise RuntimeError("x402 client returned None")
-            self.spend_governor.record_spend()
+            self.spend_governor.record_spend(tool=tool_name)
         except Exception as exc:
             LOGGER.warning("CMC MCP x402 call %s failed: %s", tool_name, exc)
-            self.spend_governor.record_failure()
+            self.spend_governor.record_failure(tool=tool_name, reason=str(exc))
             return {}
 
         if not isinstance(payload, dict):

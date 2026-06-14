@@ -14,11 +14,30 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
+
+from src.common.logging_schema import append_to_file
 
 LOGGER = logging.getLogger(__name__)
+SENSITIVE_HEX_RE = re.compile(r"0x[a-fA-F0-9]{16,}")
+LONG_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_+/=-]{80,}\b")
+
+
+@dataclass(frozen=True)
+class X402CallLog:
+    ts: str
+    outcome: Literal["success", "failure"]
+    tool: str | None
+    amount_usdc: float
+    http_status: int | None
+    reason: str | None
+    daily_spend_usdc: float
+    total_spend_usdc: float
 
 
 class X402SpendGovernor:
@@ -31,12 +50,14 @@ class X402SpendGovernor:
         cost_per_call_usdc: float,
         failure_cooldown_seconds: int = 900,
         ledger_path: str | Path = "logs/x402_spend.json",
+        call_log_path: str | Path = "logs/x402_calls.jsonl",
     ) -> None:
         self.daily_budget_usdc = max(0.0, float(daily_budget_usdc))
         self.total_budget_usdc = max(0.0, float(total_budget_usdc))
         self.cost_per_call_usdc = max(0.0, float(cost_per_call_usdc))
         self.failure_cooldown_seconds = max(0, int(failure_cooldown_seconds))
         self.ledger_path = Path(ledger_path)
+        self.call_log_path = Path(call_log_path)
         self._day = self._today()
         self._daily_spend = 0.0
         self._total_spend = 0.0
@@ -72,7 +93,13 @@ class X402SpendGovernor:
             return False
         return True
 
-    def record_spend(self, amount_usdc: float | None = None) -> None:
+    def record_spend(
+        self,
+        amount_usdc: float | None = None,
+        *,
+        tool: str | None = None,
+        http_status: int | None = None,
+    ) -> None:
         """Record a successful paid call (defaults to the per-call cap)."""
 
         self._roll_day_if_needed()
@@ -81,8 +108,21 @@ class X402SpendGovernor:
         self._total_spend += spent
         self._last_failure_monotonic = None
         self._save()
+        self._append_call_record(
+            outcome="success",
+            amount_usdc=spent,
+            tool=tool,
+            http_status=http_status,
+            reason=None,
+        )
 
-    def record_failure(self, assume_charged: bool = True) -> None:
+    def record_failure(
+        self,
+        assume_charged: bool = True,
+        *,
+        tool: str | None = None,
+        reason: str | None = None,
+    ) -> None:
         """Record a failed paid call and start the retry cooldown.
 
         ``assume_charged`` budgets conservatively: a call that failed after the
@@ -91,11 +131,19 @@ class X402SpendGovernor:
         """
 
         self._roll_day_if_needed()
-        if assume_charged:
-            self._daily_spend += self.cost_per_call_usdc
-            self._total_spend += self.cost_per_call_usdc
+        charged = self.cost_per_call_usdc if assume_charged else 0.0
+        if charged:
+            self._daily_spend += charged
+            self._total_spend += charged
         self._last_failure_monotonic = time.monotonic()
         self._save()
+        self._append_call_record(
+            outcome="failure",
+            amount_usdc=charged,
+            tool=tool,
+            http_status=None,
+            reason=reason,
+        )
 
     def snapshot(self) -> dict[str, float | str | bool]:
         """Telemetry payload for logs and the health endpoint."""
@@ -162,3 +210,39 @@ class X402SpendGovernor:
             )
         except OSError as exc:
             LOGGER.warning("x402 governor: could not persist ledger: %s", exc)
+
+    def _append_call_record(
+        self,
+        *,
+        outcome: Literal["success", "failure"],
+        amount_usdc: float,
+        tool: str | None,
+        http_status: int | None,
+        reason: str | None,
+    ) -> None:
+        record = X402CallLog(
+            ts=datetime.now(timezone.utc).isoformat(),
+            outcome=outcome,
+            tool=tool,
+            amount_usdc=round(max(0.0, float(amount_usdc)), 6),
+            http_status=http_status,
+            reason=self._redact_reason(reason),
+            daily_spend_usdc=round(self._daily_spend, 6),
+            total_spend_usdc=round(self._total_spend, 6),
+        )
+        try:
+            append_to_file(self.call_log_path, record)
+        except OSError as exc:
+            LOGGER.warning("x402 governor: could not persist call log: %s", exc)
+
+    @staticmethod
+    def _redact_reason(reason: str | None, limit: int = 200) -> str | None:
+        if reason is None:
+            return None
+
+        value = " ".join(str(reason).split())
+        value = SENSITIVE_HEX_RE.sub("0x[redacted]", value)
+        value = LONG_TOKEN_RE.sub("[redacted]", value)
+        if len(value) <= limit:
+            return value
+        return f"{value[: limit - 3]}..."
