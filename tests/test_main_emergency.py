@@ -46,6 +46,44 @@ def test_emergency_liquidate_defaults_to_live_mode(monkeypatch: object, tmp_path
     assert observed["swap"] == ("0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82", "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d", 2.0, 0.01)
 
 
+def test_emergency_liquidate_continues_after_failed_position(monkeypatch: object, tmp_path: object) -> None:
+    settings = Settings(
+        paper_trade=False,
+        position_state_path=str(tmp_path / "positions.json"),  # type: ignore[operator]
+        guardrail_state_path=str(tmp_path / "guardrail_state.json"),  # type: ignore[operator]
+        execution_log_path=str(tmp_path / "execution_log.jsonl"),  # type: ignore[operator]
+    )
+    position_manager = PositionManager(settings)
+    position_manager.open_position("ATOM", amount_tokens=0.0528, entry_price=2.0, entry_value_usdc=0.1056)
+    position_manager.open_position("CAKE", amount_tokens=2.0, entry_price=3.0, entry_value_usdc=6.0)
+    guardrails = main_module.Guardrails(settings)
+    calls: list[str] = []
+
+    def fake_execute_logged_swap(
+        settings_arg: Settings,
+        router: object,
+        action: str,
+        from_symbol: str,
+        to_symbol: str,
+        amount_in: float,
+        max_slippage_pct: float,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        del settings_arg, router, action, to_symbol, amount_in, max_slippage_pct, kwargs
+        calls.append(from_symbol)
+        if from_symbol == "ATOM":
+            raise RuntimeError("twak swap failed with exit code 1: insufficient balance")
+        return {"tx_hash": "0x" + "1" * 64}
+
+    monkeypatch.setattr(main_module, "_execute_logged_swap", fake_execute_logged_swap)
+
+    main_module.emergency_liquidate(position_manager, object(), guardrails)  # type: ignore[arg-type]
+
+    assert calls == ["ATOM", "CAKE"]
+    assert position_manager.get_position("ATOM") is not None
+    assert position_manager.get_position("CAKE") is None
+
+
 def test_balance_command_reads_live_balances(monkeypatch: object, capsys: object) -> None:
     settings = Settings(paper_trade=True)
     observed: dict[str, object] = {}

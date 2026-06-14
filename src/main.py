@@ -157,15 +157,23 @@ def emergency_liquidate(
             continue
         LOGGER.warning("Emergency liquidating %s", position.symbol)
         execution_slippage = _require_execution_slippage(guardrails.settings.max_slippage_pct)
-        result = _execute_logged_swap(
-            guardrails.settings,
-            router,
-            "emergency_liquidation",
-            position.symbol,
-            stable_symbol,
-            position.amount_tokens,
-            execution_slippage,
-        )
+        try:
+            result = _execute_logged_swap(
+                guardrails.settings,
+                router,
+                "emergency_liquidation",
+                position.symbol,
+                stable_symbol,
+                position.amount_tokens,
+                execution_slippage,
+            )
+        except Exception as exc:
+            LOGGER.error(
+                "Emergency liquidation for %s failed: %s; position left open, continuing",
+                position.symbol,
+                exc,
+            )
+            continue
         if not _execution_has_tx_hash(result):
             LOGGER.error(
                 "Emergency liquidation for %s returned no tx hash; local position remains open",
