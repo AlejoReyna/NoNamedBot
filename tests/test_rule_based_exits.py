@@ -15,6 +15,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from src.config.settings import Settings
 from src.strategy.position_manager import (
     PositionManager,
@@ -170,7 +172,8 @@ def test_window_flatten_helper(tmp_path: Path) -> None:
 
     captured = {}
 
-    def _fake_liquidate(pm, router, guardrails):  # noqa: ANN001
+    def _fake_liquidate(pm, router, guardrails, toolkit=None):  # noqa: ANN001
+        del router, guardrails, toolkit
         captured["called"] = True
         pm._open.clear()
 
@@ -244,3 +247,74 @@ def test_failed_exit_swap_does_not_crash(tmp_path: Path, monkeypatch) -> None:
         manager, object(), guardrails, "ATOM", 1.95, 100.0, exit_reason="time_stop"
     )
     assert manager.get_position("ATOM") is not None
+
+
+def test_exit_swap_caps_to_live_wallet_balance(tmp_path: Path, monkeypatch) -> None:
+    from src import main as main_mod
+
+    settings = _settings(tmp_path)
+    manager = PositionManager(settings)
+    manager.open_position(
+        "DOGE",
+        amount_tokens=5.59594069,
+        entry_price=0.089,
+        position_usd=0.498,
+        atr_pct=0.03,
+        regime=MarketRegime.TRENDING_UP,
+    )
+    calls: list[dict[str, object]] = []
+
+    class _Guardrails:
+        def __init__(self) -> None:
+            self.settings = settings
+
+        def record_trade(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            del args, kwargs
+
+    class _Toolkit:
+        def get_balance(self, symbol: str) -> dict[str, object]:
+            assert symbol == "DOGE"
+            return {"symbol": "DOGE", "balance": 5.59530611}
+
+    def _swap(
+        settings_arg,
+        router,
+        action,
+        from_symbol,
+        to_symbol,
+        amount_in,
+        max_slippage_pct,
+        expected_amount_out=None,
+        **kwargs,
+    ):
+        del settings_arg, router, action, to_symbol, max_slippage_pct, kwargs
+        calls.append(
+            {
+                "from_symbol": from_symbol,
+                "amount_in": amount_in,
+                "expected_amount_out": expected_amount_out,
+            }
+        )
+        return {"tx_hash": "0x" + "1" * 64}
+
+    monkeypatch.setattr(main_mod, "_execute_logged_swap", _swap)
+
+    main_mod._execute_position_exit(
+        manager,
+        object(),
+        _Guardrails(),
+        "DOGE",
+        0.086,
+        100.0,
+        exit_reason="time_stop",
+        toolkit=_Toolkit(),
+    )
+
+    assert calls == [
+        {
+            "from_symbol": "DOGE",
+            "amount_in": pytest.approx(5.59530611),
+            "expected_amount_out": pytest.approx(5.59530611 * 0.086),
+        }
+    ]
+    assert manager.get_position("DOGE") is None

@@ -148,6 +148,7 @@ def emergency_liquidate(
     position_manager: PositionManager,
     router: PancakeSwapRouter,
     guardrails: Guardrails,
+    toolkit: BnbToolkitWrapper | None = None,
 ) -> None:
     """Market-sell all process-local open positions back to USDC."""
 
@@ -157,6 +158,14 @@ def emergency_liquidate(
             continue
         LOGGER.warning("Emergency liquidating %s", position.symbol)
         execution_slippage = _require_execution_slippage(guardrails.settings.max_slippage_pct)
+        amount_in = _exit_amount_from_live_balance(position, toolkit)
+        if amount_in <= 0:
+            LOGGER.warning(
+                "Emergency liquidation skipping %s; live wallet balance is zero, removing stale local position",
+                position.symbol,
+            )
+            position_manager.close_position(position.symbol)
+            continue
         try:
             result = _execute_logged_swap(
                 guardrails.settings,
@@ -164,7 +173,7 @@ def emergency_liquidate(
                 "emergency_liquidation",
                 position.symbol,
                 stable_symbol,
-                position.amount_tokens,
+                amount_in,
                 execution_slippage,
             )
         except Exception as exc:
@@ -189,6 +198,7 @@ def _maybe_flatten_for_window(
     router: PancakeSwapRouter,
     guardrails: Guardrails,
     now: datetime,
+    toolkit: BnbToolkitWrapper | None = None,
 ) -> bool:
     """Liquidate the whole book to USDC shortly before the competition deadline.
 
@@ -217,7 +227,7 @@ def _maybe_flatten_for_window(
             len(open_positions),
             end_dt.isoformat(),
         )
-        emergency_liquidate(position_manager, router, guardrails)
+        emergency_liquidate(position_manager, router, guardrails, toolkit)
     return True
 
 
@@ -600,7 +610,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
         )
         _update_price_cache(price_cache, market_snapshot, now_utc)
         window_flatten_active = _maybe_flatten_for_window(
-            settings, position_manager, router, guardrails, now_utc
+            settings, position_manager, router, guardrails, now_utc, toolkit
         )
         if needs_balance_reconstruction:
             reconstructed = _reconstruct_positions_from_balances(
@@ -700,7 +710,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                 entries_blocked_reason="risk_state:kill_switch",
             )
             if position_manager.list_open_positions():
-                emergency_liquidate(position_manager, router, guardrails)
+                emergency_liquidate(position_manager, router, guardrails, toolkit)
             # Stay alive in capital-preservation mode instead of halting: the
             # competition requires at least one trade per UTC day, so a halted
             # agent would be disqualified on trade count even after surviving
@@ -740,7 +750,15 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             _interruptible_sleep()
             continue
 
-        _process_position_exits(position_manager, router, guardrails, market_snapshot, portfolio_value, price_cache)
+        _process_position_exits(
+            position_manager,
+            router,
+            guardrails,
+            market_snapshot,
+            portfolio_value,
+            price_cache,
+            toolkit,
+        )
         _monitor_position_exits_if_needed(
             position_manager,
             router,
@@ -749,6 +767,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             portfolio_value,
             settings,
             price_cache,
+            toolkit,
         )
 
         if not entries_allowed:
@@ -1515,12 +1534,21 @@ def _monitor_position_exits_if_needed(
     portfolio_value: float,
     settings: Settings,
     price_cache: PriceCache | None = None,
+    toolkit: BnbToolkitWrapper | None = None,
 ) -> None:
     if not position_manager.list_open_positions():
         return
     last_exit_check = float(getattr(run_agent, "_last_exit_check", 0.0))
     if time.time() - last_exit_check > getattr(settings, "position_monitor_seconds", 60):
-        _process_position_exits(position_manager, router, guardrails, market_snapshot, portfolio_value, price_cache)
+        _process_position_exits(
+            position_manager,
+            router,
+            guardrails,
+            market_snapshot,
+            portfolio_value,
+            price_cache,
+            toolkit,
+        )
         setattr(run_agent, "_last_exit_check", time.time())
 
 
@@ -2195,6 +2223,37 @@ def _extract_from_balance_items(items: list[Any], symbol: str) -> float | None:
     return None
 
 
+def _exit_amount_from_live_balance(position: Position, toolkit: BnbToolkitWrapper | None) -> float:
+    """Use at most the current wallet balance when selling a persisted position."""
+
+    position_amount = max(0.0, float(position.amount_tokens))
+    if toolkit is None:
+        return position_amount
+    try:
+        balance_response = toolkit.get_balance(position.symbol)
+    except Exception as exc:
+        LOGGER.warning(
+            "Balance read failed for %s before exit; using persisted amount %.12g: %s",
+            position.symbol,
+            position_amount,
+            exc,
+        )
+        return position_amount
+
+    wallet_amount = max(0.0, _extract_symbol_balance(balance_response, position.symbol))
+    if wallet_amount <= 0:
+        return 0.0
+    if wallet_amount < position_amount:
+        LOGGER.warning(
+            "Reducing %s exit amount from persisted %.12g to live wallet balance %.12g",
+            position.symbol,
+            position_amount,
+            wallet_amount,
+        )
+        return wallet_amount
+    return position_amount
+
+
 def _process_position_exits(
     position_manager: PositionManager,
     router: PancakeSwapRouter,
@@ -2202,6 +2261,7 @@ def _process_position_exits(
     market_snapshot: dict[str, dict[str, Any]],
     portfolio_value: float,
     price_cache: PriceCache | None = None,
+    toolkit: BnbToolkitWrapper | None = None,
 ) -> None:
     check_exits = getattr(position_manager, "check_exits", None)
     if callable(check_exits):
@@ -2222,6 +2282,7 @@ def _process_position_exits(
                     signal.current_price,
                     portfolio_value,
                     exit_reason=signal.reason,
+                    toolkit=toolkit,
                 )
         return
 
@@ -2239,6 +2300,7 @@ def _process_position_exits(
             current_price,
             portfolio_value,
             exit_reason=exit_reason,
+            toolkit=toolkit,
         )
 
 
@@ -2251,13 +2313,23 @@ def _execute_position_exit(
     portfolio_value: float,
     *,
     exit_reason: str,
+    toolkit: BnbToolkitWrapper | None = None,
 ) -> None:
     LOGGER.info("Exiting %s because %s was hit", symbol, exit_reason)
     position = position_manager.get_position(symbol)
     if position is None:
         return
     execution_slippage = _require_execution_slippage(guardrails.settings.max_slippage_pct)
-    expected_amount_out = current_price * position.amount_tokens
+    amount_in = _exit_amount_from_live_balance(position, toolkit)
+    if amount_in <= 0:
+        LOGGER.warning(
+            "Exit swap for %s (%s) skipped; live wallet balance is zero, removing stale local position",
+            symbol,
+            exit_reason,
+        )
+        position_manager.close_position(symbol)
+        return
+    expected_amount_out = current_price * amount_in
     try:
         result = _execute_logged_swap(
             guardrails.settings,
@@ -2265,7 +2337,7 @@ def _execute_position_exit(
             "exit",
             symbol,
             guardrails.settings.default_stable_symbol,
-            position.amount_tokens,
+            amount_in,
             execution_slippage,
             expected_amount_out=expected_amount_out,
         )
@@ -2290,11 +2362,11 @@ def _execute_position_exit(
         hold_time_seconds = position_manager.hold_time_seconds(symbol)
     closed = position_manager.close_position(symbol)
     if closed is not None:
-        realized_pnl = (current_price - closed.entry_price) * closed.amount_tokens
+        realized_pnl = (current_price - closed.entry_price) * amount_in
         trade = TradeRecord(
             symbol=closed.symbol,
             side="sell",
-            value_usdc=current_price * closed.amount_tokens,
+            value_usdc=current_price * amount_in,
             realized_pnl_usdc=realized_pnl,
             timestamp=datetime.now().astimezone(),
         )
@@ -2935,7 +3007,7 @@ def main(argv: list[str] | None = None) -> int:
         position_manager = PositionManager(settings)
         guardrails = Guardrails(settings)
         _load_positions_or_reconstruct(position_manager, toolkit, settings)
-        emergency_liquidate(position_manager, router, guardrails)
+        emergency_liquidate(position_manager, router, guardrails, toolkit)
         return 0
 
     if args.balance:
