@@ -234,10 +234,13 @@ def test_failed_exit_swap_does_not_crash(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(main_mod, "_execute_logged_swap", _boom)
 
     class _Guardrails:
-        settings = settings
+        pass
+
+    guardrails = _Guardrails()
+    guardrails.settings = settings
 
     # Must NOT raise, and the position must remain open for a later retry.
     main_mod._execute_position_exit(
-        manager, object(), _Guardrails(), "ATOM", 1.95, 100.0, exit_reason="time_stop"
+        manager, object(), guardrails, "ATOM", 1.95, 100.0, exit_reason="time_stop"
     )
     assert manager.get_position("ATOM") is not None
