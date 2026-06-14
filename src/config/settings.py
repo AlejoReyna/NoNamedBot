@@ -61,6 +61,13 @@ class Settings(BaseModel):
     trailing_stop_pct: float = 0.06
     take_profit_pct: float = 0.08
     base_risk_per_trade_pct: float = 0.0035
+    # Realization rules (breakout mode). max_hold_hours forces a time-stop on
+    # positions that never hit target or trailing stop (0 disables). The
+    # competition window flatten liquidates the whole book to USDC shortly
+    # before the deadline so the final score is realized cash, not paper.
+    max_hold_hours: float = 0.0
+    competition_end_utc: str = ""
+    flatten_before_end_minutes: int = 30
     risk_off_max_slippage_pct: float = 0.005
     loss_streak_reduce_size: int = 2
     loss_streak_pause: int = 3
@@ -261,6 +268,9 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
         "trailing_stop_pct": _get_float("TRAILING_STOP_PCT", 0.06),
         "take_profit_pct": _get_float("TAKE_PROFIT_PCT", 0.08),
         "base_risk_per_trade_pct": _get_float("BASE_RISK_PER_TRADE_PCT", 0.0035),
+        "max_hold_hours": _get_float("MAX_HOLD_HOURS", 0.0),
+        "competition_end_utc": os.getenv("COMPETITION_END_UTC", ""),
+        "flatten_before_end_minutes": _get_int("FLATTEN_BEFORE_END_MINUTES", 30),
         "risk_off_max_slippage_pct": _get_float("RISK_OFF_MAX_SLIPPAGE_PCT", 0.005),
         "loss_streak_reduce_size": _get_int("LOSS_STREAK_REDUCE_SIZE", 2),
         "loss_streak_pause": _get_int("LOSS_STREAK_PAUSE", 3),

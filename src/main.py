@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
 import re
@@ -12,7 +13,7 @@ import time
 import types
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -171,6 +172,44 @@ def emergency_liquidate(
             )
             continue
         position_manager.close_position(position.symbol)
+
+
+def _maybe_flatten_for_window(
+    settings: Settings,
+    position_manager: PositionManager,
+    router: PancakeSwapRouter,
+    guardrails: Guardrails,
+    now: datetime,
+) -> bool:
+    """Liquidate the whole book to USDC shortly before the competition deadline.
+
+    Returns True when the flatten window is active (caller should also block new
+    entries for the rest of the run). No-op when ``competition_end_utc`` is unset
+    or unparseable, so default behaviour is unchanged.
+    """
+
+    end_iso = (getattr(settings, "competition_end_utc", "") or "").strip()
+    if not end_iso:
+        return False
+    try:
+        end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+    except ValueError:
+        LOGGER.warning("Invalid COMPETITION_END_UTC=%r; window flatten disabled", end_iso)
+        return False
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+    flatten_minutes = float(getattr(settings, "flatten_before_end_minutes", 30) or 0.0)
+    if now < end_dt - timedelta(minutes=flatten_minutes):
+        return False
+    open_positions = position_manager.list_open_positions()
+    if open_positions:
+        LOGGER.warning(
+            "Competition window flatten: liquidating %s open positions before deadline %s",
+            len(open_positions),
+            end_dt.isoformat(),
+        )
+        emergency_liquidate(position_manager, router, guardrails)
+    return True
 
 
 def print_balances(toolkit: BnbToolkitWrapper, settings: Settings) -> None:
@@ -510,6 +549,9 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             position_symbols={position.symbol.upper() for position in open_positions},
         )
         _update_price_cache(price_cache, market_snapshot, now_utc)
+        window_flatten_active = _maybe_flatten_for_window(
+            settings, position_manager, router, guardrails, now_utc
+        )
         if needs_balance_reconstruction:
             reconstructed = _reconstruct_positions_from_balances(
                 position_manager,
@@ -535,12 +577,16 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
         action = "WAIT"
         entry_position_pct = 0.0
         entries_allowed = _risk_allows_new_entries(guardrails, risk_decision, portfolio_value, settings)
+        if window_flatten_active:
+            entries_allowed = False
         entries_blocked_reason = None if entries_allowed else _entries_blocked_reason(
             guardrails,
             risk_decision,
             portfolio_value,
             settings,
         )
+        if window_flatten_active:
+            entries_blocked_reason = "competition_window_flatten"
         decision_reasons_pre: list[str] = []
         if entries_allowed and not disk_allows_entries(settings):
             entries_allowed = False
@@ -1319,7 +1365,12 @@ def _open_local_position_v25(
     atr_pct: float | None,
     regime: MarketRegime,
 ) -> None:
-    try:
+    # Use the volatility-aware signature when the manager supports it; fall back
+    # to the legacy 4-arg form only for an older PositionManager. Checking the
+    # signature explicitly (instead of catching TypeError) avoids masking a
+    # genuine TypeError raised inside open_position.
+    open_params = inspect.signature(position_manager.open_position).parameters
+    if "atr_pct" in open_params and "regime" in open_params:
         position_manager.open_position(
             symbol=symbol,
             amount_tokens=amount_tokens,
@@ -1328,7 +1379,7 @@ def _open_local_position_v25(
             atr_pct=atr_pct,
             regime=regime,
         )
-    except TypeError:
+    else:
         position_manager.open_position(symbol, amount_tokens, entry_price, position_usd)
 
 

@@ -46,23 +46,47 @@ class PositionManager:
         symbol: str,
         amount_tokens: float,
         entry_price: float,
-        entry_value_usdc: float,
+        position_usd: float | None = None,
+        atr_pct: float | None = None,
+        regime: object | None = None,
+        entry_value_usdc: float | None = None,
     ) -> Position:
-        """Open and store a new position."""
+        """Open and store a new position.
+
+        When the caller supplies market context (``regime`` and/or ``atr_pct``)
+        the exit levels become volatility-aware via ``calculate_exit_levels``,
+        so a low-volatility large cap gets a reachable target instead of the
+        flat ``take_profit_pct`` (the source of the +15% large-cap miracle
+        targets). Legacy callers that pass neither keep the flat settings-based
+        levels for backward compatibility.
+
+        ``position_usd`` is the entry notional; ``entry_value_usdc`` is accepted
+        as a backward-compatible alias.
+        """
 
         normalized = symbol.upper()
         assert_tradable_symbol(normalized)
         if normalized in self._positions:
             raise ValueError(f"{normalized} position is already open")
+        notional = position_usd if position_usd is not None else entry_value_usdc
+        if notional is None:
+            notional = 0.0
         now = datetime.now(timezone.utc)
+        if regime is not None or atr_pct is not None:
+            trailing_stop_pct, take_profit_pct = calculate_exit_levels(
+                entry_price, atr_pct, regime
+            )
+        else:
+            trailing_stop_pct = self.settings.trailing_stop_pct
+            take_profit_pct = self.settings.take_profit_pct
         position = Position(
             symbol=normalized,
             amount_tokens=amount_tokens,
             entry_price=entry_price,
-            entry_value_usdc=entry_value_usdc,
+            entry_value_usdc=notional,
             highest_price=entry_price,
-            trailing_stop_price=entry_price * (1 - self.settings.trailing_stop_pct),
-            take_profit_price=entry_price * (1 + self.settings.take_profit_pct),
+            trailing_stop_price=entry_price * (1 - trailing_stop_pct),
+            take_profit_price=entry_price * (1 + take_profit_pct),
             opened_at=now,
             current_price=entry_price,
             current_price_at=now,
@@ -112,7 +136,28 @@ class PositionManager:
             return "take_profit"
         if current_price <= position.trailing_stop_price:
             return "trailing_stop"
+        if self._time_stop_triggered(position):
+            return "time_stop"
         return None
+
+    def _time_stop_triggered(self, position: Position) -> bool:
+        """Force an exit when a position has been held past max_hold_hours.
+
+        Breakout positions otherwise sit indefinitely whenever neither the
+        target nor the trailing stop is hit. A max-hold clock guarantees
+        turnover so capital is recycled and the book does not arrive at the
+        competition deadline full of stale, never-realized positions.
+        Disabled when ``max_hold_hours`` is 0 or unset.
+        """
+
+        max_hold_hours = float(getattr(self.settings, "max_hold_hours", 0.0) or 0.0)
+        if max_hold_hours <= 0 or position.opened_at is None:
+            return False
+        opened_at = position.opened_at
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600.0
+        return age_hours >= max_hold_hours
 
     def _active_trailing_stop_pct(self, position: Position) -> float:
         base_stop = float(getattr(self.settings, "trailing_stop_pct", 0.06))
@@ -238,8 +283,16 @@ def calculate_position_pct(
     loss_streak: int,
     max_position_pct: float = 0.05,
     base_risk_per_trade_pct: float = 0.0035,
+    fallback_stop_pct: float = 0.06,
 ) -> float:
-    """Calculate volatility-scaled position size as a decimal percentage."""
+    """Calculate volatility-scaled position size as a decimal percentage.
+
+    Sizing stays risk-based: position % = risk-budget / stop-distance, capped
+    at ``max_position_pct``. When ATR is cold we substitute ``fallback_stop_pct``
+    as the assumed stop distance rather than deploying a flat max position, so
+    the rule (smaller size for wider stops) holds even before the price cache
+    warms up.
+    """
 
     if equity_usd <= 0 or max_position_pct <= 0:
         return 0.0
@@ -247,14 +300,12 @@ def calculate_position_pct(
     risk_mult = max(0.0, float(risk_state_multiplier))
     if atr_pct is None or atr_pct <= 0:
         # Cold start: the price cache is not yet warm enough to compute ATR.
-        # Deploy at the configured max_position_pct (still scaled by regime and
-        # risk-state multipliers) instead of a hard 1% cap, so capital is
-        # actually put to work while the cache warms up. Drawdown/daily-loss
-        # guardrails still gate entries downstream.
-        fallback = max_position_pct * regime_mult * risk_mult
-        return max(0.0, min(fallback, max_position_pct))
-
-    stop_distance_pct = max(0.015, min(0.08, float(atr_pct) * 2.0))
+        # Size off an assumed stop distance so the position is still
+        # risk-budgeted (not a flat max bet). Drawdown/daily-loss guardrails
+        # still gate entries downstream.
+        stop_distance_pct = max(0.015, min(0.08, float(fallback_stop_pct)))
+    else:
+        stop_distance_pct = max(0.015, min(0.08, float(atr_pct) * 2.0))
     raw_position_pct = base_risk_per_trade_pct / stop_distance_pct
     position_pct = min(max_position_pct, raw_position_pct)
     if loss_streak >= 2:
