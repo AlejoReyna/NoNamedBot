@@ -287,3 +287,21 @@ class EventRiskFilter:
                 if reason:
                     return reason
         return None
+
+    def active_symbol_blackouts(self, now: datetime) -> set[str]:
+        """Set of non-GLOBAL symbols whose blackout window is active right now.
+
+        Used to exclude blacked-out symbols from discretionary candidate
+        selection so other valid symbols are still considered (a symbol-specific
+        event blocks only that symbol, not the whole universe). GLOBAL events are
+        intentionally excluded here -- they are handled by ``global_blackout``.
+        """
+
+        self._maybe_reload()
+        blocked: set[str] = set()
+        for event in self._events:
+            if event.is_global:
+                continue
+            if self._active_reason(event, now):
+                blocked.add(event.symbol)
+        return blocked

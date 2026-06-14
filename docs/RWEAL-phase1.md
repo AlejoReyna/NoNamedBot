@@ -22,9 +22,21 @@ operator changes without a restart:
 2. **Event blackout** — a static `events.json` calendar. Within a configurable
    window around a scheduled adverse event, **discretionary** entries are
    blocked. A `GLOBAL` event (e.g. a macro CPI/FOMC release) blocks all
-   discretionary entries; a symbol-specific event blocks only that symbol.
-   Unlike a manual halt, an event blackout **leaves the daily-minimum compliance
-   trade running** so the agent stays qualified.
+   discretionary entries; a symbol-specific event blocks only that symbol —
+   blacked-out symbols are removed from candidate *selection* so the next-best
+   unaffected symbol is still considered that cycle (rather than skipping the
+   cycle entirely). Unlike a manual halt, an event blackout **leaves the
+   daily-minimum compliance trade running** so the agent stays qualified; the
+   compliance trade itself is steered away from a blacked-out symbol (it falls
+   back to the fixed stable→token swap).
+
+### Halt timing guarantees
+
+The manual halt is enforced at three points so a `TRADING_HALT` that appears
+mid-cycle cannot still trade: (a) the cycle-top gate, (b) a live re-check
+immediately before `_attempt_entry_v25`, and (c) a live re-check immediately
+before each `_ensure_daily_minimum_trade` compliance call. The 1-second wake
+loop additionally shortens the wait before the next cycle begins.
 
 ## Blackout window
 

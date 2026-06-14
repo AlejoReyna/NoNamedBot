@@ -104,6 +104,31 @@ def test_global_event_blocks_any_symbol_lookup(tmp_path: Path) -> None:
     assert flt.global_blackout(NOW) is not None
 
 
+# -- active_symbol_blackouts (selection exclusion) --------------------------
+
+
+def test_active_symbol_blackouts_returns_symbol_events(tmp_path: Path) -> None:
+    events = [
+        {"symbol": "CAKE", "event_type": "unlock",
+         "scheduled_time": (NOW + timedelta(hours=1)).isoformat(), "severity": 5},
+        {"symbol": "XVS", "event_type": "unlock",
+         "scheduled_time": (NOW + timedelta(hours=48)).isoformat(), "severity": 5},
+    ]
+    flt = _filter(_write(tmp_path / "e.json", events), tmp_path / "HALT")
+    active = flt.active_symbol_blackouts(NOW)
+    assert active == {"CAKE"}  # XVS far out, not yet active
+
+
+def test_active_symbol_blackouts_excludes_global(tmp_path: Path) -> None:
+    events = [{
+        "symbol": "GLOBAL", "event_type": "macro",
+        "scheduled_time": NOW.isoformat(), "severity": 4, "blackout_minutes": 30,
+    }]
+    flt = _filter(_write(tmp_path / "e.json", events), tmp_path / "HALT")
+    # GLOBAL is handled by the cycle-top gate, not symbol exclusion.
+    assert flt.active_symbol_blackouts(NOW) == set()
+
+
 # -- manual halt ------------------------------------------------------------
 
 

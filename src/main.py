@@ -697,8 +697,12 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             # agent would be disqualified on trade count even after surviving
             # the drawdown gate. Only the tiny compliance-swap backstop runs here
             # -- unless the operator has set the RWEAL manual halt, which is a
-            # deliberate full stop that overrides the compliance backstop.
-            if not rweal_manual_halt:
+            # deliberate full stop that overrides the compliance backstop. Use a
+            # live re-check so a halt set mid-cycle is honoured immediately.
+            if not (
+                rweal_manual_halt
+                or (event_filter is not None and event_filter.manual_halt_active())
+            ):
                 _ensure_daily_minimum_trade(
                     settings,
                     router,
@@ -760,6 +764,16 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                 exclude_symbols.update(pending_swap_cooldowns)
                 if settings.strategy_mode == "breakout":
                     exclude_symbols.update(recent_near_miss_excludes)
+                # RWEAL Phase 1: exclude symbols in an active event blackout from
+                # selection so a blacked-out top pick does not suppress otherwise
+                # valid alternatives (symbol-specific events block only that
+                # symbol, not the whole universe). GLOBAL/macro blackouts are
+                # handled at the cycle-top gate, not here.
+                rweal_blacked_out: set[str] = set()
+                if event_filter is not None:
+                    rweal_blacked_out = event_filter.active_symbol_blackouts(now_utc)
+                    if rweal_blacked_out:
+                        exclude_symbols.update(rweal_blacked_out)
                 candidate = _evaluate_universe_v25(
                     market_snapshot,
                     portfolio_value,
@@ -771,10 +785,8 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                     sentiment_result=sentiment_result,
                     ml_bundle=ml_bundle,
                 )
-                # RWEAL Phase 1 per-symbol gate: drop a discretionary candidate
-                # facing a scheduled event. Runs BEFORE the compliance fallback
-                # so a blacked-out symbol still yields to a compliance trade
-                # (event blackout != disqualification).
+                # Defensive backstop: drop any discretionary candidate that still
+                # carries an active blackout (e.g. a path that bypassed excludes).
                 if candidate is not None and event_filter is not None:
                     _rweal_symbol = event_filter.symbol_blackout(candidate.symbol, now_utc)
                     if _rweal_symbol:
@@ -793,7 +805,34 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                             settings,
                             risk_decision,
                         )
+                        # A compliance trade should not be routed into a symbol
+                        # facing a scheduled event; fall through to the fixed
+                        # stable->token compliance swap instead.
+                        if (
+                            candidate is not None
+                            and event_filter is not None
+                            and event_filter.symbol_blackout(candidate.symbol, now_utc)
+                        ):
+                            LOGGER.warning(
+                                "RWEAL: compliance candidate %s is blacked out; "
+                                "falling back to fixed compliance swap",
+                                candidate.symbol,
+                            )
+                            decision_reasons.append("RWEAL: compliance symbol blacked out")
+                            candidate = None
 
+            # RWEAL Phase 1: final, instant halt guard. Re-check the control file
+            # immediately before execution so a TRADING_HALT that appears mid-cycle
+            # (after the cycle-top gate) cannot still open a position this cycle.
+            if (
+                candidate is not None
+                and event_filter is not None
+                and event_filter.manual_halt_active()
+            ):
+                rweal_manual_halt = True
+                LOGGER.warning("RWEAL manual halt detected pre-entry; skipping execution")
+                decision_reasons.append("RWEAL: manual halt (pre-execution)")
+                candidate = None
             if not skip_entries:
                 if candidate is None:
                     decision_reasons.append("No candidate passed gates")
@@ -818,7 +857,13 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                     if attempt.entered:
                         action = "ENTER"
 
-        if action != "ENTER" and not rweal_manual_halt and _ensure_daily_minimum_trade(
+        # Live halt re-check (not the cycle-top cache): this backstop runs at the
+        # very end of the cycle, after all data work, so a halt set mid-cycle
+        # must still suppress the compliance swap.
+        rweal_halt_now = rweal_manual_halt or (
+            event_filter is not None and event_filter.manual_halt_active()
+        )
+        if action != "ENTER" and not rweal_halt_now and _ensure_daily_minimum_trade(
             settings,
             router,
             guardrails,
