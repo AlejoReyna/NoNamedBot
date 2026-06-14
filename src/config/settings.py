@@ -58,6 +58,7 @@ class Settings(BaseModel):
     max_slippage_pct: float = 0.01
     swap_approval_retry_max: int = Field(default=3, ge=0)
     swap_approval_retry_delay_seconds: float = Field(default=7.0, ge=0.0)
+    swap_approval_spender_address: str = "0x8157a9d65807521fbb8db8f37eeecefdd247e9b1"
     drawdown_soft_stop_pct: float = 0.10
     drawdown_kill_switch_pct: float = 0.18
     trailing_stop_pct: float = 0.06
@@ -280,6 +281,10 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
         "max_slippage_pct": _get_float("MAX_SLIPPAGE_PCT", 0.01),
         "swap_approval_retry_max": _get_int("SWAP_APPROVAL_RETRY_MAX", 3),
         "swap_approval_retry_delay_seconds": _get_float("SWAP_APPROVAL_RETRY_DELAY_SECONDS", 7.0),
+        "swap_approval_spender_address": os.getenv(
+            "SWAP_APPROVAL_SPENDER_ADDRESS",
+            "0x8157a9d65807521fbb8db8f37eeecefdd247e9b1",
+        ),
         "drawdown_soft_stop_pct": _get_float("DRAWDOWN_SOFT_STOP_PCT", 0.10),
         "drawdown_kill_switch_pct": _get_float("DRAWDOWN_KILL_SWITCH_PCT", 0.18),
         "trailing_stop_pct": _get_float("TRAILING_STOP_PCT", 0.06),

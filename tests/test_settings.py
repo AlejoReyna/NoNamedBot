@@ -73,16 +73,20 @@ def test_load_settings_reads_cmc_snapshot_ttl_seconds(monkeypatch: object, tmp_p
 def test_load_settings_reads_swap_approval_retry_knobs(monkeypatch: object, tmp_path: Path) -> None:
     env_path = tmp_path / ".env"
     env_path.write_text(
-        "SWAP_APPROVAL_RETRY_MAX=2\nSWAP_APPROVAL_RETRY_DELAY_SECONDS=0.25\n",
+        "SWAP_APPROVAL_RETRY_MAX=2\n"
+        "SWAP_APPROVAL_RETRY_DELAY_SECONDS=0.25\n"
+        "SWAP_APPROVAL_SPENDER_ADDRESS=0x1111111111111111111111111111111111111111\n",
         encoding="utf-8",
     )
     monkeypatch.delenv("SWAP_APPROVAL_RETRY_MAX", raising=False)  # type: ignore[attr-defined]
     monkeypatch.delenv("SWAP_APPROVAL_RETRY_DELAY_SECONDS", raising=False)  # type: ignore[attr-defined]
+    monkeypatch.delenv("SWAP_APPROVAL_SPENDER_ADDRESS", raising=False)  # type: ignore[attr-defined]
 
     settings = load_settings(str(env_path))
 
     assert settings.swap_approval_retry_max == 2
     assert settings.swap_approval_retry_delay_seconds == 0.25
+    assert settings.swap_approval_spender_address == "0x1111111111111111111111111111111111111111"
 
 
 def test_load_settings_defaults_cmc_snapshot_ttl_to_four_hours(monkeypatch: object, tmp_path: Path) -> None:

@@ -30,6 +30,13 @@ LOGGER = logging.getLogger(__name__)
 
 _TX_HASH_RE = re.compile(r"0x[a-fA-F0-9]{64}")
 _BSCSCAN_TX_RE = re.compile(r"(https?://(?:www\.)?bscscan\.com/tx/(0x[a-fA-F0-9]{64}))")
+_EVM_ADDRESS_RE = re.compile(r"0x[a-fA-F0-9]{40}")
+_BSC_ASSET_ID_RE = re.compile(r"c20000714_t0x[a-fA-F0-9]{40}", re.IGNORECASE)
+
+BSC_COIN_ID = "20000714"
+# Confirmed from TWAK v0.17.0 LiquidMesh Approval logs on BSC. Keep overridable:
+# router/operator addresses can rotate without a code deploy.
+LIQUIDMESH_BSC_APPROVAL_SPENDER = "0x8157a9d65807521fbb8db8f37eeecefdd247e9b1"
 
 # Quotes are read-only and retried every cycle; a hung quote should fail fast
 # instead of stalling the 5-minute loop. Execution keeps a long timeout because
@@ -64,10 +71,12 @@ class TWAKInterface:
         paper_trade: bool = False,
         approval_retry_max: int = 3,
         approval_retry_delay_seconds: float = 7.0,
+        approval_spender_address: str = LIQUIDMESH_BSC_APPROVAL_SPENDER,
     ) -> None:
         self.paper_trade = paper_trade
         self.approval_retry_max = max(0, int(approval_retry_max))
         self.approval_retry_delay_seconds = max(0.0, float(approval_retry_delay_seconds))
+        self.approval_spender_address = approval_spender_address.strip()
 
     def get_quote(
         self,
@@ -363,23 +372,32 @@ class TWAKInterface:
 
     def _run_swap_with_approval_retry(self, command: list[str]) -> TWAKResult:
         retries = 0
+        explicit_approval_sent = False
         while True:
             try:
                 return self._run(command)
             except TWAKCommandError as exc:
-                if not self._is_approval_race_failure(exc.result):
+                is_approval_race = self._is_approval_race_failure(exc.result)
+                is_bare_allowance_failure = self._is_bare_allowance_failure(exc.result)
+                if not is_approval_race and not is_bare_allowance_failure:
                     raise
                 if retries >= self.approval_retry_max:
                     LOGGER.error(
-                        "TWAK swap approval race did not clear after %s retries",
+                        "TWAK swap approval recovery did not clear after %s retries",
                         self.approval_retry_max,
                     )
                     raise
 
                 retries += 1
+                if is_bare_allowance_failure and not explicit_approval_sent:
+                    approval_result = self._approve_swap_spender(command[3])
+                    explicit_approval_sent = True
+                    approval_hash = self._tx_hash_from_stdout(approval_result.stdout)
+                    if approval_hash:
+                        LOGGER.warning("TWAK explicit token approval sent: %s", approval_hash)
                 delay_seconds = self.approval_retry_delay_seconds
                 LOGGER.warning(
-                    "TWAK swap approval is pending; retrying after %.1fs (retry %s/%s)",
+                    "TWAK swap approval recovery is pending; retrying after %.1fs (retry %s/%s)",
                     delay_seconds,
                     retries,
                     self.approval_retry_max,
@@ -399,6 +417,58 @@ class TWAKInterface:
         return "approval was sent" in combined and (
             "0xf4059071" in combined or "check allowance" in combined
         )
+
+    @staticmethod
+    def _is_bare_allowance_failure(result: TWAKResult) -> bool:
+        decoded, _ = TWAKInterface._decode_swap_stdout(result.stdout)
+        combined = f"{result.stdout}\n{result.stderr}".lower()
+        if "approval was sent" in combined or "approval_sent_swap_failed" in combined:
+            return False
+        if "0xf4059071" not in combined and "check allowance" not in combined:
+            return False
+        if isinstance(decoded, dict):
+            error_code = str(decoded.get("errorCode", "")).upper()
+            if error_code:
+                return error_code == "TX_FAILED"
+        return "execution reverted" in combined or "tx_failed" in combined
+
+    def _approve_swap_spender(self, token: str) -> TWAKResult:
+        asset_id = self._bsc_erc20_asset_id(token)
+        spender = self._approval_spender_address()
+        return self._run(
+            [
+                "twak",
+                "erc20",
+                "approve",
+                "--token",
+                asset_id,
+                "--spender",
+                spender,
+                "--amount",
+                "unlimited",
+                "--confirm-unlimited",
+                "--json",
+            ]
+        )
+
+    def _approval_spender_address(self) -> str:
+        if not _EVM_ADDRESS_RE.fullmatch(self.approval_spender_address):
+            raise RuntimeError(
+                "SWAP_APPROVAL_SPENDER_ADDRESS must be a 0x-prefixed EVM address "
+                "to recover bare allowance failures"
+            )
+        return self.approval_spender_address
+
+    @staticmethod
+    def _bsc_erc20_asset_id(token: str) -> str:
+        resolved = resolve_twak_token(token).strip()
+        if _BSC_ASSET_ID_RE.fullmatch(resolved):
+            return resolved
+        if resolved.upper() == "BNB":
+            raise RuntimeError("Native BNB does not require ERC-20 approval")
+        if not _EVM_ADDRESS_RE.fullmatch(resolved):
+            raise RuntimeError(f"Cannot build BSC ERC-20 asset ID for token {token!r}")
+        return f"c{BSC_COIN_ID}_t{resolved}"
 
     @staticmethod
     def _amount_to_atomic_units(amount: float, asset: str) -> str:
