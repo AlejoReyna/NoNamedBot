@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from src.execution.twak_interface import (
+    LIQUIDMESH_BSC_APPROVAL_SPENDER,
     TWAKInterface,
     TWAKResult,
     _format_amount_for_cli,
@@ -254,6 +255,95 @@ def test_swap_retries_approval_race_and_returns_success(monkeypatch: Any) -> Non
     assert result["amount_out"] == 290.69
     assert len(calls) == 2
     assert sleeps == [0.25]
+
+
+def test_swap_sends_explicit_approval_on_bare_allowance_revert(monkeypatch: Any) -> None:
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+    approval_hash = "0x" + "a" * 64
+    swap_hash = "0x" + "b" * 64
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        calls.append(command)
+        swap_calls = [call for call in calls if call[:2] == ["twak", "swap"]]
+        if command[:2] == ["twak", "swap"] and len(swap_calls) == 1:
+            return type(
+                "Completed",
+                (),
+                {
+                    "returncode": 1,
+                    "stdout": '{"error":"execution reverted: 0xf4059071","errorCode":"TX_FAILED"}',
+                    "stderr": "Swapping 5.59594069 DOGE -> 0.480096390485040875 USDC via LiquidMesh",
+                },
+            )()
+        if command[:3] == ["twak", "erc20", "approve"]:
+            return type(
+                "Completed",
+                (),
+                {
+                    "returncode": 0,
+                    "stdout": f'{{"hash":"{approval_hash}"}}',
+                    "stderr": "",
+                },
+            )()
+        return type(
+            "Completed",
+            (),
+            {
+                "returncode": 0,
+                "stdout": f'{{"hash":"{swap_hash}","amount_out":0.48009639}}',
+                "stderr": "",
+            },
+        )()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("src.execution.twak_interface.time.sleep", lambda seconds: sleeps.append(seconds))
+
+    result = TWAKInterface(
+        approval_retry_max=2,
+        approval_retry_delay_seconds=0.25,
+    ).swap("DOGE", "USDC", 5.59594069, 0.005)
+
+    assert result["tx_hash"] == swap_hash
+    assert len(calls) == 3
+    assert calls[1] == [
+        "twak",
+        "erc20",
+        "approve",
+        "--token",
+        "c20000714_t0xbA2aE424d960c26247Dd6c32edC70B295c744C43",
+        "--spender",
+        LIQUIDMESH_BSC_APPROVAL_SPENDER,
+        "--amount",
+        "unlimited",
+        "--confirm-unlimited",
+        "--json",
+    ]
+    assert calls[2] == calls[0]
+    assert sleeps == [0.25]
+
+
+def test_swap_does_not_send_explicit_approval_when_retry_limit_is_zero(monkeypatch: Any) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        calls.append(command)
+        return type(
+            "Completed",
+            (),
+            {
+                "returncode": 1,
+                "stdout": '{"error":"execution reverted: 0xf4059071","errorCode":"TX_FAILED"}',
+                "stderr": "Swapping 5.59594069 DOGE -> 0.480096390485040875 USDC via LiquidMesh",
+            },
+        )()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    with pytest.raises(RuntimeError, match="0xf4059071"):
+        TWAKInterface(approval_retry_max=0).swap("DOGE", "USDC", 5.59594069, 0.005)
+
+    assert len(calls) == 1
 
 
 def test_swap_does_not_retry_non_recoverable_failure(monkeypatch: Any) -> None:

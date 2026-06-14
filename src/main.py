@@ -463,6 +463,7 @@ def _twak_interface_from_settings(settings: Settings, paper_trade: bool) -> Any:
     try:
         twak_interface.approval_retry_max = settings.swap_approval_retry_max
         twak_interface.approval_retry_delay_seconds = settings.swap_approval_retry_delay_seconds
+        twak_interface.approval_spender_address = settings.swap_approval_spender_address
     except AttributeError:
         pass
     return twak_interface
