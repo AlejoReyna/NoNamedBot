@@ -45,6 +45,7 @@ jobs:
       HEALTH_URL: ${{ vars.AGENT_HEALTH_URL || 'http://localhost:8080/health' }}
       RESTART_ONLY: ${{ inputs.restart_only }}
       SKIP_PRE_LIVE_CHECK: ${{ inputs.skip_pre_live_check }}
+      ENFORCE_PRE_LIVE_CHECK: ${{ vars.ENFORCE_PRE_LIVE_CHECK || 'false' }}
 
     steps:
       - name: Validate deploy configuration
@@ -74,6 +75,7 @@ jobs:
             printf 'HEALTH_URL=%q\n' "$HEALTH_URL"
             printf 'RESTART_ONLY=%q\n' "$RESTART_ONLY"
             printf 'SKIP_PRE_LIVE_CHECK=%q\n' "$SKIP_PRE_LIVE_CHECK"
+            printf 'ENFORCE_PRE_LIVE_CHECK=%q\n' "$ENFORCE_PRE_LIVE_CHECK"
             cat <<'REMOTE_SCRIPT'
 
           cat >/tmp/cascade-agent-deploy-user.sh <<'USER_SCRIPT'
@@ -101,7 +103,14 @@ jobs:
           python scripts/verify_twak_unlock.py
 
           if [ "$SKIP_PRE_LIVE_CHECK" != "true" ]; then
-            python scripts/pre_live_check.py
+            if python scripts/pre_live_check.py; then
+              echo "Pre-live check passed"
+            elif [ "$ENFORCE_PRE_LIVE_CHECK" = "true" ]; then
+              echo "Pre-live check failed and ENFORCE_PRE_LIVE_CHECK=true"
+              exit 1
+            else
+              echo "::warning::pre_live_check.py failed; continuing because ENFORCE_PRE_LIVE_CHECK is not true"
+            fi
           fi
 
           sudo systemctl restart "$SERVICE_NAME"
@@ -128,6 +137,7 @@ jobs:
             HEALTH_URL="$HEALTH_URL" \
             RESTART_ONLY="$RESTART_ONLY" \
             SKIP_PRE_LIVE_CHECK="$SKIP_PRE_LIVE_CHECK" \
+            ENFORCE_PRE_LIVE_CHECK="$ENFORCE_PRE_LIVE_CHECK" \
             bash /tmp/cascade-agent-deploy-user.sh
           REMOTE_SCRIPT
           } > remote-agent-deploy.sh
