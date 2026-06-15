@@ -42,20 +42,12 @@ def render_dashboard(decisions: list[dict], executions: list[dict]) -> str:
     for row in decisions:
         action = str(row.get("action", "WAIT"))
         color = {"ENTER": "#22c55e", "HALT": "#ef4444", "BLOCKED": "#f59e0b"}.get(action, "#94a3b8")
-        ml = row.get("ml_ranking") or {}
-        ml_score = row.get("ml_confidence")
-        if ml_score is None and isinstance(ml, dict):
-            scores = ml.get("ml_scores") or {}
-            ml_score = max(scores.values()) if scores else None
         decision_rows.append(
             f"<tr style='background:{color}22'>"
             f"<td>{_html_escape(str(row.get('timestamp', '')))}</td>"
             f"<td>{_html_escape(action)}</td>"
             f"<td>{_html_escape(str(row.get('symbol', '-')))}</td>"
-            f"<td>{_html_escape(str(row.get('ml_regime', '-')))}</td>"
-            f"<td>{ml_score if ml_score is not None else '-'}</td>"
-            f"<td>{_html_escape(str(ml.get('ml_selected_symbol', '-')))}</td>"
-            f"<td>{_html_escape(str(ml.get('executed_symbol', row.get('symbol', '-'))))}</td>"
+            f"<td>{_html_escape(str(row.get('entry_score', '-')))}</td>"
             f"<td>{_html_escape(str(row.get('reason', ''))[:80])}</td>"
             "</tr>"
         )
@@ -80,9 +72,9 @@ h1,h2{{color:#f8fafc}}
 </style></head><body>
 <h1>Plan B+ Live Dashboard</h1>
 <p>Decisions: {len(decisions)} | Executions: {len(executions)}</p>
-<h2>Decision timeline (shadow ML scores)</h2>
-<table><tr><th>Time</th><th>Action</th><th>Symbol</th><th>ML Regime</th><th>ML Score</th><th>ML Pick</th><th>Executed</th><th>Reason</th></tr>
-{''.join(decision_rows) or '<tr><td colspan="8">No decisions</td></tr>'}
+<h2>Decision timeline</h2>
+<table><tr><th>Time</th><th>Action</th><th>Symbol</th><th>Entry Score</th><th>Reason</th></tr>
+{''.join(decision_rows) or '<tr><td colspan="5">No decisions</td></tr>'}
 </table>
 <h2>Recent executions</h2>
 <table><tr><th>Time</th><th>Action</th><th>Swap</th><th>Tx</th></tr>

@@ -7,14 +7,11 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from src.config.settings import Settings
 from src.config.tokens import is_liquid, is_momentum_candidate_symbol, is_tradable_symbol
 from src.execution.twak_interface import TWAKInterface
-
-if TYPE_CHECKING:
-    from src.ml.types import MLContext
 
 LOGGER = logging.getLogger(__name__)
 
@@ -36,7 +33,6 @@ class BreakoutDecision:
     estimated_slippage_pct: float | None = None
     entry_score: float | None = None
     position_size_multiplier: float = 1.0
-    ml_context: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -166,7 +162,6 @@ class BreakoutEngine:
         self,
         token_data: dict[str, Any],
         portfolio_value_usdc: float,
-        ml_context: Any | None = None,
     ) -> BreakoutDecision:
         """Evaluate one token against the entry filter."""
 
@@ -208,7 +203,7 @@ class BreakoutEngine:
         self.price_cache.save()
         self.volume_cache.save()
         self.macro_cache.save()
-        return self._attach_ml_context(decision, {symbol: ml_context} if ml_context else None)
+        return decision
 
     def _evaluate_cheap_candidate(
         self,
@@ -370,30 +365,10 @@ class BreakoutEngine:
             position_size_multiplier=candidate.macro_size_multiplier,
         )
 
-    def _attach_ml_context(self, decision: BreakoutDecision, ml_contexts: dict[str, Any] | None) -> BreakoutDecision:
-        if not ml_contexts or decision.symbol is None:
-            return decision
-        ctx = ml_contexts.get(decision.symbol.upper())
-        if ctx is None:
-            return decision
-        return BreakoutDecision(
-            should_enter=decision.should_enter,
-            symbol=decision.symbol,
-            position_size_usdc=decision.position_size_usdc,
-            factor_scores=decision.factor_scores,
-            true_factor_count=decision.true_factor_count,
-            reason=decision.reason,
-            estimated_slippage_pct=decision.estimated_slippage_pct,
-            entry_score=decision.entry_score,
-            position_size_multiplier=decision.position_size_multiplier,
-            ml_context=ctx,
-        )
-
     def evaluate_all(
         self,
         market_snapshot: dict[str, dict[str, Any]],
         portfolio_value_usdc: float,
-        ml_contexts: dict[str, Any] | None = None,
     ) -> list[BreakoutDecision]:
         """Scan target symbols and return all slippage-confirmed entry decisions."""
 
@@ -455,7 +430,6 @@ class BreakoutEngine:
                 self._estimate_candidate_slippage(candidate),
                 scores_by_symbol.get(candidate.symbol, 0.0),
             )
-            decision = self._attach_ml_context(decision, ml_contexts)
             if decision.should_enter:
                 passers.append(decision)
             if self._is_better_decision(decision, candidate.volume_24h, best_decision, best_volume):
@@ -480,17 +454,16 @@ class BreakoutEngine:
                     reason="no liquid target symbols available" if saw_target_symbol else "no target symbols available",
                 )
             ]
-        return [self._attach_ml_context(best_decision, ml_contexts)]
+        return [best_decision]
 
     def evaluate_universe(
         self,
         market_snapshot: dict[str, dict[str, Any]],
         portfolio_value_usdc: float,
-        ml_contexts: dict[str, Any] | None = None,
     ) -> BreakoutDecision:
         """Scan target symbols and pick the highest-scoring candidate."""
 
-        decisions = self.evaluate_all(market_snapshot, portfolio_value_usdc, ml_contexts)
+        decisions = self.evaluate_all(market_snapshot, portfolio_value_usdc)
         passers = [decision for decision in decisions if decision.should_enter]
         if passers:
             return passers[0]

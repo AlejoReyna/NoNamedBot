@@ -21,7 +21,6 @@ def deployment_startup(
     *,
     position_manager: Any,
     toolkit: Any,
-    ml_bundle: Any | None,
 ) -> tuple[HealthState | None, Any, set[str]]:
     """
     Run live deployment checks and services.
@@ -46,30 +45,13 @@ def deployment_startup(
     port = int(getattr(settings, "health_check_port", 0) or 0)
     if port > 0:
         health_state = HealthState()
-        ml_mode = _ml_mode_label(ml_bundle)
-        health_state.update(status="ok", ml_mode=ml_mode, ml_active=_ml_active(ml_bundle))
+        health_state.update(status="ok")
         health_server = start_health_server(
             health_state,
             port=port,
             decision_log_path=settings.decision_log_path,
         )
     return health_state, health_server, pending_cooldowns
-
-
-def _ml_mode_label(ml_bundle: Any | None) -> str:
-    if ml_bundle is None:
-        return "disabled"
-    if getattr(ml_bundle, "is_ranking_active", False):
-        return "ranking_active"
-    if getattr(ml_bundle, "is_regime_only_fallback", False):
-        return "regime_fallback"
-    return "shadow"
-
-
-def _ml_active(ml_bundle: Any | None) -> bool:
-    if ml_bundle is None:
-        return False
-    return bool(getattr(ml_bundle, "is_ranking_active", False))
 
 
 def disk_allows_entries(settings: Settings) -> bool:
@@ -86,7 +68,6 @@ def update_health_snapshot(
     guardrails: Any,
     portfolio_value: float,
     position_manager: Any,
-    ml_bundle: Any | None,
 ) -> None:
     if health_state is None:
         return
@@ -99,7 +80,5 @@ def update_health_snapshot(
         positions=len(position_manager.list_open_positions()),
         daily_trades=int(getattr(guardrails, "daily_trade_count", 0)),
         drawdown_pct=drawdown,
-        ml_mode=_ml_mode_label(ml_bundle),
-        ml_active=_ml_active(ml_bundle),
         status="ok",
     )

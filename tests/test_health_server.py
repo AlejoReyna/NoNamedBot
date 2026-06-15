@@ -11,15 +11,15 @@ from src.deployment.health_server import start_health_server
 
 def test_health_endpoint_returns_required_keys() -> None:
     state = HealthState()
-    state.update(status="ok", positions=2, ml_mode="regime_fallback", daily_trades=1, drawdown_pct=4.2)
+    state.update(status="ok", positions=2, daily_trades=1, drawdown_pct=4.2)
     server = start_health_server(state, host="127.0.0.1", port=18080, decision_log_path="decision_log.jsonl")
     try:
         with urllib.request.urlopen("http://127.0.0.1:18080/health", timeout=2) as resp:
             assert resp.status == 200
             payload = json.loads(resp.read().decode("utf-8"))
-        for key in ("status", "positions", "ml_mode", "daily_trades", "drawdown_pct"):
+        for key in ("status", "positions", "daily_trades", "drawdown_pct"):
             assert key in payload
-        assert payload["ml_mode"] == "regime_fallback"
+        assert payload["positions"] == 2
     finally:
         server.shutdown()
 

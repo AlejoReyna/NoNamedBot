@@ -71,7 +71,6 @@ def build_chat_reply(
         lines = [
             f"Bot status: {health.get('status', 'unknown')}",
             f"Open positions: {health.get('positions', 0)}",
-            f"ML mode: {health.get('ml_mode', 'n/a')} (active={health.get('ml_active', False)})",
             f"Daily trades: {health.get('daily_trades', 0)}",
             f"Drawdown: {health.get('drawdown_pct', 0)}%",
         ]

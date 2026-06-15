@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
 
 
 @dataclass(frozen=True)
@@ -24,5 +23,3 @@ class EntryCandidate:
     entry_score: float | None = None
     position_size_multiplier: float = 1.0
     strategy_mode: str = "breakout"
-    ml_context: Any | None = None
-    ml_ranking: dict[str, Any] | None = None

@@ -1,6 +1,8 @@
 name: Deploy
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       environment:
@@ -26,7 +28,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    environment: ${{ inputs.environment }}
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'production' }}
 
     steps:
       - name: Deploy to EC2
@@ -42,20 +44,27 @@ jobs:
             if [ -z "$DEPLOY_PATH" ]; then
               DEPLOY_PATH="/home/ubuntu/planb-plus"
             fi
+            RESTART_ONLY="${{ github.event_name == 'workflow_dispatch' && inputs.restart_only || false }}"
+            SKIP_PRE_LIVE_CHECK="${{ github.event_name == 'workflow_dispatch' && inputs.skip_pre_live_check || false }}"
             cd "$DEPLOY_PATH"
 
-            if [ "${{ inputs.restart_only }}" != "true" ]; then
+            if [ "$RESTART_ONLY" != "true" ]; then
               git fetch origin
               git checkout main
               git pull --ff-only
+              if [ ! -d .venv ]; then
+                python3 -m venv .venv
+              fi
               source .venv/bin/activate
-              pip install -r requirements.txt -r requirements-ml.txt
+              python -m pip install --upgrade pip
+              python -m pip cache purge || true
+              pip install --no-cache-dir -r requirements.txt
             fi
 
             source .venv/bin/activate
             python scripts/verify_twak_unlock.py
 
-            if [ "${{ inputs.skip_pre_live_check }}" != "true" ]; then
+            if [ "$SKIP_PRE_LIVE_CHECK" != "true" ]; then
               python scripts/pre_live_check.py
             fi
 

@@ -67,9 +67,6 @@ class LiveDecisionLog(LogEntry):
     exit_reason: str | None = None
     gas_cost_usd: float | None = None
     expected_breakeven_pct: float | None = None
-    ml_regime: str | None = None
-    ml_confidence: float | None = None
-    ml_ranking: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

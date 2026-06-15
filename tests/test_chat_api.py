@@ -14,7 +14,7 @@ def test_chat_help_reply() -> None:
 def test_chat_health_reply() -> None:
     out = build_chat_reply(
         "bot status",
-        health_snapshot={"status": "ok", "positions": 2, "ml_mode": "regime_fallback"},
+        health_snapshot={"status": "ok", "positions": 2, "daily_trades": 3},
     )
-    assert "regime_fallback" in out["reply"]
+    assert "Open positions: 2" in out["reply"]
     assert out["source"] == "health snapshot"

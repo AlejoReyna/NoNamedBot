@@ -14,10 +14,8 @@ class HealthState:
 
     last_cycle_at: datetime | None = None
     positions: int = 0
-    ml_mode: str = "disabled"
     daily_trades: int = 0
     drawdown_pct: float = 0.0
-    ml_active: bool = False
     status: str = "starting"
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -34,10 +32,8 @@ class HealthState:
                 "status": self.status,
                 "last_cycle": last_cycle,
                 "positions": self.positions,
-                "ml_mode": self.ml_mode,
                 "daily_trades": self.daily_trades,
                 "drawdown_pct": round(self.drawdown_pct, 4),
-                "ml_active": self.ml_active,
             }
 
     def is_stalled(self, stall_minutes: float = 15.0) -> bool:
