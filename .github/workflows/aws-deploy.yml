@@ -39,9 +39,9 @@ jobs:
     env:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
       SSM_INSTANCE_ID: ${{ vars.AGENT_SSM_INSTANCE_ID }}
-      DEPLOY_USER: ${{ vars.AGENT_DEPLOY_USER || 'ubuntu' }}
-      DEPLOY_PATH: ${{ vars.AGENT_DEPLOY_PATH || '/home/ubuntu/planb-plus' }}
-      SERVICE_NAME: ${{ vars.AGENT_SERVICE_NAME || 'planb-plus' }}
+      DEPLOY_USER: ${{ vars.AGENT_DEPLOY_USER || 'ec2-user' }}
+      DEPLOY_PATH: ${{ vars.AGENT_DEPLOY_PATH || '/home/ec2-user/cascade-ai' }}
+      SERVICE_NAME: ${{ vars.AGENT_SERVICE_NAME || 'cascade-ai' }}
       HEALTH_URL: ${{ vars.AGENT_HEALTH_URL || 'http://localhost:8080/health' }}
       RESTART_ONLY: ${{ inputs.restart_only }}
       SKIP_PRE_LIVE_CHECK: ${{ inputs.skip_pre_live_check }}
@@ -90,6 +90,13 @@ jobs:
             pip install -r requirements.txt
           fi
 
+          systemctl --user disable --now planb-plus 2>/dev/null || true
+          rm -f "$HOME/.config/systemd/user/planb-plus.service"
+          sudo systemctl disable --now planb-plus 2>/dev/null || true
+          sudo rm -f /etc/systemd/system/planb-plus.service
+          sudo systemctl daemon-reload
+          systemctl --user daemon-reload 2>/dev/null || true
+
           . .venv/bin/activate
           python scripts/verify_twak_unlock.py
 
@@ -97,8 +104,7 @@ jobs:
             python scripts/pre_live_check.py
           fi
 
-          systemctl --user daemon-reload
-          systemctl --user restart "$SERVICE_NAME"
+          sudo systemctl restart "$SERVICE_NAME"
 
           for i in $(seq 1 12); do
             if curl -sf "$HEALTH_URL" >/dev/null; then
@@ -110,8 +116,8 @@ jobs:
           done
 
           echo "Health check failed after restart"
-          systemctl --user status "$SERVICE_NAME" --no-pager || true
-          journalctl --user -u "$SERVICE_NAME" -n 100 --no-pager || true
+          sudo systemctl status "$SERVICE_NAME" --no-pager || true
+          sudo journalctl -u "$SERVICE_NAME" -n 100 --no-pager || true
           exit 1
           USER_SCRIPT
 

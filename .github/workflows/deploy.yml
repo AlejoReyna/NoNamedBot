@@ -42,7 +42,11 @@ jobs:
             set -euo pipefail
             DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
             if [ -z "$DEPLOY_PATH" ]; then
-              DEPLOY_PATH="/home/ubuntu/planb-plus"
+              DEPLOY_PATH="/home/ec2-user/cascade-ai"
+            fi
+            SERVICE_NAME="${{ secrets.SERVICE_NAME }}"
+            if [ -z "$SERVICE_NAME" ]; then
+              SERVICE_NAME="cascade-ai"
             fi
             RESTART_ONLY="${{ github.event_name == 'workflow_dispatch' && inputs.restart_only || false }}"
             SKIP_PRE_LIVE_CHECK="${{ github.event_name == 'workflow_dispatch' && inputs.skip_pre_live_check || false }}"
@@ -61,6 +65,13 @@ jobs:
               pip install --no-cache-dir -r requirements.txt
             fi
 
+            systemctl --user disable --now planb-plus 2>/dev/null || true
+            rm -f "$HOME/.config/systemd/user/planb-plus.service"
+            sudo systemctl disable --now planb-plus 2>/dev/null || true
+            sudo rm -f /etc/systemd/system/planb-plus.service
+            sudo systemctl daemon-reload
+            systemctl --user daemon-reload 2>/dev/null || true
+
             source .venv/bin/activate
             python scripts/verify_twak_unlock.py
 
@@ -68,8 +79,7 @@ jobs:
               python scripts/pre_live_check.py
             fi
 
-            systemctl --user daemon-reload
-            systemctl --user restart planb-plus
+            sudo systemctl restart "$SERVICE_NAME"
 
             for i in $(seq 1 12); do
               if curl -sf http://localhost:8080/health > /dev/null; then
@@ -81,4 +91,6 @@ jobs:
             done
 
             echo "Health check failed after restart"
+            sudo systemctl status "$SERVICE_NAME" --no-pager || true
+            sudo journalctl -u "$SERVICE_NAME" -n 100 --no-pager || true
             exit 1
