@@ -384,6 +384,6 @@ NoNamedYet_Bot/
 
 <div align="center">
 
-**Built for BNB Hack Track 1** · TWAK self-custody · CoinMarketCap data · No private keys in Python
+**Built for BNB Hack Track 1** · TWAK self-custody · CoinMarketCap data · No private keys in Python. Some cool guy I worked with told me updating the README sometimes fixed CI/CD pipelines 
 
 </div>
