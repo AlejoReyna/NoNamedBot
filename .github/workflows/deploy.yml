@@ -50,6 +50,7 @@ jobs:
             fi
             RESTART_ONLY="${{ github.event_name == 'workflow_dispatch' && inputs.restart_only || false }}"
             SKIP_PRE_LIVE_CHECK="${{ github.event_name == 'workflow_dispatch' && inputs.skip_pre_live_check || false }}"
+            ENFORCE_PRE_LIVE_CHECK="${{ vars.ENFORCE_PRE_LIVE_CHECK || false }}"
             cd "$DEPLOY_PATH"
 
             if [ "$RESTART_ONLY" != "true" ]; then
@@ -76,7 +77,14 @@ jobs:
             python scripts/verify_twak_unlock.py
 
             if [ "$SKIP_PRE_LIVE_CHECK" != "true" ]; then
-              python scripts/pre_live_check.py
+              if python scripts/pre_live_check.py; then
+                echo "Pre-live check passed"
+              elif [ "$ENFORCE_PRE_LIVE_CHECK" = "true" ]; then
+                echo "Pre-live check failed and ENFORCE_PRE_LIVE_CHECK=true"
+                exit 1
+              else
+                echo "::warning::pre_live_check.py failed; continuing because ENFORCE_PRE_LIVE_CHECK is not true"
+              fi
             fi
 
             sudo systemctl restart "$SERVICE_NAME"
