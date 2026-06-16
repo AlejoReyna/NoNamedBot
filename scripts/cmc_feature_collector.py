@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.config.settings import load_settings
+from src.config.tokens import TRADABLE_TARGET_SYMBOLS
 from src.execution.twak_interface import TWAKInterface
 
 DB_PATH = Path("data/cmc_premium.db")
@@ -177,7 +178,7 @@ def main() -> int:
         from src.data.cmc_mcp_client import CMCMCPClient
 
         client = CMCMCPClient(settings)
-        symbols = settings.ml_universe_symbols
+        symbols = getattr(settings, "ml_universe_symbols", None) or TRADABLE_TARGET_SYMBOLS
         enriched = client.fetch_x402_enriched_snapshot(symbols)
         if isinstance(enriched, dict) and enriched:
             snapshot["symbols"] = enriched
