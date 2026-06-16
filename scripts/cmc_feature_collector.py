@@ -184,19 +184,13 @@ def main() -> int:
         # so id_overrides must be populated from the keyless layer — same
         # pattern used by the main trading loop.
         keyless = client.fetch_keyless_quotes_snapshot(symbols)
-        print(f"Keyless snapshot: {len(keyless)} symbols")
         id_overrides: dict[str, str] = {
             str(sym).upper(): str(row["id"])
             for sym, row in keyless.items()
             if isinstance(row, dict) and row.get("id")
         }
-        print(f"id_overrides resolved: {len(id_overrides)}")
         enriched = client.fetch_x402_enriched_snapshot(symbols, id_overrides)
-        print(f"Enriched snapshot: {type(enriched).__name__} len={len(enriched) if isinstance(enriched, dict) else 'N/A'}")
         if isinstance(enriched, dict) and enriched:
-            _sample_sym = next(iter(enriched))
-            _sample = enriched[_sample_sym]
-            print(f"Sample [{_sample_sym}]: price={_sample.get('price')} vol24h={_sample.get('volume_24h')} keys={list(_sample.keys())[:8]}")
             snapshot["symbols"] = enriched
             snapshot.update({k: v for k, v in enriched.items() if isinstance(v, dict)})
             # Persist the x402 snapshot so the bot can load it on restart
