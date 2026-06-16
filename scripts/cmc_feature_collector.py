@@ -51,6 +51,34 @@ def _update_local_cache(path: Path, updates: dict[str, float], max_age_hours: fl
     tmp.replace(path)
 
 
+_QUOTES_CREATE_SQL = """
+        CREATE TABLE IF NOT EXISTS quotes (
+            symbol TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            price REAL,
+            percent_change_1h REAL,
+            percent_change_6h REAL,
+            percent_change_24h REAL,
+            volume_24h REAL,
+            volume_1h REAL,
+            market_cap REAL,
+            high_3h REAL,
+            high_6h REAL,
+            high_24h REAL,
+            low_24h REAL,
+            rsi REAL,
+            macd REAL,
+            funding_rate REAL,
+            open_interest_change_pct REAL,
+            macro_total_market_cap REAL,
+            macro_btc_dominance REAL,
+            macro_stablecoin_dominance REAL,
+            source TEXT DEFAULT 'x402',
+            PRIMARY KEY (symbol, timestamp, source)
+        );
+"""
+
+
 def _init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
@@ -72,23 +100,126 @@ def _init_db(conn: sqlite3.Connection) -> None:
             altcoin_volume REAL,
             payload_json TEXT
         );
-        CREATE TABLE IF NOT EXISTS quotes (
-            symbol TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            price REAL,
-            percent_change_1h REAL,
-            percent_change_24h REAL,
-            volume_24h REAL,
-            volume_1h REAL,
-            market_cap REAL,
-            source TEXT DEFAULT 'x402',
-            PRIMARY KEY (symbol, timestamp)
-        );
         """
+        + _QUOTES_CREATE_SQL
     )
+    _migrate_quotes_columns(conn)
 
 
-def _store_snapshot(conn: sqlite3.Connection, ts: str, payload: dict) -> None:
+# Columns added after the original (price, pct_1h, pct_24h, vol_24h, vol_1h,
+# market_cap, source) shipped. Existing DBs on EC2 predate them, so ALTER each
+# in idempotently — sqlite raises "duplicate column name" when it already
+# exists, which we swallow.
+_QUOTES_EXTRA_COLUMNS = (
+    "percent_change_6h",
+    "high_3h",
+    "high_6h",
+    "high_24h",
+    "low_24h",
+    "rsi",
+    "macd",
+    "funding_rate",
+    "open_interest_change_pct",
+    "macro_total_market_cap",
+    "macro_btc_dominance",
+    "macro_stablecoin_dominance",
+)
+
+
+def _migrate_quotes_columns(conn: sqlite3.Connection) -> None:
+    info = list(conn.execute("PRAGMA table_info(quotes)"))
+    existing = {row[1] for row in info}
+    for column in _QUOTES_EXTRA_COLUMNS:
+        if column in existing:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE quotes ADD COLUMN {column} REAL")
+        except sqlite3.OperationalError:
+            pass
+
+    # Pre-existing DBs were keyed on (symbol, timestamp) only. ALTER cannot add
+    # `source` to the primary key, so a keyless row would REPLACE the x402 row
+    # at the same timestamp. SQLite can't alter a PK in place, so rebuild the
+    # table once when `source` is missing from the key.
+    pk_cols = {row[1] for row in info if row[5] > 0}  # row[5] = pk position
+    if "source" not in pk_cols:
+        _rebuild_quotes_with_source_pk(conn)
+
+
+def _rebuild_quotes_with_source_pk(conn: sqlite3.Connection) -> None:
+    conn.execute("ALTER TABLE quotes RENAME TO quotes_legacy")
+    conn.executescript(_QUOTES_CREATE_SQL)
+    old_cols = {row[1] for row in conn.execute("PRAGMA table_info(quotes_legacy)")}
+    new_cols = [row[1] for row in conn.execute("PRAGMA table_info(quotes)")]
+    shared = [col for col in new_cols if col in old_cols]
+    col_list = ", ".join(shared)
+    conn.execute(
+        f"INSERT OR IGNORE INTO quotes ({col_list}) SELECT {col_list} FROM quotes_legacy"
+    )
+    conn.execute("DROP TABLE quotes_legacy")
+
+
+_QUOTE_COLUMNS = (
+    "price",
+    "percent_change_1h",
+    "percent_change_6h",
+    "percent_change_24h",
+    "volume_24h",
+    "volume_1h",
+    "market_cap",
+    "high_3h",
+    "high_6h",
+    "high_24h",
+    "low_24h",
+    "rsi",
+    "macd",
+    "funding_rate",
+    "open_interest_change_pct",
+    "macro_total_market_cap",
+    "macro_btc_dominance",
+    "macro_stablecoin_dominance",
+)
+
+
+def _store_quote_row(
+    conn: sqlite3.Connection,
+    symbol: str,
+    ts: str,
+    row: dict,
+    source: str,
+) -> None:
+    """Persist one per-symbol quote row across all tracked columns.
+
+    Only writes when at least one numeric field is present, and coerces values
+    defensively so a bad field never aborts the whole snapshot.
+    """
+
+    values: list[float | None] = []
+    has_value = False
+    for column in _QUOTE_COLUMNS:
+        raw = row.get(column)
+        if raw is None:
+            values.append(None)
+            continue
+        try:
+            values.append(float(raw))
+            has_value = True
+        except (TypeError, ValueError):
+            values.append(None)
+    if not has_value:
+        return
+    placeholders = ", ".join(["?"] * (len(_QUOTE_COLUMNS) + 3))
+    columns = ", ".join(("symbol", "timestamp", *_QUOTE_COLUMNS, "source"))
+    try:
+        conn.execute(
+            f"INSERT OR REPLACE INTO quotes ({columns}) VALUES ({placeholders})",
+            (str(symbol).upper(), ts, *values, source),
+        )
+    except (sqlite3.Error, TypeError, ValueError):
+        pass
+
+
+def _store_snapshot(conn: sqlite3.Connection, ts: str, payload: dict, source: str = "x402") -> None:
     fgi = payload.get("fear_greed_index") or payload.get("fear_greed")
     if fgi is not None:
         try:
@@ -112,34 +243,8 @@ def _store_snapshot(conn: sqlite3.Connection, ts: str, payload: dict) -> None:
     for symbol, row in payload.items():
         if not isinstance(row, dict):
             continue
-        # --- quotes table: persist per-symbol price/volume data ---
-        price = row.get("price")
-        pct_1h = row.get("percent_change_1h")
-        pct_24h = row.get("percent_change_24h")
-        vol_24h = row.get("volume_24h")
-        vol_1h = row.get("volume_1h")
-        mkt_cap = row.get("market_cap")
-        if any(v is not None for v in (price, pct_1h, pct_24h, vol_24h, vol_1h, mkt_cap)):
-            try:
-                conn.execute(
-                    "INSERT OR REPLACE INTO quotes"
-                    " (symbol, timestamp, price, percent_change_1h, percent_change_24h,"
-                    "  volume_24h, volume_1h, market_cap, source)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        str(symbol).upper(),
-                        ts,
-                        float(price) if price is not None else None,
-                        float(pct_1h) if pct_1h is not None else None,
-                        float(pct_24h) if pct_24h is not None else None,
-                        float(vol_24h) if vol_24h is not None else None,
-                        float(vol_1h) if vol_1h is not None else None,
-                        float(mkt_cap) if mkt_cap is not None else None,
-                        "x402",
-                    ),
-                )
-            except (TypeError, ValueError):
-                pass
+        # --- quotes table: persist per-symbol price/volume/technicals/macro ---
+        _store_quote_row(conn, symbol, ts, row, source)
         # --- funding_rates table ---
         funding = row.get("funding_rate")
         oi = row.get("open_interest")
@@ -173,6 +278,7 @@ def main() -> int:
 
     twak = TWAKInterface(paper_trade=settings.paper_trade)
     snapshot: dict = {"collected_at": ts_iso, "symbols": {}}
+    keyless: dict = {}
 
     try:
         from src.data.cmc_mcp_client import CMCMCPClient
@@ -184,19 +290,21 @@ def main() -> int:
         # so id_overrides must be populated from the keyless layer — same
         # pattern used by the main trading loop.
         keyless = client.fetch_keyless_quotes_snapshot(symbols)
-        print(f"Keyless snapshot: {len(keyless)} symbols")
         id_overrides: dict[str, str] = {
             str(sym).upper(): str(row["id"])
             for sym, row in keyless.items()
             if isinstance(row, dict) and row.get("id")
         }
-        print(f"id_overrides resolved: {len(id_overrides)}")
-        enriched = client.fetch_x402_enriched_snapshot(symbols, id_overrides)
-        print(f"Enriched snapshot: {type(enriched).__name__} len={len(enriched) if isinstance(enriched, dict) else 'N/A'}")
+        # Technicals default OFF for the collector: it enriches the whole
+        # universe, so paid technicals would roughly double x402 calls per run.
+        # Opt in with CMC_COLLECTOR_FETCH_TECHNICALS=true once the budget math
+        # is explicit. The live loop still gets RSI via x402_fetch_technicals.
+        enriched = client.fetch_x402_enriched_snapshot(
+            symbols,
+            id_overrides,
+            fetch_technicals=getattr(settings, "cmc_collector_fetch_technicals", False),
+        )
         if isinstance(enriched, dict) and enriched:
-            _sample_sym = next(iter(enriched))
-            _sample = enriched[_sample_sym]
-            print(f"Sample [{_sample_sym}]: price={_sample.get('price')} vol24h={_sample.get('volume_24h')} keys={list(_sample.keys())[:8]}")
             snapshot["symbols"] = enriched
             snapshot.update({k: v for k, v in enriched.items() if isinstance(v, dict)})
             # Persist the x402 snapshot so the bot can load it on restart
@@ -229,7 +337,17 @@ def main() -> int:
 
     with sqlite3.connect(DB_PATH) as conn:
         _init_db(conn)
-        _store_snapshot(conn, ts_iso, snapshot.get("symbols", snapshot))
+        _store_snapshot(conn, ts_iso, snapshot.get("symbols", snapshot), source="x402")
+        # Persist the free keyless rows too (source='keyless') instead of
+        # discarding them after id harvesting. They give a denser inter-run
+        # price/volume series between the paid x402 cycles; the (symbol,
+        # timestamp, source) primary key keeps them from colliding with x402.
+        # Write quote rows only — the shared market_metrics/fear_greed rows are
+        # owned by the x402 path and must not be clobbered with keyless nulls.
+        if isinstance(keyless, dict):
+            for sym, row in keyless.items():
+                if isinstance(row, dict):
+                    _store_quote_row(conn, str(sym).upper(), ts_iso, row, "keyless")
         conn.commit()
 
     print(f"Wrote {raw_path} and updated {DB_PATH}")

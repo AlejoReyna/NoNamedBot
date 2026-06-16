@@ -42,6 +42,11 @@ class Settings(BaseModel):
     # Paid enrichment scope: top-N candidates by cheap rank (0 = all targets).
     # The full universe stays visible via the free keyless path every cycle.
     x402_enrich_top_n: int = 50
+    # Fetch paid x402 technical-analysis (RSI/MACD) for enriched symbols. The
+    # keyless REST API has no technicals endpoint, so without this the RSI
+    # factor fails closed on every token. Roughly doubles x402 calls per
+    # enrichment batch; still governor-gated. Set false to disable.
+    x402_fetch_technicals: bool = True
     use_keyless_primary: bool = False
     use_dual_market_data: bool = False
     cmc_keyless_base_url: str = "https://pro-api.coinmarketcap.com/trial-pro-api/v3"
@@ -120,6 +125,14 @@ class Settings(BaseModel):
     guardrail_state_path: str = "guardrail_state.json"
     execution_log_path: str = "execution_log.jsonl"
     decision_log_path: str = "decision_log.jsonl"
+    # Per-cycle factor matrix: one row per evaluated symbol with every factor
+    # boolean, raw scoring inputs, entry_score and missing-field flags. Off by
+    # default — on a 132-symbol universe this writes a row per symbol per cycle.
+    factor_matrix_log_enabled: bool = False
+    factor_matrix_log_path: str = "logs/factor_matrix.jsonl"
+    # Entry/exit outcome log: entry factors + realized PnL, joinable by symbol
+    # to learn which factor combinations actually win. Append-only, best-effort.
+    trade_outcome_log_path: str = "logs/trade_outcomes.jsonl"
     strategy_mode: Literal["breakout", "scalping"] = "breakout"
     scalping_entry_score_min: float = 60.0
     scalping_position_pct: float = 0.01
@@ -145,6 +158,12 @@ class Settings(BaseModel):
     log_rotate_max_mb: float = 50.0
     cmc_collector_enabled: bool = True
     cmc_collector_interval_min: int = 15
+    # Whether the background collector also pays for x402 technicals. Off by
+    # default: the collector enriches the WHOLE tradable universe (not just top
+    # candidates like the main loop), so enabling technicals there roughly
+    # doubles paid x402 calls per run and can starve the quote-refresh budget.
+    # The live trading loop still gets RSI via the global x402_fetch_technicals.
+    cmc_collector_fetch_technicals: bool = False
     min_bnb_gas: float = 0.003
     min_usdc_balance: float = 20.0
     disk_guard_min_free_bytes: int = 500_000_000
@@ -249,6 +268,7 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
         "x402_min_position_value_usdc": _get_float("X402_MIN_POSITION_VALUE_USDC", 5.0),
         "x402_hot_refresh_age_seconds": _get_int("X402_HOT_REFRESH_AGE_SECONDS", 600),
         "x402_enrich_top_n": _get_int("X402_ENRICH_TOP_N", 50),
+        "x402_fetch_technicals": _get_bool("X402_FETCH_TECHNICALS", True),
         "use_keyless_primary": use_keyless_primary,
         "use_dual_market_data": use_dual_market_data,
         "cmc_keyless_base_url": os.getenv(
@@ -332,6 +352,9 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
         "guardrail_state_path": os.getenv("GUARDRAIL_STATE_PATH", "guardrail_state.json"),
         "execution_log_path": os.getenv("EXECUTION_LOG_PATH", "execution_log.jsonl"),
         "decision_log_path": os.getenv("DECISION_LOG_PATH", "decision_log.jsonl"),
+        "factor_matrix_log_enabled": _get_bool("FACTOR_MATRIX_LOG_ENABLED", False),
+        "factor_matrix_log_path": os.getenv("FACTOR_MATRIX_LOG_PATH", "logs/factor_matrix.jsonl"),
+        "trade_outcome_log_path": os.getenv("TRADE_OUTCOME_LOG_PATH", "logs/trade_outcomes.jsonl"),
         "strategy_mode": os.getenv("STRATEGY_MODE", "breakout"),
         "scalping_entry_score_min": _get_float("SCALPING_ENTRY_SCORE_MIN", 60.0),
         "scalping_position_pct": _get_float("SCALPING_POSITION_PCT", 0.01),
@@ -356,6 +379,7 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
         "log_rotate_max_mb": _get_float("LOG_ROTATE_MAX_MB", 50.0),
         "cmc_collector_enabled": _get_bool("CMC_COLLECTOR_ENABLED", True),
         "cmc_collector_interval_min": _get_int("CMC_COLLECTOR_INTERVAL_MIN", 15),
+        "cmc_collector_fetch_technicals": _get_bool("CMC_COLLECTOR_FETCH_TECHNICALS", False),
         "min_bnb_gas": _get_float("MIN_BNB_GAS", 0.003),
         "min_usdc_balance": _get_float("MIN_USDC_BALANCE", 20.0),
         "disk_guard_min_free_bytes": _get_int("DISK_GUARD_MIN_FREE_BYTES", 500_000_000),
