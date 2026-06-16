@@ -359,16 +359,35 @@ def test_fetch_x402_enriched_snapshot_paid_calls_are_id_only(monkeypatch: Any) -
     """Probed June 12: the paid tool rejects symbol-only requests after
     settling payment, and id-only responses arrive columnar (headers+rows).
     Pinned UCIDs and keyless-harvested id_overrides merge into one id-only
-    call; symbols with no known id are skipped on the paid layer."""
+    quote call; technical-analysis calls are single-id because CMC rejects
+    comma-separated ids for that tool."""
 
     class PaidX402Client:
         def __init__(self) -> None:
             self.calls: list[dict[str, Any]] = []
 
         def request_with_x402(self, method: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
+            tool = payload["params"]["name"]
             arguments = payload["params"]["arguments"]
-            self.calls.append(arguments)
+            self.calls.append({"tool": tool, "arguments": arguments})
             assert "symbol" not in arguments, "paid path must never send symbol args"
+            if tool == "get_crypto_technical_analysis":
+                if arguments["id"] == "7186":
+                    text = (
+                        '{"rsi":{"rsi7":"65.77","rsi14":"54.29","rsi21":"51.18"},'
+                        '"macd":{"macdLine":"-0.020367","signalLine":"-0.037515"}}'
+                    )
+                else:
+                    text = (
+                        '{"rsi":{"rsi7":"58.1","rsi14":"61.5","rsi21":"57.4"},'
+                        '"macd":{"macdLine":"0.0123","signalLine":"0.0100"}}'
+                    )
+                return {
+                    "result": {
+                        "content": [{"type": "text", "text": text}],
+                        "isError": False,
+                    }
+                }
             return {
                 "result": {
                     "content": [
@@ -397,12 +416,17 @@ def test_fetch_x402_enriched_snapshot_paid_calls_are_id_only(monkeypatch: Any) -
         id_overrides={"AB": "12345"},
     )
 
-    assert len(paid.calls) == 2  # quotes + technicals; both must stay id-only
-    for call in paid.calls:
-        requested_ids = set(call["id"].split(","))
-        assert requested_ids == {"7186", "12345"}
+    assert len(paid.calls) == 3  # one quote batch + two single-id technicals
+    quote_calls = [call for call in paid.calls if call["tool"] == "get_crypto_quotes_latest"]
+    technical_calls = [call for call in paid.calls if call["tool"] == "get_crypto_technical_analysis"]
+    assert len(quote_calls) == 1
+    assert set(quote_calls[0]["arguments"]["id"].split(",")) == {"7186", "12345"}
+    assert [call["arguments"]["id"] for call in technical_calls] == ["7186", "12345"]
     assert snapshot["AB"]["price"] == 1.0
+    assert snapshot["AB"]["rsi"] == 61.5
     assert snapshot["CAKE"]["price"] == 2.5
+    assert snapshot["CAKE"]["rsi"] == 54.29
+    assert snapshot["CAKE"]["macd"] == -0.020367
     assert "ZZZ" not in snapshot
 
     paid.calls.clear()
@@ -412,8 +436,63 @@ def test_fetch_x402_enriched_snapshot_paid_calls_are_id_only(monkeypatch: Any) -
         fetch_technicals=False,
     )
     assert len(paid.calls) == 1
-    assert set(paid.calls[0]["id"].split(",")) == {"7186", "12345"}
+    assert paid.calls[0]["tool"] == "get_crypto_quotes_latest"
+    assert set(paid.calls[0]["arguments"]["id"].split(",")) == {"7186", "12345"}
     assert snapshot["AB"]["price"] == 1.0
+
+
+def test_fetch_x402_enriched_snapshot_caps_single_id_technical_calls(monkeypatch: Any) -> None:
+    class PaidX402Client:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def request_with_x402(self, method: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
+            tool = payload["params"]["name"]
+            arguments = payload["params"]["arguments"]
+            self.calls.append({"tool": tool, "arguments": arguments})
+            if tool == "get_crypto_technical_analysis":
+                return {
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": '{"rsi":{"rsi14":"54.29"},"macd":{"macdLine":"-0.020367"}}',
+                            }
+                        ],
+                        "isError": False,
+                    }
+                }
+            return {
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                '{"headers":["id","symbol","price","volume_24h"],'
+                                '"rows":[["7186","CAKE",2.5,5000000.0],["12345","AB",1.0,1000000.0]]}'
+                            ),
+                        }
+                    ],
+                    "isError": False,
+                }
+            }
+
+    def fake_get(*args: Any, **kwargs: Any) -> FakeKeylessResponse:
+        return FakeKeylessResponse({"data": {}})
+
+    paid = PaidX402Client()
+    monkeypatch.setattr(requests, "get", fake_get)
+    client = CMCMCPClient(
+        Settings(use_keyless_primary=False, x402_technicals_top_n=1),
+        x402_client=paid,  # type: ignore[arg-type]
+    )
+
+    snapshot = client.fetch_x402_enriched_snapshot(["CAKE", "AB"], id_overrides={"AB": "12345"})
+
+    technical_calls = [call for call in paid.calls if call["tool"] == "get_crypto_technical_analysis"]
+    assert [call["arguments"]["id"] for call in technical_calls] == ["7186"]
+    assert snapshot["CAKE"]["rsi"] == 54.29
+    assert snapshot["AB"]["rsi"] is None
 
 
 def test_fetch_x402_enriched_snapshot_returns_empty_when_budget_blocks_payment(monkeypatch: Any) -> None:

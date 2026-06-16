@@ -386,11 +386,11 @@ class CMCMCPClient:
             return {}
 
         # Paid technicals so RSI/MACD actually populate. The keyless REST API has
-        # no technical-analysis endpoint, so without this call `rsi` is always
-        # None on the dual x402 path and the RSI factor fails closed (a fixed
-        # -BREAKOUT_SCORE_WEIGHT_RSI on every token). Governor-gated: when the
-        # x402 budget is exhausted _call_tool_x402 returns {}, so this degrades
-        # gracefully back to the previous no-RSI behaviour instead of erroring.
+        # no technical-analysis endpoint, and CMC's x402 technical tool accepts
+        # one numeric id per call, so this is separately capped below the paid
+        # quote enrichment scope. Governor-gated: when the x402 budget is
+        # exhausted _call_tool_x402 returns {}, so this degrades gracefully back
+        # to the previous no-RSI behaviour instead of erroring.
         want_technicals = (
             bool(getattr(self.settings, "x402_fetch_technicals", True))
             if fetch_technicals is None
@@ -492,10 +492,10 @@ class CMCMCPClient:
     ) -> dict[str, Any]:
         """Fetch paid x402 technical-analysis (RSI/MACD), always by CMC id.
 
-        Mirrors ``_fetch_x402_quotes_id_preferred``: the paid MCP tool rejects
-        symbol-only requests, so ids are resolved from pinned UCIDs first, then
-        from ids harvested into ``id_overrides`` from the fresh keyless snapshot.
-        Symbols with no known id are skipped on the paid layer.
+        The paid MCP tool rejects symbol-only requests, and the technical
+        endpoint accepts only one numeric id per paid call. Its successful
+        response is also symbol-less (for example ``{"rsi":{"rsi14":"54.29"}}``),
+        so this method maps each single-id response back to the requested symbol.
         """
 
         overrides = {k.upper(): str(v) for k, v in (id_overrides or {}).items()}
@@ -508,12 +508,50 @@ class CMCMCPClient:
         if not resolved:
             return {}
 
-        def _fetch_batch(batch: list[str]) -> dict[str, Any]:
-            ids = list(dict.fromkeys(resolved[s] for s in batch))
-            return self._call_tool_x402("get_crypto_technical_analysis", {"id": ",".join(ids)})
+        limit = int(getattr(self.settings, "x402_technicals_top_n", 5))
+        if limit <= 0:
+            return {}
 
-        payload = self._fetch_combined_payload(list(resolved), _fetch_batch)
-        return self._by_symbol(payload)
+        normalized: dict[str, dict[str, Any]] = {}
+        for symbol in list(resolved)[:limit]:
+            payload = self._call_tool_x402("get_crypto_technical_analysis", {"id": resolved[symbol]})
+            if not payload:
+                continue
+            symbol_payload = self._technical_payload_for_symbol(symbol, payload)
+            if symbol_payload:
+                normalized[symbol] = symbol_payload
+        return normalized
+
+    def _technical_payload_for_symbol(self, symbol: str, payload: dict[str, Any]) -> dict[str, Any]:
+        data = payload.get("data")
+        if isinstance(data, dict) and isinstance(data.get(symbol), dict):
+            raw = data[symbol]
+        elif payload.get("symbol") or payload.get("base_symbol"):
+            raw = payload
+        else:
+            items = self._extract_items(payload)
+            has_symbol_items = any(
+                isinstance(item, dict) and (item.get("symbol") or item.get("base_symbol"))
+                for item in items
+            )
+            if has_symbol_items:
+                by_symbol = self._by_symbol(payload)
+                raw = by_symbol.get(symbol) or next(iter(by_symbol.values()), {})
+            else:
+                raw = payload
+
+        if not isinstance(raw, dict):
+            return {}
+
+        rsi = self._first_number(raw, ("rsi", "rsi_14", "rsi14", "technical.rsi", "rsi.rsi14"))
+        macd = self._first_number(raw, ("macd", "macdLine", "technical.macd", "macd.macdLine"))
+        normalized = dict(raw)
+        normalized["symbol"] = symbol
+        if rsi is not None:
+            normalized["rsi"] = rsi
+        if macd is not None:
+            normalized["macd"] = macd
+        return normalized
 
     def _build_enriched_snapshot(
         self,
