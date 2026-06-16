@@ -20,6 +20,34 @@ from src.execution.twak_interface import TWAKInterface
 DB_PATH = Path("data/cmc_premium.db")
 RAW_DIR = Path("data/cmc_premium")
 CACHE_PATH = Path("logs/market_snapshot_cache.json")
+PRICE_CACHE_PATH = Path("price_cache.json")
+VOLUME_CACHE_PATH = Path("volume_cache.json")
+
+
+def _update_local_cache(path: Path, updates: dict[str, float], max_age_hours: float = 24.0) -> None:
+    """Merge new {symbol: value} points into a LocalCache-format JSON file.
+
+    Format on disk: {"BTC": [{"timestamp": <unix>, "value": <float>}, ...], ...}
+    Matches what BreakoutEngine.LocalCache writes, so the dashboard and
+    breakout engine both read the same file.
+    """
+    try:
+        existing: dict[str, list[dict]] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        existing = {}
+
+    now = time.time()
+    cutoff = now - max_age_hours * 3600
+    for symbol, value in updates.items():
+        if not isinstance(value, (int, float)) or value != value:  # skip NaN
+            continue
+        points = [pt for pt in existing.get(symbol, []) if pt.get("timestamp", 0) >= cutoff]
+        points.append({"timestamp": now, "value": float(value)})
+        existing[symbol] = points
+
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(existing), encoding="utf-8")
+    tmp.replace(path)
 
 
 def _init_db(conn: sqlite3.Connection) -> None:
@@ -165,6 +193,16 @@ def main() -> int:
             _cache_tmp = CACHE_PATH.with_suffix(".tmp")
             _cache_tmp.write_text(json.dumps(_cache_payload), encoding="utf-8")
             _cache_tmp.replace(CACHE_PATH)
+            # Update price_cache.json and volume_cache.json so the dashboard
+            # market cache section populates independently of the breakout engine.
+            _update_local_cache(
+                PRICE_CACHE_PATH,
+                {sym: data["price"] for sym, data in enriched.items() if isinstance(data, dict) and data.get("price") is not None},
+            )
+            _update_local_cache(
+                VOLUME_CACHE_PATH,
+                {sym: data["volume_24h"] for sym, data in enriched.items() if isinstance(data, dict) and data.get("volume_24h") is not None},
+            )
     except Exception as exc:
         snapshot["error"] = str(exc)
         print(f"CMC fetch failed: {exc}")
