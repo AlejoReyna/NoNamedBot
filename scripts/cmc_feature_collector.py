@@ -194,6 +194,9 @@ def main() -> int:
         enriched = client.fetch_x402_enriched_snapshot(symbols, id_overrides)
         print(f"Enriched snapshot: {type(enriched).__name__} len={len(enriched) if isinstance(enriched, dict) else 'N/A'}")
         if isinstance(enriched, dict) and enriched:
+            _sample_sym = next(iter(enriched))
+            _sample = enriched[_sample_sym]
+            print(f"Sample [{_sample_sym}]: price={_sample.get('price')} vol24h={_sample.get('volume_24h')} keys={list(_sample.keys())[:8]}")
             snapshot["symbols"] = enriched
             snapshot.update({k: v for k, v in enriched.items() if isinstance(v, dict)})
             # Persist the x402 snapshot so the bot can load it on restart
