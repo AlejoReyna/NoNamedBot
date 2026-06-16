@@ -179,7 +179,17 @@ def main() -> int:
 
         client = CMCMCPClient(settings)
         symbols = getattr(settings, "ml_universe_symbols", None) or TRADABLE_TARGET_SYMBOLS
-        enriched = client.fetch_x402_enriched_snapshot(symbols)
+        # Fetch free keyless snapshot first to harvest CMC ids.
+        # The paid x402 tool rejects symbol-only requests ("id: Required"),
+        # so id_overrides must be populated from the keyless layer — same
+        # pattern used by the main trading loop.
+        keyless = client.fetch_keyless_quotes_snapshot(symbols)
+        id_overrides: dict[str, str] = {
+            str(sym).upper(): str(row["id"])
+            for sym, row in keyless.items()
+            if isinstance(row, dict) and row.get("id")
+        }
+        enriched = client.fetch_x402_enriched_snapshot(symbols, id_overrides)
         if isinstance(enriched, dict) and enriched:
             snapshot["symbols"] = enriched
             snapshot.update({k: v for k, v in enriched.items() if isinstance(v, dict)})
