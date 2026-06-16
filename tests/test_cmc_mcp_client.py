@@ -397,12 +397,23 @@ def test_fetch_x402_enriched_snapshot_paid_calls_are_id_only(monkeypatch: Any) -
         id_overrides={"AB": "12345"},
     )
 
-    assert len(paid.calls) == 1
-    requested_ids = set(paid.calls[0]["id"].split(","))
-    assert requested_ids == {"7186", "12345"}
+    assert len(paid.calls) == 2  # quotes + technicals; both must stay id-only
+    for call in paid.calls:
+        requested_ids = set(call["id"].split(","))
+        assert requested_ids == {"7186", "12345"}
     assert snapshot["AB"]["price"] == 1.0
     assert snapshot["CAKE"]["price"] == 2.5
     assert "ZZZ" not in snapshot
+
+    paid.calls.clear()
+    snapshot = client.fetch_x402_enriched_snapshot(
+        ["CAKE", "AB", "ZZZ"],
+        id_overrides={"AB": "12345"},
+        fetch_technicals=False,
+    )
+    assert len(paid.calls) == 1
+    assert set(paid.calls[0]["id"].split(",")) == {"7186", "12345"}
+    assert snapshot["AB"]["price"] == 1.0
 
 
 def test_fetch_x402_enriched_snapshot_returns_empty_when_budget_blocks_payment(monkeypatch: Any) -> None:
