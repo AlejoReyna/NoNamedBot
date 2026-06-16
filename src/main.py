@@ -63,6 +63,7 @@ from src.strategy.scalping_guardrails import ScalpingGuardrails
 from src.strategy.scalping_position_manager import ScalpingPositionManager
 from src.strategy.guardrails import Guardrails, RiskDecision, RiskState, TradeRecord
 from src.strategy.position_manager import Position, PositionManager, calculate_position_pct
+from src.research import trade_outcome_log
 from src.strategy.regime_detector import MarketRegime, RegimeDetector, RegimeResult
 from src.strategy.sentiment_tier1 import SentimentResult, SentimentTier1
 from src.strategy.volatility import PriceCache
@@ -2294,6 +2295,20 @@ def _execute_position_exit(
     closed = position_manager.close_position(symbol)
     if closed is not None:
         realized_pnl = (current_price - closed.entry_price) * amount_in
+        try:
+            trade_outcome_log.record_exit(
+                getattr(guardrails.settings, "trade_outcome_log_path", trade_outcome_log.DEFAULT_PATH),
+                symbol=closed.symbol,
+                entry_price=closed.entry_price,
+                exit_price=current_price,
+                realized_pnl_usdc=realized_pnl,
+                exit_reason=exit_reason,
+                hold_time_seconds=hold_time_seconds,
+                exit_tx_hash=_execution_tx_hash(result),
+                trade_id=getattr(closed, "trade_id", None),
+            )
+        except Exception as exc:  # logging must never block an exit
+            LOGGER.debug("Could not record trade exit outcome: %s", exc)
         trade = TradeRecord(
             symbol=closed.symbol,
             side="sell",
@@ -2394,7 +2409,27 @@ def _maybe_enter_position(
         LOGGER.error("Entry swap for %s returned no tx hash; local position not opened", decision.symbol)
         return
     amount_tokens = expected_amount_out
-    position_manager.open_position(decision.symbol, amount_tokens, price, decision.position_size_usdc)
+    # Stamp a stable trade_id onto the persisted position so the entry/exit
+    # join in the outcome log survives a process restart.
+    trade_id = trade_outcome_log.new_trade_id()
+    position_manager.open_position(
+        decision.symbol, amount_tokens, price, decision.position_size_usdc, trade_id=trade_id
+    )
+    try:
+        trade_outcome_log.record_entry(
+            getattr(guardrails.settings, "trade_outcome_log_path", trade_outcome_log.DEFAULT_PATH),
+            symbol=decision.symbol,
+            entry_price=price,
+            size_usdc=decision.position_size_usdc,
+            entry_score=decision.entry_score,
+            true_factor_count=decision.true_factor_count,
+            factor_scores=decision.factor_scores,
+            estimated_slippage_pct=decision.estimated_slippage_pct,
+            entry_tx_hash=_execution_tx_hash(result),
+            trade_id=trade_id,
+        )
+    except Exception as exc:  # logging must never block an entry
+        LOGGER.debug("Could not record trade entry outcome: %s", exc)
     guardrails.record_trade(
         TradeRecord(
             symbol=decision.symbol,
@@ -2832,6 +2867,11 @@ def _execute_logged_swap(
 
 def _execution_has_tx_hash(result: dict[str, Any]) -> bool:
     return bool(result.get("tx_hash") or result.get("hash") or result.get("transaction_hash"))
+
+
+def _execution_tx_hash(result: dict[str, Any]) -> str | None:
+    value = result.get("tx_hash") or result.get("hash") or result.get("transaction_hash")
+    return str(value) if value else None
 
 
 def _settings_with_updates(settings: Settings, updates: dict[str, Any]) -> Settings:

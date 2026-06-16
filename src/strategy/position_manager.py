@@ -31,6 +31,10 @@ class Position:
     current_price: float | None = None
     # ISO 8601 timestamp of when current_price was last refreshed.
     current_price_at: datetime | None = None
+    # Stable id linking this position to its entry/exit rows in the trade
+    # outcome log. Persisted so the join survives a process restart (additive
+    # field; dashboard Zod ignores it). None for legacy/reconstructed rows.
+    trade_id: str | None = None
 
 
 class PositionManager:
@@ -50,6 +54,7 @@ class PositionManager:
         atr_pct: float | None = None,
         regime: object | None = None,
         entry_value_usdc: float | None = None,
+        trade_id: str | None = None,
     ) -> Position:
         """Open and store a new position.
 
@@ -90,6 +95,7 @@ class PositionManager:
             opened_at=now,
             current_price=entry_price,
             current_price_at=now,
+            trade_id=trade_id,
         )
         self._positions[normalized] = position
         self.persist_positions()
@@ -240,6 +246,7 @@ class PositionManager:
             "current_price_at": (
                 position.current_price_at.isoformat() if position.current_price_at else None
             ),
+            "trade_id": position.trade_id,
         }
 
     @staticmethod
@@ -263,6 +270,7 @@ class PositionManager:
                 else None
             ),
             current_price_at=PositionManager._parse_datetime(payload.get("current_price_at")),
+            trade_id=(str(payload["trade_id"]) if payload.get("trade_id") is not None else None),
         )
 
     @staticmethod

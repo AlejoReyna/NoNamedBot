@@ -209,6 +209,7 @@ class BreakoutEngine:
         self,
         token_data: dict[str, Any],
         portfolio_value_usdc: float,
+        bnb_data: dict[str, Any] | None = None,
     ) -> _CheapCandidate:
         """Evaluate all candidate factors that do not require TWAK."""
 
@@ -225,7 +226,7 @@ class BreakoutEngine:
         breakout_profile = self._breakout_profile(symbol, token_data, price)
         macro_score, macro_size_multiplier = self._macro_context(token_data)
 
-        regime_not_risk_off = self.check_regime(token_data)
+        regime_not_risk_off = self.check_regime(token_data, bnb_data)
         position_size = portfolio_value_usdc * self.settings.max_position_pct
         if not regime_not_risk_off:
             position_size *= float(getattr(self.settings, "regime_size_multiplier", 0.5))
@@ -372,6 +373,7 @@ class BreakoutEngine:
     ) -> list[BreakoutDecision]:
         """Scan target symbols and return all slippage-confirmed entry decisions."""
 
+        bnb_reference = self._bnb_reference(market_snapshot)
         candidates: list[_CheapCandidate] = []
         best_decision: BreakoutDecision | None = None
         best_volume = -1.0
@@ -383,7 +385,9 @@ class BreakoutEngine:
             enriched_data = {"symbol": symbol.upper(), **token_data}
             if not is_liquid(enriched_data):
                 continue
-            candidate = self._evaluate_cheap_candidate(enriched_data, portfolio_value_usdc)
+            candidate = self._evaluate_cheap_candidate(
+                enriched_data, portfolio_value_usdc, bnb_data=bnb_reference
+            )
             candidates.append(candidate)
 
             unquoted_decision = self._decision_from_candidate(candidate, estimated_slippage=None)
@@ -439,6 +443,7 @@ class BreakoutEngine:
         self.price_cache.save()
         self.volume_cache.save()
         self.macro_cache.save()
+        self._log_factor_matrix(candidates, scores_by_symbol, momentum_scores, bnb_reference)
 
         if passers:
             return passers
@@ -643,12 +648,112 @@ class BreakoutEngine:
             return None
         return current - oldest
 
+    def _log_factor_matrix(
+        self,
+        candidates: list[_CheapCandidate],
+        scores_by_symbol: dict[str, float],
+        momentum_scores: dict[str, float],
+        bnb_reference: dict[str, Any] | None = None,
+    ) -> None:
+        """Append one JSONL row per evaluated symbol with the full factor matrix.
+
+        Persists what the engine otherwise only emits as transient warnings:
+        every factor boolean, the raw scoring inputs, the entry_score, and
+        which inputs were missing. This is the join key for offline tuning of
+        which factor combinations actually win. Gated and best-effort so it can
+        never affect a live trading cycle.
+        """
+
+        if not getattr(self.settings, "factor_matrix_log_enabled", False):
+            return
+        path_str = getattr(self.settings, "factor_matrix_log_path", "logs/factor_matrix.jsonl")
+        try:
+            path = Path(path_str)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            now = time.time()
+            # The regime decision reads BNB from the normalized reference, not
+            # the token row, so judge "missing" from that same source — else the
+            # log says BNB was missing even when the decision used it correctly.
+            bnb_missing = (
+                bnb_reference is None
+                or self._bnb_change_1h_fraction(bnb_reference, separate_bnb_data=True) is None
+            )
+            lines = []
+            for candidate in candidates:
+                token_data = candidate.token_data
+                row = {
+                    "ts": now,
+                    "symbol": candidate.symbol,
+                    "entry_score": scores_by_symbol.get(candidate.symbol),
+                    "momentum_z": momentum_scores.get(candidate.symbol, 0.0),
+                    "factors": {
+                        "volume_breakout": candidate.volume_breakout,
+                        "six_hour_high_break": candidate.six_hour_high_break,
+                        "regime_not_risk_off": candidate.regime_not_risk_off,
+                        "rsi_in_range": candidate.rsi_in_range,
+                        "derivatives_risk_clear": candidate.derivatives_risk_clear,
+                    },
+                    "inputs": {
+                        "breakout_strength": candidate.breakout_strength,
+                        "volume_surge_score": candidate.volume_surge_score,
+                        "macro_score": candidate.macro_score,
+                        "macro_size_multiplier": candidate.macro_size_multiplier,
+                        "volume_24h": candidate.volume_24h,
+                        "momentum_1h": candidate.momentum_1h,
+                        "momentum_24h": candidate.momentum_24h,
+                    },
+                    "missing": {
+                        "rsi": self._positive_number(token_data.get("rsi")) is None,
+                        "funding_rate": self._number(token_data.get("funding_rate")) is None,
+                        "open_interest_change_pct": self._number(
+                            token_data.get("open_interest_change_pct")
+                        )
+                        is None,
+                        "bnb_1h_trend": bnb_missing,
+                    },
+                }
+                lines.append(json.dumps(row, default=str))
+            if lines:
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write("\n".join(lines) + "\n")
+        except OSError as exc:
+            LOGGER.debug("Could not write factor matrix log: %s", exc)
+
     def _warn_missing_factor_once(self, symbol: str, factor: str) -> None:
         key = (symbol.upper(), factor)
         if key in self._missing_factor_warnings:
             return
         self._missing_factor_warnings.add(key)
         LOGGER.warning("Missing data for %s factor on %s; failing factor closed", factor, symbol)
+
+    def _bnb_reference(self, market_snapshot: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+        """Return a normalized standalone BNB row for the regime check.
+
+        The top-level ``BNB`` (or ``WBNB``) snapshot row exists purely as a
+        regime reference and is skipped by the per-token scan, so without this
+        it never reaches ``check_regime`` and the regime factor fails closed for
+        every token (halving size via ``regime_size_multiplier``).
+
+        The 1h move is canonicalized into percent points under
+        ``bnb_1h_trend_pct``. The separate-BNB branch reads that alias first as
+        percent points, which avoids the scaling bug where a percent-point
+        value (e.g. 1.5 == 1.5%) would otherwise be misread as a raw fraction
+        (1.5 == 150%).
+        """
+
+        row = market_snapshot.get("BNB") or market_snapshot.get("WBNB")
+        if not isinstance(row, dict):
+            return None
+        normalized = dict(row)
+        trend = None
+        for key in ("bnb_1h_trend_pct", "percent_change_1h", "price_change_percentage_1h", "change_1h"):
+            candidate = self._number(normalized.get(key))
+            if candidate is not None:
+                trend = candidate
+                break
+        if trend is not None:
+            normalized["bnb_1h_trend_pct"] = trend
+        return normalized
 
     def check_regime(self, token_data: dict[str, Any], bnb_data: dict[str, Any] | None = None) -> bool:
         bnb_source = bnb_data if bnb_data is not None else token_data
@@ -662,14 +767,20 @@ class BreakoutEngine:
 
     def _bnb_change_1h_fraction(self, data: dict[str, Any], separate_bnb_data: bool) -> float | None:
         if separate_bnb_data:
+            # bnb_1h_trend_pct is canonicalized to percent points by
+            # _bnb_reference and read FIRST, so a percent-point value (e.g. 1.5
+            # == 1.5%) is never misread as a raw fraction (1.5 == 150%). The
+            # raw percent_change_1h alias keeps its legacy fraction semantics as
+            # a last resort, but the real engine path never reaches it because
+            # _bnb_reference always populates bnb_1h_trend_pct.
             return self._first_change_fraction(
                 data,
                 (
-                    ("percent_change_1h", "fraction"),
+                    ("bnb_1h_trend_pct", "percent_points"),
                     ("bnb_percent_change_1h", "fraction"),
                     ("price_change_percentage_1h", "percent_points"),
                     ("change_1h", "percent_points"),
-                    ("bnb_1h_trend_pct", "percent_points"),
+                    ("percent_change_1h", "fraction"),
                 ),
             )
         return self._first_change_fraction(

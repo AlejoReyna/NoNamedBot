@@ -361,12 +361,19 @@ class CMCMCPClient:
         self,
         symbols: list[str],
         id_overrides: dict[str, str] | None = None,
+        *,
+        fetch_technicals: bool | None = None,
     ) -> dict[str, Any]:
         """Fetch paid x402 quotes plus free keyless derivatives and market metrics.
 
         ``id_overrides`` maps SYMBOL -> CMC id, typically harvested from the
         fresh keyless snapshot, so unpinned symbols can still be queried by id
         (the paid MCP tool rejects symbol-only requests: "id: Required").
+
+        ``fetch_technicals`` overrides the global ``x402_fetch_technicals``
+        setting for this call. The collector passes ``False`` so it does not
+        double paid calls across the whole universe, while the main loop (scoped
+        to top candidates) keeps technicals on via the global default.
         """
 
         normalized_symbols = self._normalize_target_symbols(symbols)
@@ -378,6 +385,21 @@ class CMCMCPClient:
             LOGGER.warning("x402 quotes unavailable; skipping enriched snapshot")
             return {}
 
+        # Paid technicals so RSI/MACD actually populate. The keyless REST API has
+        # no technical-analysis endpoint, so without this call `rsi` is always
+        # None on the dual x402 path and the RSI factor fails closed (a fixed
+        # -BREAKOUT_SCORE_WEIGHT_RSI on every token). Governor-gated: when the
+        # x402 budget is exhausted _call_tool_x402 returns {}, so this degrades
+        # gracefully back to the previous no-RSI behaviour instead of erroring.
+        want_technicals = (
+            bool(getattr(self.settings, "x402_fetch_technicals", True))
+            if fetch_technicals is None
+            else bool(fetch_technicals)
+        )
+        technicals: dict[str, Any] = {}
+        if want_technicals:
+            technicals = self._fetch_x402_technicals_id_preferred(normalized_symbols, id_overrides)
+
         derivatives = self._fetch_keyless("get_global_crypto_derivatives_metrics", {})
         market_metrics = self._fetch_combined_payload(
             normalized_symbols,
@@ -386,7 +408,7 @@ class CMCMCPClient:
         return self._build_enriched_snapshot(
             normalized_symbols,
             quotes,
-            {},
+            technicals,
             market_metrics,
             derivatives,
         )
@@ -459,6 +481,36 @@ class CMCMCPClient:
         def _fetch_batch(batch: list[str]) -> dict[str, Any]:
             ids = list(dict.fromkeys(resolved[s] for s in batch))
             return self._call_tool_x402("get_crypto_quotes_latest", {"id": ",".join(ids)})
+
+        payload = self._fetch_combined_payload(list(resolved), _fetch_batch)
+        return self._by_symbol(payload)
+
+    def _fetch_x402_technicals_id_preferred(
+        self,
+        symbols: list[str],
+        id_overrides: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Fetch paid x402 technical-analysis (RSI/MACD), always by CMC id.
+
+        Mirrors ``_fetch_x402_quotes_id_preferred``: the paid MCP tool rejects
+        symbol-only requests, so ids are resolved from pinned UCIDs first, then
+        from ids harvested into ``id_overrides`` from the fresh keyless snapshot.
+        Symbols with no known id are skipped on the paid layer.
+        """
+
+        overrides = {k.upper(): str(v) for k, v in (id_overrides or {}).items()}
+        resolved: dict[str, str] = {}
+        for symbol in symbols:
+            key = symbol.upper()
+            cmc_id = resolve_cmc_coin_id(key) or overrides.get(key)
+            if cmc_id:
+                resolved[key] = str(cmc_id)
+        if not resolved:
+            return {}
+
+        def _fetch_batch(batch: list[str]) -> dict[str, Any]:
+            ids = list(dict.fromkeys(resolved[s] for s in batch))
+            return self._call_tool_x402("get_crypto_technical_analysis", {"id": ",".join(ids)})
 
         payload = self._fetch_combined_payload(list(resolved), _fetch_batch)
         return self._by_symbol(payload)
