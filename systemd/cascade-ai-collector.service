@@ -1,0 +1,24 @@
+[Unit]
+Description=Cascade AI CMC x402 quote collector
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+Group=ec2-user
+Environment=HOME=/home/ec2-user
+Environment=PATH=/home/ec2-user/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# WorkingDirectory is load-bearing: logs/ and data/ paths in the collector
+# script resolve relative to this directory.
+WorkingDirectory=/home/ec2-user/cascade-ai
+EnvironmentFile=/home/ec2-user/cascade-ai/.env
+ExecStart=/home/ec2-user/cascade-ai/.venv/bin/python scripts/cmc_feature_collector.py
+StandardOutput=append:/home/ec2-user/cascade-ai/logs/cmc_collector.log
+StandardError=append:/home/ec2-user/cascade-ai/logs/cmc_collector.log
+
+# Install (run on EC2 as ec2-user):
+#   sudo cp /home/ec2-user/cascade-ai/systemd/cascade-ai-collector.service /etc/systemd/system/
+#   sudo cp /home/ec2-user/cascade-ai/systemd/cascade-ai-collector.timer  /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now cascade-ai-collector.timer
+#   systemctl status cascade-ai-collector.timer
