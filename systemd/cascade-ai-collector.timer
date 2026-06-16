@@ -1,0 +1,18 @@
+[Unit]
+Description=Run Cascade AI CMC x402 collector every 30 minutes
+Requires=cascade-ai-collector.service
+
+[Timer]
+OnCalendar=*:0/30
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+
+# Install (run on EC2 as ec2-user):
+#   sudo cp /home/ec2-user/cascade-ai/systemd/cascade-ai-collector.service /etc/systemd/system/
+#   sudo cp /home/ec2-user/cascade-ai/systemd/cascade-ai-collector.timer  /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now cascade-ai-collector.timer
+#   systemctl status cascade-ai-collector.timer
