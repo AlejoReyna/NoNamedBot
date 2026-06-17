@@ -21,6 +21,15 @@ from typing import Any
 REPRODUCIBLE_SCALAR_FEATURES = {
     "entry_score",
     "true_factor_count",
+    # Volatility / execution context logged at entry time
+    "estimated_slippage_pct",   # already in entry log; whitelisted here
+    "atr_pct",                  # 14-period ATR as % of price at entry
+    # Market regime at entry (one-hot; RANGING is the base/omitted class)
+    "regime_trending_up",
+    "regime_risk_off",
+    # BNB macro momentum at entry — drives BSC market tailwind/headwind
+    "bnb_1h_pct",
+    "bnb_24h_pct",
 }
 FACTOR_PREFIX = "factor_"
 
@@ -41,12 +50,24 @@ def entry_feature_vector(
     factor_scores: dict[str, Any] | None,
     entry_score: Any = None,
     true_factor_count: Any = None,
+    estimated_slippage_pct: Any = None,
+    atr_pct: Any = None,
+    regime: Any = None,
+    bnb_1h_pct: Any = None,
+    bnb_24h_pct: Any = None,
 ) -> dict[str, float]:
     """Canonical model feature dict shared by training and shadow serving.
 
     Produces ``factor_<key>`` indicators plus the reproducible entry-time
     scalars. Both ``build_dataset`` (offline) and the shadow predictor (live)
     build features through this single contract so feature names always match.
+
+    New context parameters (all optional / default 0.0 when absent so old
+    callers remain valid and old log rows train without error):
+      estimated_slippage_pct — execution cost proxy; already in the entry log.
+      atr_pct               — 14-period ATR as % of price; logged from entry path.
+      regime                — MarketRegime value or its .value string; one-hotted.
+      bnb_1h_pct / bnb_24h_pct — BNB macro momentum from the market snapshot.
     """
 
     features: dict[str, float] = {}
@@ -54,6 +75,14 @@ def entry_feature_vector(
         features[f"{FACTOR_PREFIX}{key}"] = float(int(bool(value)))
     features["entry_score"] = to_float(entry_score)
     features["true_factor_count"] = to_float(true_factor_count)
+    features["estimated_slippage_pct"] = to_float(estimated_slippage_pct)
+    features["atr_pct"] = to_float(atr_pct)
+    # Regime one-hot: RANGING is the omitted base class.
+    regime_str = str(getattr(regime, "value", regime) or "").lower()
+    features["regime_trending_up"] = 1.0 if "trending_up" in regime_str else 0.0
+    features["regime_risk_off"] = 1.0 if "risk_off" in regime_str else 0.0
+    features["bnb_1h_pct"] = to_float(bnb_1h_pct)
+    features["bnb_24h_pct"] = to_float(bnb_24h_pct)
     return features
 
 
