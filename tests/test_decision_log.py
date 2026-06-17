@@ -75,3 +75,32 @@ def test_decision_log_writes_blocked_reason_when_present(tmp_path: object) -> No
 
     record = json.loads(log_path.read_text(encoding="utf-8"))
     assert record["entries_blocked_reason"] == "disk_guard_free_space_below_threshold"
+
+
+def test_decision_log_writes_ml_audit_when_present(tmp_path: object) -> None:
+    log_path = tmp_path / "decision_log.jsonl"  # type: ignore[operator]
+    logger = DecisionLogger(log_path)
+
+    logger.log(
+        cycle_number=5,
+        mode="live",
+        portfolio_value_usdc=10_000.0,
+        position_count=0,
+        entries_allowed=True,
+        action="WAIT",
+        reason="No candidate passed gates",
+        priced_target_count=12,
+        ml_audit={
+            "ml_enabled": True,
+            "ml_active": False,
+            "ml_shadow_mode": True,
+            "ml_validation_auc": 0.55,
+            "ml_regime": None,
+            "ml_confidence": None,
+        },
+    )
+
+    record = json.loads(log_path.read_text(encoding="utf-8"))
+    assert record["ml_audit"]["ml_enabled"] is True
+    assert record["ml_audit"]["ml_active"] is False
+    assert record["ml_audit"]["ml_validation_auc"] == 0.55

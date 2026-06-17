@@ -530,6 +530,7 @@ class CMCMCPClient:
         technicals: dict[str, Any],
         market_metrics: dict[str, Any],
         derivatives: dict[str, Any],
+        fear_greed_index: float | None = None,
     ) -> dict[str, Any]:
         quotes_by_symbol = self._by_symbol(quotes)
         technicals_by_symbol = self._by_symbol(technicals)
@@ -539,6 +540,13 @@ class CMCMCPClient:
             quotes_by_symbol.get("BNB", quotes_by_symbol.get("WBNB", {})),
             ("bnb_1h_trend_pct", "percent_change_1h", "price_change_percentage_1h", "change_1h"),
         )
+        normalized_fgi: float | None = None
+        if fear_greed_index is not None:
+            try:
+                value = float(fear_greed_index)
+                normalized_fgi = value / 100.0 if value > 1.0 else value
+            except (TypeError, ValueError):
+                normalized_fgi = None
 
         snapshot: dict[str, Any] = {}
         for symbol in normalized_symbols:
@@ -566,6 +574,10 @@ class CMCMCPClient:
                 "market_cap": market_cap,
                 "volume_1h": self._first_number_from_many(combined, ("volume_1h", "volume_1h_usd")),
                 "volume_24h": volume_24h,
+                "volume_change_24h": self._first_number_from_many(
+                    combined,
+                    ("volume_change_24h", "volume_change_24h_usd", "quote.USD.volume_change_24h"),
+                ),
                 "percent_change_1h": self._first_number_from_many(
                     combined,
                     ("percent_change_1h", "quote.USD.percent_change_1h", "price_change_percentage_1h", "change_1h"),
@@ -594,13 +606,25 @@ class CMCMCPClient:
                 "low_24h": self._first_number_from_many(combined, ("low_24h", "low_24h_price")),
                 "bnb_1h_trend_pct": bnb_trend,
                 # The x402 technicals tool nests RSI as rsi.{rsi7,rsi14,rsi21}
-                # and MACD as macd.macdLine; rsi14 is the standard 14-period
-                # value. Keep the flat aliases for any other source.
+                # and MACD as macd.{macdLine,signalLine,histogram}; rsi14 is the
+                # standard 14-period value. Keep the flat aliases for any other source.
                 "rsi": self._first_number_from_many(
                     combined, ("rsi.rsi14", "rsi_14", "rsi14", "rsi", "technical.rsi")
                 ),
+                "rsi7": self._first_number_from_many(
+                    combined, ("rsi.rsi7", "rsi_7", "rsi7", "technical.rsi7")
+                ),
+                "rsi21": self._first_number_from_many(
+                    combined, ("rsi.rsi21", "rsi_21", "rsi21", "technical.rsi21")
+                ),
                 "macd": self._first_number_from_many(
                     combined, ("macd.macdLine", "macd", "technical.macd")
+                ),
+                "macd_signal": self._first_number_from_many(
+                    combined, ("macd.signalLine", "macd_signal", "technical.macd_signal")
+                ),
+                "macd_histogram": self._first_number_from_many(
+                    combined, ("macd.histogram", "macd_histogram", "technical.macd_histogram")
                 ),
                 "estimated_slippage_pct": self._resolve_estimated_slippage_pct(
                     combined=combined,
@@ -615,6 +639,35 @@ class CMCMCPClient:
                     combined,
                     ("open_interest_change_pct", "oi_change_pct", "open_interest_24h_change_pct"),
                 ),
+                "market_cap_dominance": self._first_number_from_many(
+                    combined,
+                    ("market_cap_dominance", "quote.USD.market_cap_dominance", "dominance"),
+                ),
+                "fully_diluted_market_cap": self._first_number_from_many(
+                    combined,
+                    ("fully_diluted_market_cap", "quote.USD.fully_diluted_market_cap"),
+                ),
+                "circulating_supply": self._first_number_from_many(
+                    combined,
+                    ("circulating_supply", "quote.USD.circulating_supply"),
+                ),
+                "total_supply": self._first_number_from_many(
+                    combined,
+                    ("total_supply", "quote.USD.total_supply"),
+                ),
+                "max_supply": self._first_number_from_many(
+                    combined,
+                    ("max_supply", "quote.USD.max_supply"),
+                ),
+                "social_dominance": self._first_number_from_many(
+                    combined,
+                    ("social_dominance", "social_score", "social_dominance_percentage"),
+                ),
+                "social_volume_change_24h": self._first_number_from_many(
+                    combined,
+                    ("social_volume_change_24h", "social_volume_delta_24h", "social_volume_24h_change_pct"),
+                ),
+                "fear_greed_index": normalized_fgi,
                 **macro_context,
             }
         LOGGER.info("Built enriched x402 snapshot for %d symbols", len(snapshot))

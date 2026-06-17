@@ -122,6 +122,17 @@ class Settings(BaseModel):
     breakout_score_weight_rsi: float = 10.0
     breakout_score_weight_derivatives: float = 10.0
     breakout_score_weight_macro: float = 5.0
+    # Entry-quality guards. These work together with (and can override) the raw
+    # entry_score threshold so low-conviction setups like ETH with 2/6 factors
+    # in risk-off regime do not enter.
+    breakout_min_true_factor_count: int = Field(default=3, ge=0, le=6)
+    breakout_block_in_risk_off_regime: bool = True
+    breakout_require_rsi_in_range: bool = True
+    breakout_min_entry_score_buffer: float = 0.0
+    # ML-aware guards. Only applied when an ML context is available.
+    breakout_ml_min_confidence: float = 0.55
+    breakout_block_in_chop_regime: bool = True
+    breakout_chop_confidence_buffer: float = 0.10
     trail_step1_profit_pct: float = 0.08
     trail_step1_stop_pct: float = 0.04
     trail_step2_profit_pct: float = 0.12
@@ -372,6 +383,13 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
         "breakout_score_weight_rsi": _get_float("BREAKOUT_SCORE_WEIGHT_RSI", 10.0),
         "breakout_score_weight_derivatives": _get_float("BREAKOUT_SCORE_WEIGHT_DERIVATIVES", 10.0),
         "breakout_score_weight_macro": _get_float("BREAKOUT_SCORE_WEIGHT_MACRO", 5.0),
+        "breakout_min_true_factor_count": _get_int("BREAKOUT_MIN_TRUE_FACTOR_COUNT", 3),
+        "breakout_block_in_risk_off_regime": _get_bool("BREAKOUT_BLOCK_IN_RISK_OFF_REGIME", True),
+        "breakout_require_rsi_in_range": _get_bool("BREAKOUT_REQUIRE_RSI_IN_RANGE", True),
+        "breakout_min_entry_score_buffer": _get_float("BREAKOUT_MIN_ENTRY_SCORE_BUFFER", 0.0),
+        "breakout_ml_min_confidence": _get_float("BREAKOUT_ML_MIN_CONFIDENCE", 0.55),
+        "breakout_block_in_chop_regime": _get_bool("BREAKOUT_BLOCK_IN_CHOP_REGIME", True),
+        "breakout_chop_confidence_buffer": _get_float("BREAKOUT_CHOP_CONFIDENCE_BUFFER", 0.10),
         "trail_step1_profit_pct": _get_float("TRAIL_STEP1_PROFIT_PCT", 0.08),
         "trail_step1_stop_pct": _get_float("TRAIL_STEP1_STOP_PCT", 0.04),
         "trail_step2_profit_pct": _get_float("TRAIL_STEP2_PROFIT_PCT", 0.12),

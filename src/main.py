@@ -511,6 +511,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
     guardrails = strategy_bundle.guardrails
     scoring.evaluate_universe = strategy_bundle.evaluate_universe
     shadow_logger = _build_shadow_logger(price_cache, settings)
+    ml_bundle = _build_ml_bundle(settings)
     positions_loaded = position_manager.load_positions()
     needs_balance_reconstruction = not positions_loaded and not settings.paper_trade
     if positions_loaded:
@@ -797,6 +798,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                     twak_interface,
                     exclude_symbols=exclude_symbols,
                     sentiment_result=sentiment_result,
+                    ml_bundle=ml_bundle,
                 )
                 # Defensive backstop: drop any discretionary candidate that still
                 # carries an active blackout (e.g. a path that bypassed excludes).
@@ -945,6 +947,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             telemetry_exclude_symbols,
             sentiment_result,
             candidate,
+            ml_bundle=ml_bundle,
         )
         legacy_reason = decision_reasons[-1] if decision_reasons else "ok"
         if candidate is None and telemetry_candidate is not None:
@@ -1024,6 +1027,20 @@ def _build_shadow_logger(price_cache: PriceCache, settings: Settings) -> Any | N
             decision_log_path="logs/decision_shadow.jsonl",
         )
     except ImportError:
+        return None
+
+
+def _build_ml_bundle(settings: Settings) -> Any | None:
+    """Create the ML bundle when enabled; fail closed to None on any error."""
+
+    if not getattr(settings, "ml_enabled", False):
+        return None
+    try:
+        from src.ml.bundle import MLBundle
+
+        return MLBundle.from_settings(settings)
+    except Exception as exc:
+        LOGGER.warning("ML bundle disabled (fail-closed): %s", exc)
         return None
 
 
@@ -1725,6 +1742,7 @@ def _telemetry_candidate_for_log(
     exclude_symbols: set[str],
     sentiment_result: SentimentResult | None,
     selected: EntryCandidate | None,
+    ml_bundle: Any | None = None,
 ) -> EntryCandidate | None:
     """Return the best evaluated symbol for dashboard telemetry when no entry triggers."""
 
@@ -1760,7 +1778,19 @@ def _telemetry_candidate_for_log(
         for symbol, data in market_snapshot.items()
         if symbol.upper() not in {item.upper() for item in exclude_symbols}
     }
-    decision = engine.evaluate_universe(filtered_snapshot, portfolio_value)
+    ml_contexts: dict[str, Any] = {}
+    if ml_bundle is not None:
+        try:
+            ml_bundle.refresh_ohlcv_if_stale()
+            ml_contexts = ml_bundle.build_contexts(filtered_snapshot)
+        except Exception as exc:
+            LOGGER.warning("ML bundle context build failed for telemetry: %s", exc)
+            ml_contexts = {}
+    try:
+        decision = engine.evaluate_universe(filtered_snapshot, portfolio_value, ml_contexts=ml_contexts)
+    except TypeError:
+        decision = engine.evaluate_universe(filtered_snapshot, portfolio_value)
+    ml_audit = _build_telemetry_ml_audit(ml_bundle, getattr(decision, "ml_context", None), decision)
     telemetry = breakout_decision_to_candidate(
         decision,
         market_snapshot,
@@ -1768,6 +1798,7 @@ def _telemetry_candidate_for_log(
         settings,
         risk_decision,
         for_telemetry=True,
+        ml_audit=ml_audit,
     )
     if telemetry is not None:
         return telemetry
@@ -1780,6 +1811,35 @@ def _telemetry_candidate_for_log(
         settings=settings,
         exclude_symbols=exclude_symbols,
     )
+
+
+def _build_telemetry_ml_audit(
+    ml_bundle: Any | None,
+    ml_context: Any | None,
+    decision: Any | None = None,
+) -> dict[str, Any] | None:
+    """Build a lightweight ML audit payload for the telemetry-only path."""
+
+    if ml_bundle is None:
+        return None
+    audit: dict[str, Any] = {
+        "ml_enabled": True,
+        "ml_active": bool(getattr(ml_bundle, "is_ranking_active", False)),
+        "ml_shadow_mode": bool(getattr(getattr(ml_bundle, "settings", None), "ml_shadow_mode", True)),
+        "ml_validation_auc": float(getattr(ml_bundle, "validation_auc", 0.0) or 0.0),
+    }
+    if ml_context is not None:
+        audit["ml_regime"] = getattr(ml_context, "regime", None)
+        audit["ml_confidence"] = round(float(getattr(ml_context, "confidence", 0.0) or 0.0), 6)
+        audit["ml_position_size_multiplier"] = getattr(ml_context, "position_size_multiplier", None)
+    else:
+        audit["ml_regime"] = None
+        audit["ml_confidence"] = None
+        audit["ml_position_size_multiplier"] = None
+    if decision is not None:
+        audit["quality_guards"] = dict(getattr(decision, "quality_guards", {}) or {})
+        audit["entries_blocked_reason"] = getattr(decision, "entries_blocked_reason", None)
+    return audit
 
 
 def _telemetry_candidate_from_priced_targets(
@@ -1901,6 +1961,7 @@ def _breakout_decision_from_candidate(
         entry_score=candidate.entry_score,
         position_size_multiplier=candidate.position_size_multiplier,
         factor_metrics=dict(getattr(candidate, "factor_metrics", {}) or {}),
+        ml_audit=dict(getattr(candidate, "ml_audit", {}) or {}) or None,
     )
 
 
@@ -2708,6 +2769,7 @@ def _log_cycle_decision(
     )
     position_size_usdc = decision.position_size_usdc if decision is not None else 0.0
     priced_target_count = len(_priced_target_symbols(market_snapshot))
+    ml_audit = getattr(decision, "ml_audit", None)
 
     record = log_decision(
         settings,
@@ -2729,6 +2791,7 @@ def _log_cycle_decision(
         exit_reason=exit_reason,
         hold_time_seconds=hold_time_seconds,
         factor_metrics=factor_metrics,
+        ml_audit=ml_audit,
     )
 
     factors = f"{true_factor_count}/6" if decision is not None else "-"
