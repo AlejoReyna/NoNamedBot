@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,15 @@ class BreakoutDecision:
     estimated_slippage_pct: float | None = None
     entry_score: float | None = None
     position_size_multiplier: float = 1.0
+    # Provenance of the slippage figure so observers can tell apart a candidate
+    # that was never sent for a TWAK quote ("not_quoted") from one that was
+    # quoted but the quote failed/returned nothing ("failed") from a real
+    # numeric quote ("quoted"). Both former cases leave estimated_slippage_pct
+    # None, so without this they look identical on the dashboard.
+    slippage_quote_state: str = "not_quoted"
+    # Raw measured value behind each factor (human-readable), so the dashboard can
+    # display the real numbers the booleans were derived from. Keyed by factor name.
+    factor_metrics: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -58,6 +67,12 @@ class _CheapCandidate:
     chase_cap_exceeded: bool
     momentum_1h: float = 0.0
     momentum_24h: float = 0.0
+    # Raw indicator readings retained for telemetry/audit display.
+    rsi: float | None = None
+    funding_rate: float | None = None
+    open_interest_change: float | None = None
+    price: float | None = None
+    last_reference_high: float | None = None
 
 
 @dataclass(frozen=True)
@@ -197,9 +212,12 @@ class BreakoutEngine:
         candidate = self._evaluate_cheap_candidate(token_data, portfolio_value_usdc)
         entry_score = self._entry_score(candidate, momentum_z_score=0.0)
         estimated_slippage: float | None = None
+        quote_state = "not_quoted"
         if self._should_quote_candidate(candidate, entry_score):
-            estimated_slippage = self._estimate_candidate_slippage(candidate)
-        decision = self._decision_from_candidate(candidate, estimated_slippage, entry_score)
+            estimated_slippage, quote_state = self._estimate_candidate_slippage(candidate)
+        decision = self._decision_from_candidate(
+            candidate, estimated_slippage, entry_score, slippage_quote_state=quote_state
+        )
         self.price_cache.save()
         self.volume_cache.save()
         self.macro_cache.save()
@@ -280,24 +298,43 @@ class BreakoutEngine:
             chase_cap_exceeded=breakout_profile.chase_cap_exceeded,
             momentum_1h=self._token_change_fraction(token_data, hours=1) or 0.0,
             momentum_24h=self._token_change_fraction(token_data, hours=24) or 0.0,
+            rsi=rsi,
+            funding_rate=funding_rate,
+            open_interest_change=open_interest_change,
+            price=price,
+            last_reference_high=breakout_profile.broken_reference_high,
         )
 
-    def _estimate_candidate_slippage(self, candidate: _CheapCandidate) -> float | None:
+    def _estimate_candidate_slippage(self, candidate: _CheapCandidate) -> tuple[float | None, str]:
+        """Quote slippage and report whether the quote succeeded.
+
+        Returns ``(value, state)`` where state is ``"quoted"`` when a usable
+        numeric slippage came back, or ``"failed"`` when the quote raised or
+        returned nothing. The caller uses ``"not_quoted"`` for candidates that
+        were never sent for a quote at all, so the three cases stay distinct in
+        telemetry instead of collapsing into a single ``None``.
+        """
+
         try:
-            return self.twak_interface.estimate_slippage_pct(
+            value = self.twak_interface.estimate_slippage_pct(
                 amount=candidate.position_size_usdc,
                 from_token=self.settings.default_stable_symbol,
                 to_token=candidate.symbol,
             )
         except Exception as exc:
             LOGGER.warning("TWAK slippage quote failed for %s: %s", candidate.symbol, exc)
-            return None
+            return None, "failed"
+        if value is None:
+            LOGGER.warning("TWAK slippage quote returned no value for %s", candidate.symbol)
+            return None, "failed"
+        return value, "quoted"
 
     def _decision_from_candidate(
         self,
         candidate: _CheapCandidate,
         estimated_slippage: float | None,
         entry_score: float | None = None,
+        slippage_quote_state: str = "not_quoted",
     ) -> BreakoutDecision:
         """Build a full decision after optional TWAK slippage evaluation."""
 
@@ -346,13 +383,29 @@ class BreakoutEngine:
                 f"entry score {resolved_score:.1f} below quote floor {quote_floor:.1f}"
             )
         elif not slippage_under_cap:
-            reason = "slippage estimate missing, negative, or above cap"
+            if slippage_quote_state == "not_quoted":
+                reason = "slippage not quoted (candidate not sent for a TWAK quote yet)"
+            elif slippage_quote_state == "failed":
+                reason = "slippage quote failed (TWAK returned no usable quote)"
+            elif estimated_slippage is not None and estimated_slippage < 0:
+                reason = "slippage estimate negative"
+            elif estimated_slippage is not None:
+                reason = (
+                    f"slippage {estimated_slippage * 100:.2f}% above cap "
+                    f"{self.settings.max_slippage_pct * 100:.2f}%"
+                )
+            else:
+                reason = "slippage estimate missing, negative, or above cap"
         elif resolved_score < threshold:
             reason = (
                 f"entry score {resolved_score:.1f} below threshold {threshold:.1f}"
             )
         else:
             reason = "entry blocked by scoring model"
+
+        factor_metrics = self._build_factor_metrics(
+            candidate, estimated_slippage, resolved_score, slippage_quote_state
+        )
 
         return BreakoutDecision(
             should_enter=should_enter,
@@ -364,7 +417,80 @@ class BreakoutEngine:
             estimated_slippage_pct=estimated_slippage,
             entry_score=resolved_score,
             position_size_multiplier=candidate.macro_size_multiplier,
+            factor_metrics=factor_metrics,
+            slippage_quote_state=slippage_quote_state,
         )
+
+    def _build_factor_metrics(
+        self,
+        candidate: _CheapCandidate,
+        estimated_slippage: float | None,
+        entry_score: float | None,
+        slippage_quote_state: str = "not_quoted",
+    ) -> dict[str, str]:
+        """Human-readable reading behind each factor for dashboard display.
+
+        These are the actual measured values the boolean gates were derived from,
+        so an observer can cross-check the agent against live market data.
+        """
+
+        def price_fmt(value: float | None) -> str:
+            if value is None:
+                return "n/a"
+            return f"{value:,.6g}"
+
+        cap_pct = float(getattr(self.settings, "max_slippage_pct", 0.0)) * 100.0
+        metrics: dict[str, str] = {}
+
+        metrics["volume_breakout"] = (
+            f"surge {candidate.volume_surge_score:.2f}× · 24h vol ${candidate.volume_24h:,.0f}"
+        )
+
+        ref_high = candidate.last_reference_high
+        if candidate.six_hour_high_break and ref_high is not None:
+            metrics["six_hour_high_break"] = (
+                f"price {price_fmt(candidate.price)} cleared 6h high {price_fmt(ref_high)}"
+            )
+        elif ref_high is not None:
+            metrics["six_hour_high_break"] = (
+                f"price {price_fmt(candidate.price)} · 6h high {price_fmt(ref_high)}"
+            )
+        else:
+            metrics["six_hour_high_break"] = f"price {price_fmt(candidate.price)} · no 6h reference"
+
+        metrics["regime_not_risk_off"] = (
+            "regime risk-on / neutral" if candidate.regime_not_risk_off else "regime risk-off"
+        )
+
+        if estimated_slippage is None:
+            if slippage_quote_state == "failed":
+                metrics["slippage_under_cap"] = f"quote failed · cap {cap_pct:.2f}%"
+            else:
+                metrics["slippage_under_cap"] = f"not quoted · cap {cap_pct:.2f}%"
+        else:
+            metrics["slippage_under_cap"] = (
+                f"{estimated_slippage * 100:.2f}% · cap {cap_pct:.2f}%"
+            )
+
+        if candidate.rsi is None:
+            metrics["rsi_in_range"] = "RSI n/a · band 55–75"
+        else:
+            metrics["rsi_in_range"] = f"RSI {candidate.rsi:.1f} · band 55–75"
+
+        if candidate.funding_rate is None or candidate.open_interest_change is None:
+            metrics["derivatives_risk_clear"] = "funding/OI data missing"
+        else:
+            metrics["derivatives_risk_clear"] = (
+                f"funding {candidate.funding_rate * 100:.3f}% · OI {candidate.open_interest_change:+.1f}%"
+            )
+
+        if entry_score is not None:
+            metrics["entry_score"] = (
+                f"{entry_score:.1f}/100 · need {float(getattr(self.settings, 'breakout_entry_score_min', 45.0)):.0f}+"
+                f" · floor {self._quote_score_floor:.0f}"
+            )
+
+        return metrics
 
     def evaluate_all(
         self,
@@ -429,10 +555,12 @@ class BreakoutEngine:
 
         passers: list[BreakoutDecision] = []
         for candidate in quote_candidates[:MAX_UNIVERSE_TWAK_QUOTES]:
+            slippage_value, quote_state = self._estimate_candidate_slippage(candidate)
             decision = self._decision_from_candidate(
                 candidate,
-                self._estimate_candidate_slippage(candidate),
+                slippage_value,
                 scores_by_symbol.get(candidate.symbol, 0.0),
+                slippage_quote_state=quote_state,
             )
             if decision.should_enter:
                 passers.append(decision)

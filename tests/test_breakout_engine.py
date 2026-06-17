@@ -108,6 +108,30 @@ def test_missing_rsi_and_derivatives_fail_optional_factors_but_do_not_veto_core_
     assert decision.should_enter is True
     assert decision.factor_scores["rsi_in_range"] is False
     assert decision.factor_scores["derivatives_risk_clear"] is False
+    # The reason the factor failed closed must be explicit in the metrics so the
+    # dashboard/logs can show "missing input" rather than "condition not met".
+    assert "n/a" in decision.factor_metrics["rsi_in_range"].lower()
+    assert "missing" in decision.factor_metrics["derivatives_risk_clear"].lower()
+
+
+def test_missing_rsi_emits_warning_once(caplog) -> None:
+    import logging
+
+    engine = _engine_with_price_high("CAKE", 10.0)
+    with caplog.at_level(logging.WARNING):
+        engine.evaluate_token(_token(rsi=None), 10000.0)
+        engine.evaluate_token(_token(rsi=None), 10000.0)
+
+    rsi_warnings = [r for r in caplog.records if "rsi_in_range" in r.getMessage()]
+    assert len(rsi_warnings) == 1
+
+
+def test_missing_derivatives_data_surfaces_in_metrics() -> None:
+    engine = _engine_with_price_high("CAKE", 10.0)
+    decision = engine.evaluate_token(_token(funding_rate=None), 10000.0)
+
+    assert decision.factor_scores["derivatives_risk_clear"] is False
+    assert decision.factor_metrics["derivatives_risk_clear"] == "funding/OI data missing"
 
 
 def test_stablecoin_targets_are_not_directional_entries() -> None:
@@ -225,7 +249,11 @@ def test_missing_slippage_blocks_entry_even_when_other_factors_pass() -> None:
 
     assert decision.factor_scores["slippage_under_cap"] is False
     assert decision.should_enter is False
-    assert decision.reason == "slippage estimate missing, negative, or above cap"
+    # A candidate that was sent for a quote but got nothing back is a quote
+    # FAILURE, distinct from a candidate that was never quoted.
+    assert decision.slippage_quote_state == "failed"
+    assert decision.reason == "slippage quote failed (TWAK returned no usable quote)"
+    assert decision.factor_metrics["slippage_under_cap"].startswith("quote failed")
 
 
 def test_slippage_factor_with_real_estimate() -> None:
@@ -270,7 +298,34 @@ def test_negative_slippage_blocks_entry() -> None:
 
     assert decision.factor_scores["slippage_under_cap"] is False
     assert decision.should_enter is False
-    assert decision.reason == "slippage estimate missing, negative, or above cap"
+    assert decision.slippage_quote_state == "quoted"
+    assert decision.reason == "slippage estimate negative"
+
+
+def test_not_quoted_is_distinct_from_above_cap() -> None:
+    # A liquid, tradable candidate whose entry_score stays below the quote floor
+    # (no 6h breakout, weak derivatives) is never sent for a TWAK quote: state
+    # must read "not_quoted", not "failed" or "above cap".
+    twak = FakeTWAKSlippage(0.005)
+    engine = _engine(twak=twak)
+    decision = engine.evaluate_token(_token(), 10000.0)
+
+    assert twak.calls == []
+    assert decision.slippage_quote_state == "not_quoted"
+    assert decision.factor_scores["slippage_under_cap"] is False
+    assert decision.factor_metrics["slippage_under_cap"].startswith("not quoted")
+
+
+def test_above_cap_slippage_reports_value_and_cap() -> None:
+    twak = FakeTWAKSlippage(0.05)  # 5% slippage, above the 1% default cap
+    engine = _engine_with_price_high("CAKE", 10.0)
+    engine.twak_interface = twak  # type: ignore[assignment]
+
+    decision = engine.evaluate_token(_token(), 10000.0)
+
+    assert decision.factor_scores["slippage_under_cap"] is False
+    assert decision.slippage_quote_state == "quoted"
+    assert "above cap" in (decision.reason or "")
 
 
 def test_insufficient_core_factors_reports_count() -> None:
