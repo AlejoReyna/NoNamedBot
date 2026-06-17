@@ -361,12 +361,19 @@ class CMCMCPClient:
         self,
         symbols: list[str],
         id_overrides: dict[str, str] | None = None,
+        *,
+        fetch_technicals: bool | None = None,
     ) -> dict[str, Any]:
         """Fetch paid x402 quotes plus free keyless derivatives and market metrics.
 
         ``id_overrides`` maps SYMBOL -> CMC id, typically harvested from the
         fresh keyless snapshot, so unpinned symbols can still be queried by id
         (the paid MCP tool rejects symbol-only requests: "id: Required").
+
+        ``fetch_technicals`` overrides the global ``x402_fetch_technicals``
+        setting for this call. The collector passes ``False`` so it does not
+        double paid calls across the whole universe, while the main loop (scoped
+        to top candidates) keeps technicals on via the global default.
         """
 
         normalized_symbols = self._normalize_target_symbols(symbols)
@@ -378,6 +385,21 @@ class CMCMCPClient:
             LOGGER.warning("x402 quotes unavailable; skipping enriched snapshot")
             return {}
 
+        # Paid technicals so RSI/MACD actually populate. The keyless REST API has
+        # no technical-analysis endpoint, so without this call `rsi` is always
+        # None on the dual x402 path and the RSI factor fails closed (a fixed
+        # -BREAKOUT_SCORE_WEIGHT_RSI on every token). Governor-gated: when the
+        # x402 budget is exhausted _call_tool_x402 returns {}, so this degrades
+        # gracefully back to the previous no-RSI behaviour instead of erroring.
+        want_technicals = (
+            bool(getattr(self.settings, "x402_fetch_technicals", True))
+            if fetch_technicals is None
+            else bool(fetch_technicals)
+        )
+        technicals: dict[str, Any] = {}
+        if want_technicals:
+            technicals = self._fetch_x402_technicals_id_preferred(normalized_symbols, id_overrides)
+
         derivatives = self._fetch_keyless("get_global_crypto_derivatives_metrics", {})
         market_metrics = self._fetch_combined_payload(
             normalized_symbols,
@@ -386,7 +408,7 @@ class CMCMCPClient:
         return self._build_enriched_snapshot(
             normalized_symbols,
             quotes,
-            {},
+            technicals,
             market_metrics,
             derivatives,
         )
@@ -463,6 +485,48 @@ class CMCMCPClient:
         payload = self._fetch_combined_payload(list(resolved), _fetch_batch)
         return self._by_symbol(payload)
 
+    def _fetch_x402_technicals_id_preferred(
+        self,
+        symbols: list[str],
+        id_overrides: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Fetch paid x402 technical-analysis (RSI/MACD), always by CMC id.
+
+        Mirrors ``_fetch_x402_quotes_id_preferred``: the paid MCP tool rejects
+        symbol-only requests, so ids are resolved from pinned UCIDs first, then
+        from ids harvested into ``id_overrides`` from the fresh keyless snapshot.
+        Symbols with no known id are skipped on the paid layer.
+        """
+
+        overrides = {k.upper(): str(v) for k, v in (id_overrides or {}).items()}
+        resolved: dict[str, str] = {}
+        for symbol in symbols:
+            key = symbol.upper()
+            cmc_id = resolve_cmc_coin_id(key) or overrides.get(key)
+            if cmc_id:
+                resolved[key] = str(cmc_id)
+        if not resolved:
+            return {}
+
+        # get_crypto_technical_analysis is a SINGLE-asset tool: it rejects
+        # comma-joined ids ("error: id is not number"), so each symbol needs its
+        # own paid call. That makes technicals cost one x402 call per symbol, so
+        # cap how many we fetch per refresh to stay inside the daily budget;
+        # take symbols in the order given (highest priority first). The spend
+        # governor inside _call_tool_x402 is the hard backstop — once the budget
+        # is exhausted it returns {} and we simply stop populating technicals.
+        limit = max(0, int(getattr(self.settings, "x402_technicals_max_symbols", 0) or 0))
+        ordered = list(resolved.items())
+        if limit:
+            ordered = ordered[:limit]
+
+        by_symbol: dict[str, dict[str, Any]] = {}
+        for symbol, cmc_id in ordered:
+            blob = self._call_tool_x402("get_crypto_technical_analysis", {"id": str(cmc_id)})
+            if isinstance(blob, dict) and blob:
+                by_symbol[symbol] = blob
+        return by_symbol
+
     def _build_enriched_snapshot(
         self,
         normalized_symbols: list[str],
@@ -533,8 +597,15 @@ class CMCMCPClient:
                 "high_24h": self._first_number_from_many(combined, ("high_24h", "high_24h_price")),
                 "low_24h": self._first_number_from_many(combined, ("low_24h", "low_24h_price")),
                 "bnb_1h_trend_pct": bnb_trend,
-                "rsi": self._first_number_from_many(combined, ("rsi", "rsi_14", "technical.rsi")),
-                "macd": self._first_number_from_many(combined, ("macd", "technical.macd")),
+                # The x402 technicals tool nests RSI as rsi.{rsi7,rsi14,rsi21}
+                # and MACD as macd.macdLine; rsi14 is the standard 14-period
+                # value. Keep the flat aliases for any other source.
+                "rsi": self._first_number_from_many(
+                    combined, ("rsi.rsi14", "rsi_14", "rsi14", "rsi", "technical.rsi")
+                ),
+                "macd": self._first_number_from_many(
+                    combined, ("macd.macdLine", "macd", "technical.macd")
+                ),
                 "estimated_slippage_pct": self._resolve_estimated_slippage_pct(
                     combined=combined,
                     volume_24h=volume_24h,
@@ -920,24 +991,32 @@ class CMCMCPClient:
         for key in keys:
             found = cls._read_path(payload, key)
             if found is not None:
-                try:
-                    val = float(found)
-                    if skip_zero and val == 0:
-                        continue
+                val = cls._coerce_number(found)
+                if val is not None and not (skip_zero and val == 0):
                     return val
-                except (TypeError, ValueError):
-                    continue
         for key in keys:
             found = cls._recursive_lookup(payload, key.split(".")[-1])
             if found is not None:
-                try:
-                    val = float(found)
-                    if skip_zero and val == 0:
-                        continue
+                val = cls._coerce_number(found)
+                if val is not None and not (skip_zero and val == 0):
                     return val
-                except (TypeError, ValueError):
-                    continue
         return default
+
+    @staticmethod
+    def _coerce_number(found: Any) -> float | None:
+        """Best-effort float, tolerating CMC's comma-grouped string numbers.
+
+        The x402 technical-analysis tool returns values like "1,706.82" (and
+        RSI as "44.87"); a bare float() raises on the thousands separator, which
+        previously dropped every technical reading.
+        """
+
+        if isinstance(found, str):
+            found = found.replace(",", "").strip()
+        try:
+            return float(found)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _read_path(payload: dict[str, Any], path: str) -> Any:
