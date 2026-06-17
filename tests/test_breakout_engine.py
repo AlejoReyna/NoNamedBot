@@ -134,6 +134,32 @@ def test_missing_derivatives_data_surfaces_in_metrics() -> None:
     assert decision.factor_metrics["derivatives_risk_clear"] == "funding/OI data missing"
 
 
+def test_unquotable_symbol_without_verified_contract_is_skipped() -> None:
+    # TRIA is in the target allowlist but has no verified BSC contract, so TWAK
+    # cannot quote it; it must be rejected before selection, not picked and then
+    # failed on the quote.
+    engine = _engine_with_price_high("TRIA", 10.0)
+    decision = engine.evaluate_token(_token(symbol="TRIA"), 10000.0)
+
+    assert decision.should_enter is False
+    assert "verified BSC contract" in decision.reason
+
+
+def test_verified_contract_symbol_still_evaluates() -> None:
+    # CAKE has a verified contract, so the gate must not block it.
+    engine = _engine_with_price_high("CAKE", 10.0)
+    decision = engine.evaluate_token(_token(), 10000.0)
+    assert decision.reason != "symbol has no verified BSC contract (not executable on TWAK)"
+
+
+def test_contract_gate_can_be_disabled_via_setting() -> None:
+    engine = _engine_with_price_high("TRIA", 10.0, settings=Settings(require_verified_bsc_contract=False))
+    decision = engine.evaluate_token(_token(symbol="TRIA"), 10000.0)
+    # With the gate off, TRIA is evaluated normally (and only blocked later by
+    # the slippage/quote stage, not by the contract gate).
+    assert "verified BSC contract" not in (decision.reason or "")
+
+
 def test_stablecoin_targets_are_not_directional_entries() -> None:
     engine = _engine()
 

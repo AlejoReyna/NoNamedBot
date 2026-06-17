@@ -100,6 +100,11 @@ class Settings(BaseModel):
     breakout_lookback_hours: int = 3
     breakout_buffer: float = 0.002
     breakout_reference_windows_hours: list[int] = Field(default_factory=lambda: [3, 6, 24])
+    # Only select breakout candidates that have a verified BEP-20 contract (i.e.
+    # are executable on TWAK). Off-list/unmapped symbols otherwise win the score
+    # ranking and then fail the quote, parking the bot on WAIT. The eligible
+    # universe is BSC-native, so this aligns with "trade only liquid majors".
+    require_verified_bsc_contract: bool = True
     breakout_entry_score_min: float = 45.0
     breakout_quote_score_buffer: float = 5.0
     breakout_near_miss_cooldown_cycles: int = 1
@@ -332,6 +337,7 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
         "breakout_lookback_hours": _get_int("BREAKOUT_LOOKBACK_HOURS", 3),
         "breakout_buffer": _get_float("BREAKOUT_BUFFER", 0.002),
         "breakout_reference_windows_hours": _get_int_list("BREAKOUT_REFERENCE_WINDOWS_HOURS", [3, 6, 24]),
+        "require_verified_bsc_contract": _get_bool("REQUIRE_VERIFIED_BSC_CONTRACT", True),
         "breakout_entry_score_min": _get_float("BREAKOUT_ENTRY_SCORE_MIN", 45.0),
         "breakout_quote_score_buffer": _get_float("BREAKOUT_QUOTE_SCORE_BUFFER", 5.0),
         "breakout_near_miss_cooldown_cycles": _get_int("BREAKOUT_NEAR_MISS_COOLDOWN_CYCLES", 1),

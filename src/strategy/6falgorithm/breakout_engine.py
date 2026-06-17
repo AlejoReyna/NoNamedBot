@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Any
 
 from src.config.settings import Settings
-from src.config.tokens import is_liquid, is_momentum_candidate_symbol, is_tradable_symbol
+from src.config.tokens import (
+    has_verified_bsc_contract,
+    is_liquid,
+    is_momentum_candidate_symbol,
+    is_tradable_symbol,
+)
 from src.execution.twak_interface import TWAKInterface
 
 LOGGER = logging.getLogger(__name__)
@@ -211,6 +216,16 @@ class BreakoutEngine:
                 factor_scores={},
                 true_factor_count=0,
                 reason="symbol excluded from momentum candidates",
+                ml_context=ml_context,
+            )
+        if bool(getattr(self.settings, "require_verified_bsc_contract", True)) and not has_verified_bsc_contract(symbol):
+            return BreakoutDecision(
+                should_enter=False,
+                symbol=symbol or None,
+                position_size_usdc=0.0,
+                factor_scores={},
+                true_factor_count=0,
+                reason="symbol has no verified BSC contract (not executable on TWAK)",
                 ml_context=ml_context,
             )
 
@@ -509,8 +524,14 @@ class BreakoutEngine:
         best_decision: BreakoutDecision | None = None
         best_volume = -1.0
         saw_target_symbol = False
+        require_contract = bool(getattr(self.settings, "require_verified_bsc_contract", True))
         for symbol, token_data in market_snapshot.items():
             if not is_tradable_symbol(symbol) or not is_momentum_candidate_symbol(symbol):
+                continue
+            # Skip symbols TWAK cannot execute (no verified BEP-20 contract): they
+            # otherwise win the candidate ranking on score, then fail the quote and
+            # leave the bot on WAIT instead of trading the best *executable* name.
+            if require_contract and not has_verified_bsc_contract(symbol):
                 continue
             saw_target_symbol = True
             enriched_data = {"symbol": symbol.upper(), **token_data}
