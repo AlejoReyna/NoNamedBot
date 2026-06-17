@@ -277,8 +277,15 @@ class BreakoutEngine:
             rsi_in_range = 55.0 <= rsi <= 75.0
 
         if funding_rate is None or open_interest_change is None:
-            self._warn_missing_factor_once(symbol, "derivatives_risk_clear")
-            derivatives_risk_clear = False
+            # CMC has no funding/OI feed, so this data is structurally absent.
+            # Default is fail-closed; when derivatives_neutral_on_missing is set,
+            # treat absent data as neutral (pass) so a metric we cannot source
+            # stops capping every candidate at 5/6. Present data is still strict.
+            if bool(getattr(self.settings, "derivatives_neutral_on_missing", False)):
+                derivatives_risk_clear = True
+            else:
+                self._warn_missing_factor_once(symbol, "derivatives_risk_clear")
+                derivatives_risk_clear = False
         else:
             derivatives_risk_clear = not (abs(funding_rate) > 0.0015 or open_interest_change < -10.0)
 
@@ -498,7 +505,10 @@ class BreakoutEngine:
             metrics["rsi_in_range"] = f"RSI {candidate.rsi:.1f} · band 55–75"
 
         if candidate.funding_rate is None or candidate.open_interest_change is None:
-            metrics["derivatives_risk_clear"] = "funding/OI data missing"
+            if bool(getattr(self.settings, "derivatives_neutral_on_missing", False)):
+                metrics["derivatives_risk_clear"] = "funding/OI data missing · neutral (pass)"
+            else:
+                metrics["derivatives_risk_clear"] = "funding/OI data missing"
         else:
             metrics["derivatives_risk_clear"] = (
                 f"funding {candidate.funding_rate * 100:.3f}% · OI {candidate.open_interest_change:+.1f}%"

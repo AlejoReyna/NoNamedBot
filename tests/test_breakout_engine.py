@@ -134,6 +134,30 @@ def test_missing_derivatives_data_surfaces_in_metrics() -> None:
     assert decision.factor_metrics["derivatives_risk_clear"] == "funding/OI data missing"
 
 
+def test_derivatives_neutral_on_missing_passes_when_data_absent() -> None:
+    engine = _engine_with_price_high(
+        "CAKE", 10.0, settings=Settings(max_chase_pct=0.06, derivatives_neutral_on_missing=True)
+    )
+    decision = engine.evaluate_token(
+        _token(funding_rate=None, open_interest_change_pct=None), 10000.0
+    )
+
+    assert decision.factor_scores["derivatives_risk_clear"] is True
+    assert "neutral" in decision.factor_metrics["derivatives_risk_clear"].lower()
+
+
+def test_derivatives_neutral_still_strict_when_data_present() -> None:
+    # Neutral-on-missing must NOT relax evaluation when real funding/OI exist.
+    engine = _engine_with_price_high(
+        "CAKE", 10.0, settings=Settings(max_chase_pct=0.06, derivatives_neutral_on_missing=True)
+    )
+    decision = engine.evaluate_token(
+        _token(funding_rate=0.05, open_interest_change_pct=-50.0), 10000.0
+    )
+
+    assert decision.factor_scores["derivatives_risk_clear"] is False
+
+
 def test_unquotable_symbol_without_verified_contract_is_skipped() -> None:
     # TRIA is in the target allowlist but has no verified BSC contract, so TWAK
     # cannot quote it; it must be rejected before selection, not picked and then
