@@ -41,6 +41,7 @@ def test_decision_log_writes_jsonl_record(tmp_path: object) -> None:
         "symbol",
         "position_size_usdc",
         "factor_scores",
+        "factor_metrics",
         "true_factor_count",
         "estimated_slippage_pct",
         "reason",
@@ -51,6 +52,7 @@ def test_decision_log_writes_jsonl_record(tmp_path: object) -> None:
     assert record["action"] == "ENTER"
     assert record["symbol"] == "CAKE"
     assert record["factor_scores"] == {"slippage_under_cap": True}
+    assert record["factor_metrics"] == {}
     assert record["estimated_slippage_pct"] == 0.005
     assert "timestamp" in record
 

@@ -508,12 +508,20 @@ class CMCMCPClient:
         if not resolved:
             return {}
 
-        def _fetch_batch(batch: list[str]) -> dict[str, Any]:
-            ids = list(dict.fromkeys(resolved[s] for s in batch))
-            return self._call_tool_x402("get_crypto_technical_analysis", {"id": ",".join(ids)})
+        # The technical-analysis MCP tool accepts one numeric id per call. A
+        # comma-joined id list is rejected by CMC, so fetch each resolved symbol
+        # independently and map the symbol-less response back to that symbol.
+        limit = max(0, int(getattr(self.settings, "x402_technicals_max_symbols", 0) or 0))
+        ordered = list(resolved.items())
+        if limit:
+            ordered = ordered[:limit]
 
-        payload = self._fetch_combined_payload(list(resolved), _fetch_batch)
-        return self._by_symbol(payload)
+        by_symbol: dict[str, dict[str, Any]] = {}
+        for symbol, cmc_id in ordered:
+            blob = self._call_tool_x402("get_crypto_technical_analysis", {"id": str(cmc_id)})
+            if isinstance(blob, dict) and blob:
+                by_symbol[symbol] = blob
+        return by_symbol
 
     def _build_enriched_snapshot(
         self,

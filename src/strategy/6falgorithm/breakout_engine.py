@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,7 @@ class BreakoutDecision:
     # Raw measured value behind each factor (human-readable), so the dashboard can
     # display the real numbers the booleans were derived from. Keyed by factor name.
     factor_metrics: dict[str, str] = field(default_factory=dict)
+    ml_context: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -177,6 +178,7 @@ class BreakoutEngine:
         self,
         token_data: dict[str, Any],
         portfolio_value_usdc: float,
+        ml_context: Any | None = None,
     ) -> BreakoutDecision:
         """Evaluate one token against the entry filter."""
 
@@ -189,6 +191,7 @@ class BreakoutEngine:
                 factor_scores={},
                 true_factor_count=0,
                 reason="token failed liquidity filter",
+                ml_context=ml_context,
             )
         if not is_tradable_symbol(symbol):
             return BreakoutDecision(
@@ -198,6 +201,7 @@ class BreakoutEngine:
                 factor_scores={},
                 true_factor_count=0,
                 reason="symbol outside tradable target allowlist",
+                ml_context=ml_context,
             )
         if not is_momentum_candidate_symbol(symbol):
             return BreakoutDecision(
@@ -207,6 +211,7 @@ class BreakoutEngine:
                 factor_scores={},
                 true_factor_count=0,
                 reason="symbol excluded from momentum candidates",
+                ml_context=ml_context,
             )
 
         candidate = self._evaluate_cheap_candidate(token_data, portfolio_value_usdc)
@@ -221,7 +226,7 @@ class BreakoutEngine:
         self.price_cache.save()
         self.volume_cache.save()
         self.macro_cache.save()
-        return decision
+        return replace(decision, ml_context=ml_context)
 
     def _evaluate_cheap_candidate(
         self,

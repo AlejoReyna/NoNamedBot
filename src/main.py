@@ -1237,6 +1237,7 @@ def _evaluate_universe_v25(
     twak_interface: TWAKInterface | None = None,
     exclude_symbols: set[str] | None = None,
     sentiment_result: SentimentResult | None = None,
+    ml_bundle: Any | None = None,
 ) -> EntryCandidate | None:
     evaluate = getattr(scoring, "evaluate_universe", None)
     if evaluate is not None and evaluate is not fallback_evaluate_universe:
@@ -1250,6 +1251,7 @@ def _evaluate_universe_v25(
                 twak_interface=twak_interface,
                 exclude_symbols=exclude_symbols or set(),
                 sentiment_result=sentiment_result,
+                ml_bundle=ml_bundle,
             )
         except TypeError:
             try:
