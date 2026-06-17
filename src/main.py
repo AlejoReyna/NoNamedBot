@@ -1455,6 +1455,11 @@ def _attempt_entry_v25(
     if amount_out > 0:
         entry_price = position_usd / amount_out
 
+    # Stamp a stable trade_id so the entry/exit join in the outcome log holds
+    # across restarts, then open the position and record the entry event. Without
+    # this, the v25 path produced exit-only rows with trade_id=null and the ML
+    # dataset builder joined to zero training rows.
+    trade_id = trade_outcome_log.new_trade_id()
     _open_local_position_v25(
         position_manager,
         candidate.symbol,
@@ -1463,7 +1468,23 @@ def _attempt_entry_v25(
         position_usd,
         atr_pct,
         regime_result.regime,
+        trade_id=trade_id,
     )
+    try:
+        trade_outcome_log.record_entry(
+            getattr(settings, "trade_outcome_log_path", trade_outcome_log.DEFAULT_PATH),
+            symbol=candidate.symbol,
+            entry_price=entry_price,
+            size_usdc=position_usd,
+            entry_score=candidate.entry_score,
+            true_factor_count=candidate.true_factor_count,
+            factor_scores=candidate.factor_scores,
+            estimated_slippage_pct=candidate.slippage_normal,
+            entry_tx_hash=_execution_tx_hash(swap_result),
+            trade_id=trade_id,
+        )
+    except Exception as exc:  # logging must never block an entry
+        LOGGER.debug("Could not record trade entry outcome (v25): %s", exc)
     guardrails.record_trade(
         TradeRecord(
             symbol=candidate.symbol,
@@ -1486,12 +1507,16 @@ def _open_local_position_v25(
     position_usd: float,
     atr_pct: float | None,
     regime: MarketRegime,
+    trade_id: str | None = None,
 ) -> None:
     # Use the volatility-aware signature when the manager supports it; fall back
     # to the legacy 4-arg form only for an older PositionManager. Checking the
     # signature explicitly (instead of catching TypeError) avoids masking a
     # genuine TypeError raised inside open_position.
     open_params = inspect.signature(position_manager.open_position).parameters
+    # Stamp the trade_id when supported so the entry/exit outcome-log join holds
+    # across restarts (record_exit reads trade_id off the closed Position).
+    extra = {"trade_id": trade_id} if (trade_id and "trade_id" in open_params) else {}
     if "atr_pct" in open_params and "regime" in open_params:
         position_manager.open_position(
             symbol=symbol,
@@ -1500,9 +1525,10 @@ def _open_local_position_v25(
             position_usd=position_usd,
             atr_pct=atr_pct,
             regime=regime,
+            **extra,
         )
     else:
-        position_manager.open_position(symbol, amount_tokens, entry_price, position_usd)
+        position_manager.open_position(symbol, amount_tokens, entry_price, position_usd, **extra)
 
 
 def _monitor_position_exits_if_needed(
