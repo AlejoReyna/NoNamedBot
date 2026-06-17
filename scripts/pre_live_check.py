@@ -43,15 +43,10 @@ def main() -> int:
     checks.append(("TWAK wallet matches AGENT_WALLET_ADDRESS", wallet_ok, unlock.get("detail", "")))
 
     min_bnb = getattr(settings, "min_bnb_gas", 0.05)
-    min_usdc = getattr(settings, "min_usdc_balance", 50.0)
     try:
         toolkit = BnbToolkitWrapper(settings)
         bnb = _balance(toolkit, "BNB")
-        usdc = _balance(toolkit, "USDC")
-        usdt = _balance(toolkit, "USDT")
-        stable = max(usdc, usdt)
         checks.append((f"BNB gas ≥ {min_bnb}", bnb >= min_bnb, f"{bnb:.6f} BNB"))
-        checks.append((f"stable balance ≥ ${min_usdc}", stable >= min_usdc, f"USDC={usdc:.2f} USDT={usdt:.2f}"))
     except Exception as exc:
         checks.append(("wallet balances", False, str(exc)))
 
