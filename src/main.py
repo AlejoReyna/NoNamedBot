@@ -1853,6 +1853,7 @@ def _breakout_decision_from_candidate(
         estimated_slippage_pct=getattr(liquidity, "slippage_normal", candidate.slippage_normal),
         entry_score=candidate.entry_score,
         position_size_multiplier=candidate.position_size_multiplier,
+        factor_metrics=dict(getattr(candidate, "factor_metrics", {}) or {}),
     )
 
 
@@ -2378,6 +2379,8 @@ def _maybe_enter_position(
             true_factor_count=decision.true_factor_count,
             reason=decision.reason,
             estimated_slippage_pct=decision.estimated_slippage_pct,
+            entry_score=decision.entry_score,
+            factor_metrics=dict(getattr(decision, "factor_metrics", {}) or {}),
         )
     if decision.position_size_usdc <= 0:
         LOGGER.warning("Signal ignored for %s because portfolio floor prevents spend", decision.symbol)
@@ -2619,6 +2622,9 @@ def _log_cycle_decision(
     estimated_slippage = decision.estimated_slippage_pct if decision is not None else None
     true_factor_count = decision.true_factor_count if decision is not None else 0
     factor_scores = dict(decision.factor_scores) if decision is not None else {}
+    factor_metrics = (
+        dict(getattr(decision, "factor_metrics", {}) or {}) if decision is not None else {}
+    )
     position_size_usdc = decision.position_size_usdc if decision is not None else 0.0
     priced_target_count = len(_priced_target_symbols(market_snapshot))
 
@@ -2641,6 +2647,7 @@ def _log_cycle_decision(
         entries_blocked_reason=entries_blocked_reason,
         exit_reason=exit_reason,
         hold_time_seconds=hold_time_seconds,
+        factor_metrics=factor_metrics,
     )
 
     factors = f"{true_factor_count}/6" if decision is not None else "-"

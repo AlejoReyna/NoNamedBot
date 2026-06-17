@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 
 
@@ -23,3 +23,5 @@ class EntryCandidate:
     entry_score: float | None = None
     position_size_multiplier: float = 1.0
     strategy_mode: str = "breakout"
+    # Human-readable measured value behind each factor, carried through to telemetry.
+    factor_metrics: dict[str, str] = field(default_factory=dict)

@@ -79,6 +79,7 @@ def breakout_decision_to_candidate(
         entry_score=maybe_number(getattr(decision, "entry_score", None)),
         position_size_multiplier=position_size_multiplier,
         strategy_mode="breakout",
+        factor_metrics=dict(getattr(decision, "factor_metrics", {}) or {}),
     )
 
 
@@ -115,4 +116,5 @@ def coerce_entry_candidate(
         entry_score=maybe_number(getattr(candidate, "entry_score", None)),
         position_size_multiplier=maybe_number(getattr(candidate, "position_size_multiplier", None)) or 1.0,
         strategy_mode=str(getattr(candidate, "strategy_mode", "breakout")),
+        factor_metrics=dict(getattr(candidate, "factor_metrics", {}) or {}),
     )

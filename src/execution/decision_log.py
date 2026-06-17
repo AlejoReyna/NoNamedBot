@@ -39,6 +39,7 @@ class DecisionLogger:
         entries_blocked_reason: str | None = None,
         exit_reason: str | None = None,
         hold_time_seconds: int | None = None,
+        factor_metrics: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Append one strategy decision record and return it."""
 
@@ -53,6 +54,7 @@ class DecisionLogger:
             "symbol": symbol.upper() if symbol else None,
             "position_size_usdc": position_size_usdc,
             "factor_scores": factor_scores or {},
+            "factor_metrics": factor_metrics or {},
             "true_factor_count": true_factor_count,
             "estimated_slippage_pct": estimated_slippage_pct,
             "reason": reason,
@@ -96,6 +98,7 @@ def log_decision(
     entries_blocked_reason: str | None = None,
     exit_reason: str | None = None,
     hold_time_seconds: int | None = None,
+    factor_metrics: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Append a strategy decision record using the configured settings path."""
 
@@ -119,4 +122,5 @@ def log_decision(
         entries_blocked_reason=entries_blocked_reason,
         exit_reason=exit_reason,
         hold_time_seconds=hold_time_seconds,
+        factor_metrics=factor_metrics,
     )
