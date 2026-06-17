@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,15 @@ class BreakoutDecision:
     estimated_slippage_pct: float | None = None
     entry_score: float | None = None
     position_size_multiplier: float = 1.0
+    # Provenance of the slippage figure so observers can tell apart a candidate
+    # that was never sent for a TWAK quote ("not_quoted") from one that was
+    # quoted but the quote failed/returned nothing ("failed") from a real
+    # numeric quote ("quoted"). Both former cases leave estimated_slippage_pct
+    # None, so without this they look identical on the dashboard.
+    slippage_quote_state: str = "not_quoted"
+    # Raw measured value behind each factor (human-readable), so the dashboard can
+    # display the real numbers the booleans were derived from. Keyed by factor name.
+    factor_metrics: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -58,6 +67,12 @@ class _CheapCandidate:
     chase_cap_exceeded: bool
     momentum_1h: float = 0.0
     momentum_24h: float = 0.0
+    # Raw indicator readings retained for telemetry/audit display.
+    rsi: float | None = None
+    funding_rate: float | None = None
+    open_interest_change: float | None = None
+    price: float | None = None
+    last_reference_high: float | None = None
 
 
 @dataclass(frozen=True)
@@ -197,9 +212,12 @@ class BreakoutEngine:
         candidate = self._evaluate_cheap_candidate(token_data, portfolio_value_usdc)
         entry_score = self._entry_score(candidate, momentum_z_score=0.0)
         estimated_slippage: float | None = None
+        quote_state = "not_quoted"
         if self._should_quote_candidate(candidate, entry_score):
-            estimated_slippage = self._estimate_candidate_slippage(candidate)
-        decision = self._decision_from_candidate(candidate, estimated_slippage, entry_score)
+            estimated_slippage, quote_state = self._estimate_candidate_slippage(candidate)
+        decision = self._decision_from_candidate(
+            candidate, estimated_slippage, entry_score, slippage_quote_state=quote_state
+        )
         self.price_cache.save()
         self.volume_cache.save()
         self.macro_cache.save()
@@ -209,6 +227,7 @@ class BreakoutEngine:
         self,
         token_data: dict[str, Any],
         portfolio_value_usdc: float,
+        bnb_data: dict[str, Any] | None = None,
     ) -> _CheapCandidate:
         """Evaluate all candidate factors that do not require TWAK."""
 
@@ -225,7 +244,7 @@ class BreakoutEngine:
         breakout_profile = self._breakout_profile(symbol, token_data, price)
         macro_score, macro_size_multiplier = self._macro_context(token_data)
 
-        regime_not_risk_off = self.check_regime(token_data)
+        regime_not_risk_off = self.check_regime(token_data, bnb_data)
         position_size = portfolio_value_usdc * self.settings.max_position_pct
         if not regime_not_risk_off:
             position_size *= float(getattr(self.settings, "regime_size_multiplier", 0.5))
@@ -279,24 +298,43 @@ class BreakoutEngine:
             chase_cap_exceeded=breakout_profile.chase_cap_exceeded,
             momentum_1h=self._token_change_fraction(token_data, hours=1) or 0.0,
             momentum_24h=self._token_change_fraction(token_data, hours=24) or 0.0,
+            rsi=rsi,
+            funding_rate=funding_rate,
+            open_interest_change=open_interest_change,
+            price=price,
+            last_reference_high=breakout_profile.broken_reference_high,
         )
 
-    def _estimate_candidate_slippage(self, candidate: _CheapCandidate) -> float | None:
+    def _estimate_candidate_slippage(self, candidate: _CheapCandidate) -> tuple[float | None, str]:
+        """Quote slippage and report whether the quote succeeded.
+
+        Returns ``(value, state)`` where state is ``"quoted"`` when a usable
+        numeric slippage came back, or ``"failed"`` when the quote raised or
+        returned nothing. The caller uses ``"not_quoted"`` for candidates that
+        were never sent for a quote at all, so the three cases stay distinct in
+        telemetry instead of collapsing into a single ``None``.
+        """
+
         try:
-            return self.twak_interface.estimate_slippage_pct(
+            value = self.twak_interface.estimate_slippage_pct(
                 amount=candidate.position_size_usdc,
                 from_token=self.settings.default_stable_symbol,
                 to_token=candidate.symbol,
             )
         except Exception as exc:
             LOGGER.warning("TWAK slippage quote failed for %s: %s", candidate.symbol, exc)
-            return None
+            return None, "failed"
+        if value is None:
+            LOGGER.warning("TWAK slippage quote returned no value for %s", candidate.symbol)
+            return None, "failed"
+        return value, "quoted"
 
     def _decision_from_candidate(
         self,
         candidate: _CheapCandidate,
         estimated_slippage: float | None,
         entry_score: float | None = None,
+        slippage_quote_state: str = "not_quoted",
     ) -> BreakoutDecision:
         """Build a full decision after optional TWAK slippage evaluation."""
 
@@ -345,13 +383,29 @@ class BreakoutEngine:
                 f"entry score {resolved_score:.1f} below quote floor {quote_floor:.1f}"
             )
         elif not slippage_under_cap:
-            reason = "slippage estimate missing, negative, or above cap"
+            if slippage_quote_state == "not_quoted":
+                reason = "slippage not quoted (candidate not sent for a TWAK quote yet)"
+            elif slippage_quote_state == "failed":
+                reason = "slippage quote failed (TWAK returned no usable quote)"
+            elif estimated_slippage is not None and estimated_slippage < 0:
+                reason = "slippage estimate negative"
+            elif estimated_slippage is not None:
+                reason = (
+                    f"slippage {estimated_slippage * 100:.2f}% above cap "
+                    f"{self.settings.max_slippage_pct * 100:.2f}%"
+                )
+            else:
+                reason = "slippage estimate missing, negative, or above cap"
         elif resolved_score < threshold:
             reason = (
                 f"entry score {resolved_score:.1f} below threshold {threshold:.1f}"
             )
         else:
             reason = "entry blocked by scoring model"
+
+        factor_metrics = self._build_factor_metrics(
+            candidate, estimated_slippage, resolved_score, slippage_quote_state
+        )
 
         return BreakoutDecision(
             should_enter=should_enter,
@@ -363,7 +417,80 @@ class BreakoutEngine:
             estimated_slippage_pct=estimated_slippage,
             entry_score=resolved_score,
             position_size_multiplier=candidate.macro_size_multiplier,
+            factor_metrics=factor_metrics,
+            slippage_quote_state=slippage_quote_state,
         )
+
+    def _build_factor_metrics(
+        self,
+        candidate: _CheapCandidate,
+        estimated_slippage: float | None,
+        entry_score: float | None,
+        slippage_quote_state: str = "not_quoted",
+    ) -> dict[str, str]:
+        """Human-readable reading behind each factor for dashboard display.
+
+        These are the actual measured values the boolean gates were derived from,
+        so an observer can cross-check the agent against live market data.
+        """
+
+        def price_fmt(value: float | None) -> str:
+            if value is None:
+                return "n/a"
+            return f"{value:,.6g}"
+
+        cap_pct = float(getattr(self.settings, "max_slippage_pct", 0.0)) * 100.0
+        metrics: dict[str, str] = {}
+
+        metrics["volume_breakout"] = (
+            f"surge {candidate.volume_surge_score:.2f}× · 24h vol ${candidate.volume_24h:,.0f}"
+        )
+
+        ref_high = candidate.last_reference_high
+        if candidate.six_hour_high_break and ref_high is not None:
+            metrics["six_hour_high_break"] = (
+                f"price {price_fmt(candidate.price)} cleared 6h high {price_fmt(ref_high)}"
+            )
+        elif ref_high is not None:
+            metrics["six_hour_high_break"] = (
+                f"price {price_fmt(candidate.price)} · 6h high {price_fmt(ref_high)}"
+            )
+        else:
+            metrics["six_hour_high_break"] = f"price {price_fmt(candidate.price)} · no 6h reference"
+
+        metrics["regime_not_risk_off"] = (
+            "regime risk-on / neutral" if candidate.regime_not_risk_off else "regime risk-off"
+        )
+
+        if estimated_slippage is None:
+            if slippage_quote_state == "failed":
+                metrics["slippage_under_cap"] = f"quote failed · cap {cap_pct:.2f}%"
+            else:
+                metrics["slippage_under_cap"] = f"not quoted · cap {cap_pct:.2f}%"
+        else:
+            metrics["slippage_under_cap"] = (
+                f"{estimated_slippage * 100:.2f}% · cap {cap_pct:.2f}%"
+            )
+
+        if candidate.rsi is None:
+            metrics["rsi_in_range"] = "RSI n/a · band 55–75"
+        else:
+            metrics["rsi_in_range"] = f"RSI {candidate.rsi:.1f} · band 55–75"
+
+        if candidate.funding_rate is None or candidate.open_interest_change is None:
+            metrics["derivatives_risk_clear"] = "funding/OI data missing"
+        else:
+            metrics["derivatives_risk_clear"] = (
+                f"funding {candidate.funding_rate * 100:.3f}% · OI {candidate.open_interest_change:+.1f}%"
+            )
+
+        if entry_score is not None:
+            metrics["entry_score"] = (
+                f"{entry_score:.1f}/100 · need {float(getattr(self.settings, 'breakout_entry_score_min', 45.0)):.0f}+"
+                f" · floor {self._quote_score_floor:.0f}"
+            )
+
+        return metrics
 
     def evaluate_all(
         self,
@@ -372,6 +499,7 @@ class BreakoutEngine:
     ) -> list[BreakoutDecision]:
         """Scan target symbols and return all slippage-confirmed entry decisions."""
 
+        bnb_reference = self._bnb_reference(market_snapshot)
         candidates: list[_CheapCandidate] = []
         best_decision: BreakoutDecision | None = None
         best_volume = -1.0
@@ -383,7 +511,9 @@ class BreakoutEngine:
             enriched_data = {"symbol": symbol.upper(), **token_data}
             if not is_liquid(enriched_data):
                 continue
-            candidate = self._evaluate_cheap_candidate(enriched_data, portfolio_value_usdc)
+            candidate = self._evaluate_cheap_candidate(
+                enriched_data, portfolio_value_usdc, bnb_data=bnb_reference
+            )
             candidates.append(candidate)
 
             unquoted_decision = self._decision_from_candidate(candidate, estimated_slippage=None)
@@ -425,10 +555,12 @@ class BreakoutEngine:
 
         passers: list[BreakoutDecision] = []
         for candidate in quote_candidates[:MAX_UNIVERSE_TWAK_QUOTES]:
+            slippage_value, quote_state = self._estimate_candidate_slippage(candidate)
             decision = self._decision_from_candidate(
                 candidate,
-                self._estimate_candidate_slippage(candidate),
+                slippage_value,
                 scores_by_symbol.get(candidate.symbol, 0.0),
+                slippage_quote_state=quote_state,
             )
             if decision.should_enter:
                 passers.append(decision)
@@ -439,6 +571,7 @@ class BreakoutEngine:
         self.price_cache.save()
         self.volume_cache.save()
         self.macro_cache.save()
+        self._log_factor_matrix(candidates, scores_by_symbol, momentum_scores, bnb_reference)
 
         if passers:
             return passers
@@ -643,12 +776,112 @@ class BreakoutEngine:
             return None
         return current - oldest
 
+    def _log_factor_matrix(
+        self,
+        candidates: list[_CheapCandidate],
+        scores_by_symbol: dict[str, float],
+        momentum_scores: dict[str, float],
+        bnb_reference: dict[str, Any] | None = None,
+    ) -> None:
+        """Append one JSONL row per evaluated symbol with the full factor matrix.
+
+        Persists what the engine otherwise only emits as transient warnings:
+        every factor boolean, the raw scoring inputs, the entry_score, and
+        which inputs were missing. This is the join key for offline tuning of
+        which factor combinations actually win. Gated and best-effort so it can
+        never affect a live trading cycle.
+        """
+
+        if not getattr(self.settings, "factor_matrix_log_enabled", False):
+            return
+        path_str = getattr(self.settings, "factor_matrix_log_path", "logs/factor_matrix.jsonl")
+        try:
+            path = Path(path_str)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            now = time.time()
+            # The regime decision reads BNB from the normalized reference, not
+            # the token row, so judge "missing" from that same source — else the
+            # log says BNB was missing even when the decision used it correctly.
+            bnb_missing = (
+                bnb_reference is None
+                or self._bnb_change_1h_fraction(bnb_reference, separate_bnb_data=True) is None
+            )
+            lines = []
+            for candidate in candidates:
+                token_data = candidate.token_data
+                row = {
+                    "ts": now,
+                    "symbol": candidate.symbol,
+                    "entry_score": scores_by_symbol.get(candidate.symbol),
+                    "momentum_z": momentum_scores.get(candidate.symbol, 0.0),
+                    "factors": {
+                        "volume_breakout": candidate.volume_breakout,
+                        "six_hour_high_break": candidate.six_hour_high_break,
+                        "regime_not_risk_off": candidate.regime_not_risk_off,
+                        "rsi_in_range": candidate.rsi_in_range,
+                        "derivatives_risk_clear": candidate.derivatives_risk_clear,
+                    },
+                    "inputs": {
+                        "breakout_strength": candidate.breakout_strength,
+                        "volume_surge_score": candidate.volume_surge_score,
+                        "macro_score": candidate.macro_score,
+                        "macro_size_multiplier": candidate.macro_size_multiplier,
+                        "volume_24h": candidate.volume_24h,
+                        "momentum_1h": candidate.momentum_1h,
+                        "momentum_24h": candidate.momentum_24h,
+                    },
+                    "missing": {
+                        "rsi": self._positive_number(token_data.get("rsi")) is None,
+                        "funding_rate": self._number(token_data.get("funding_rate")) is None,
+                        "open_interest_change_pct": self._number(
+                            token_data.get("open_interest_change_pct")
+                        )
+                        is None,
+                        "bnb_1h_trend": bnb_missing,
+                    },
+                }
+                lines.append(json.dumps(row, default=str))
+            if lines:
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write("\n".join(lines) + "\n")
+        except OSError as exc:
+            LOGGER.debug("Could not write factor matrix log: %s", exc)
+
     def _warn_missing_factor_once(self, symbol: str, factor: str) -> None:
         key = (symbol.upper(), factor)
         if key in self._missing_factor_warnings:
             return
         self._missing_factor_warnings.add(key)
         LOGGER.warning("Missing data for %s factor on %s; failing factor closed", factor, symbol)
+
+    def _bnb_reference(self, market_snapshot: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+        """Return a normalized standalone BNB row for the regime check.
+
+        The top-level ``BNB`` (or ``WBNB``) snapshot row exists purely as a
+        regime reference and is skipped by the per-token scan, so without this
+        it never reaches ``check_regime`` and the regime factor fails closed for
+        every token (halving size via ``regime_size_multiplier``).
+
+        The 1h move is canonicalized into percent points under
+        ``bnb_1h_trend_pct``. The separate-BNB branch reads that alias first as
+        percent points, which avoids the scaling bug where a percent-point
+        value (e.g. 1.5 == 1.5%) would otherwise be misread as a raw fraction
+        (1.5 == 150%).
+        """
+
+        row = market_snapshot.get("BNB") or market_snapshot.get("WBNB")
+        if not isinstance(row, dict):
+            return None
+        normalized = dict(row)
+        trend = None
+        for key in ("bnb_1h_trend_pct", "percent_change_1h", "price_change_percentage_1h", "change_1h"):
+            candidate = self._number(normalized.get(key))
+            if candidate is not None:
+                trend = candidate
+                break
+        if trend is not None:
+            normalized["bnb_1h_trend_pct"] = trend
+        return normalized
 
     def check_regime(self, token_data: dict[str, Any], bnb_data: dict[str, Any] | None = None) -> bool:
         bnb_source = bnb_data if bnb_data is not None else token_data
@@ -662,14 +895,20 @@ class BreakoutEngine:
 
     def _bnb_change_1h_fraction(self, data: dict[str, Any], separate_bnb_data: bool) -> float | None:
         if separate_bnb_data:
+            # bnb_1h_trend_pct is canonicalized to percent points by
+            # _bnb_reference and read FIRST, so a percent-point value (e.g. 1.5
+            # == 1.5%) is never misread as a raw fraction (1.5 == 150%). The
+            # raw percent_change_1h alias keeps its legacy fraction semantics as
+            # a last resort, but the real engine path never reaches it because
+            # _bnb_reference always populates bnb_1h_trend_pct.
             return self._first_change_fraction(
                 data,
                 (
-                    ("percent_change_1h", "fraction"),
+                    ("bnb_1h_trend_pct", "percent_points"),
                     ("bnb_percent_change_1h", "fraction"),
                     ("price_change_percentage_1h", "percent_points"),
                     ("change_1h", "percent_points"),
-                    ("bnb_1h_trend_pct", "percent_points"),
+                    ("percent_change_1h", "fraction"),
                 ),
             )
         return self._first_change_fraction(

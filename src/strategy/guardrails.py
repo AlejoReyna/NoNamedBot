@@ -212,6 +212,60 @@ class Guardrails:
 
         return self._kill_switch
 
+    @property
+    def all_time_high_usdc(self) -> float:
+        """Public read of the tracked portfolio all-time-high."""
+
+        return self._all_time_high_usdc
+
+    def recalibrate_paper_state(self, current_portfolio_value_usdc: float) -> dict[str, object]:
+        """Re-anchor a STALE PAPER guardrail to the current paper portfolio.
+
+        Why this exists: ``portfolio_ath`` is a monotonic high-water mark. If it
+        was seeded at a notional bankroll (e.g. 10000) that the live paper
+        balance never actually reached, the drawdown is computed against a peak
+        that never happened. Once
+        ``(ath - value) / ath >= drawdown_kill_switch_pct`` the kill switch
+        latches in state and never clears on its own, so the bot HALTs every
+        cycle even though no real capital was lost. Example: ath=10000,
+        value=8000 -> 20% >= 18% -> latched kill switch.
+
+        This re-anchors the ATH to the current value and clears the latched
+        kill switch so a fresh, honest drawdown baseline starts from here.
+
+        Safety: refuses outright in live mode so it can NEVER be used to paper
+        over a real live drawdown. Live recovery must go through a deliberate,
+        audited manual process, not this helper.
+        """
+
+        if not bool(getattr(self.settings, "paper_trade", True)):
+            raise RuntimeError(
+                "recalibrate_paper_state refused: paper_trade is False. "
+                "Live guardrail state must not be auto-reset; this would hide a "
+                "real drawdown."
+            )
+        if current_portfolio_value_usdc <= 0:
+            raise ValueError("current portfolio value must be positive to recalibrate")
+
+        before = {
+            "portfolio_ath": self._all_time_high_usdc,
+            "kill_switch": self._kill_switch,
+            "drawdown_pct": self._drawdown_pct(current_portfolio_value_usdc),
+        }
+        self._all_time_high_usdc = float(current_portfolio_value_usdc)
+        self._kill_switch = False
+        if self._state == RiskState.KILL_SWITCH:
+            self._state = RiskState.NORMAL
+        self._save_state()
+        return {
+            "before": before,
+            "after": {
+                "portfolio_ath": self._all_time_high_usdc,
+                "kill_switch": self._kill_switch,
+                "drawdown_pct": 0.0,
+            },
+        }
+
     def seconds_until_trading_resumes(self) -> int:
         """Return seconds remaining in the daily-loss pause window."""
 
