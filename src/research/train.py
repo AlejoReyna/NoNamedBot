@@ -1,0 +1,214 @@
+"""Train entry-quality models with walk-forward validation."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+from src.ml.model_store import ModelArtifact, save_artifact
+from src.research.dataset import assert_no_leakage, build_dataset, feature_columns
+
+
+@dataclass(frozen=True)
+class EvaluationResult:
+    model_name: str
+    folds: int
+    mean_auc: float
+    mean_accuracy: float
+    rule_pnl_usdc: float
+    model_pnl_usdc: float
+    selected_trades: int
+
+
+def _git_sha() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def _candidate_models() -> dict[str, Any]:
+    models: dict[str, Any] = {
+        "logreg": make_pipeline(
+            StandardScaler(),
+            LogisticRegression(max_iter=1000, class_weight="balanced", random_state=42),
+        )
+    }
+    try:
+        from lightgbm import LGBMClassifier
+
+        models["lgb"] = LGBMClassifier(
+            objective="binary",
+            n_estimators=250,
+            learning_rate=0.03,
+            num_leaves=31,
+            min_child_samples=10,
+            n_jobs=2,
+            random_state=42,
+            verbose=-1,
+        )
+    except ImportError:
+        pass
+    return models
+
+
+def _predict_probability(model: Any, x_test: pd.DataFrame) -> list[float]:
+    if hasattr(model, "predict_proba"):
+        return [float(value) for value in model.predict_proba(x_test)[:, 1]]
+    preds = model.predict(x_test)
+    return [float(value) for value in preds]
+
+
+def evaluate_walk_forward(
+    frame: pd.DataFrame,
+    model: Any,
+    features: list[str],
+    *,
+    threshold: float = 0.55,
+    splits: int = 3,
+) -> EvaluationResult:
+    """Evaluate model against the rule baseline on held-out time slices."""
+
+    assert_no_leakage(features)
+    x = frame[features].fillna(0.0)
+    y = frame["entry_win"].astype(int)
+    pnl = pd.to_numeric(frame["realized_pnl_usdc"], errors="coerce").fillna(0.0)
+    max_splits = max(2, min(splits, len(frame) - 1))
+    splitter = TimeSeriesSplit(n_splits=max_splits)
+    aucs: list[float] = []
+    accuracies: list[float] = []
+    rule_pnl = 0.0
+    model_pnl = 0.0
+    selected = 0
+
+    for train_idx, test_idx in splitter.split(x):
+        y_train = y.iloc[train_idx]
+        y_test = y.iloc[test_idx]
+        if y_train.nunique() < 2:
+            continue
+        fitted = model.fit(x.iloc[train_idx], y_train)
+        probabilities = _predict_probability(fitted, x.iloc[test_idx])
+        predictions = [1 if prob >= threshold else 0 for prob in probabilities]
+        if y_test.nunique() >= 2:
+            aucs.append(float(roc_auc_score(y_test, probabilities)))
+        accuracies.append(float(accuracy_score(y_test, predictions)))
+        fold_pnl = pnl.iloc[test_idx].reset_index(drop=True)
+        rule_pnl += float(fold_pnl.sum())
+        for pred, trade_pnl in zip(predictions, fold_pnl):
+            if pred:
+                selected += 1
+                model_pnl += float(trade_pnl)
+
+    return EvaluationResult(
+        model_name=type(model).__name__,
+        folds=len(accuracies),
+        mean_auc=float(sum(aucs) / len(aucs)) if aucs else 0.0,
+        mean_accuracy=float(sum(accuracies) / len(accuracies)) if accuracies else 0.0,
+        rule_pnl_usdc=rule_pnl,
+        model_pnl_usdc=model_pnl,
+        selected_trades=selected,
+    )
+
+
+def train_entry_quality_model(
+    *,
+    trade_outcomes_path: str | Path = "logs/trade_outcomes.jsonl",
+    cmc_db_path: str | Path = "data/cmc_premium.db",
+    output_path: str | Path = "models/entry_quality_v1.pkl",
+    model_card_path: str | Path | None = None,
+    threshold: float = 0.55,
+) -> dict[str, Any]:
+    """Build the dataset, evaluate candidates, and export the best artifact."""
+
+    frame = build_dataset(trade_outcomes_path, cmc_db_path)
+    if frame.empty:
+        raise ValueError("no closed trades available for training")
+    features = feature_columns(frame)
+    assert_no_leakage(features)
+    if not features:
+        raise ValueError("no numeric entry-time features available")
+    if frame["entry_win"].nunique() < 2:
+        raise ValueError("entry_win has a single class; collect more closed trades before training")
+
+    models = _candidate_models()
+    evaluations: dict[str, EvaluationResult] = {}
+    for name, model in models.items():
+        evaluations[name] = evaluate_walk_forward(frame, model, features, threshold=threshold)
+
+    best_name = max(
+        evaluations,
+        key=lambda name: (evaluations[name].model_pnl_usdc - evaluations[name].rule_pnl_usdc, evaluations[name].mean_auc),
+    )
+    final_model = models[best_name].fit(frame[features].fillna(0.0), frame["entry_win"].astype(int))
+    best = evaluations[best_name]
+    metrics = {
+        "mean_auc": best.mean_auc,
+        "mean_accuracy": best.mean_accuracy,
+        "rule_pnl_usdc": best.rule_pnl_usdc,
+        "model_pnl_usdc": best.model_pnl_usdc,
+        "pnl_delta_usdc": best.model_pnl_usdc - best.rule_pnl_usdc,
+        "selected_trades": float(best.selected_trades),
+        "training_rows": float(len(frame)),
+    }
+
+    artifact = ModelArtifact(
+        model=final_model,
+        feature_names=features,
+        version="entry_quality_v1",
+        trained_at=datetime.now(timezone.utc).isoformat(),
+        metrics=metrics,
+        model_type=best_name,
+    )
+    save_artifact(output_path, artifact)
+
+    card = {
+        "version": artifact.version,
+        "trained_at": artifact.trained_at,
+        "git_sha": _git_sha(),
+        "target": "entry_win_after_fees",
+        "threshold": threshold,
+        "features": features,
+        "metrics": metrics,
+        "all_evaluations": {name: result.__dict__ for name, result in evaluations.items()},
+        "promotion_gate": {
+            "passed": metrics["pnl_delta_usdc"] > 0.0 and metrics["mean_auc"] >= 0.5,
+            "rule_baseline": "all rule-engine entries in held-out walk-forward folds",
+        },
+    }
+    card_path = Path(model_card_path) if model_card_path else Path(output_path).with_suffix(".model_card.json")
+    card_path.parent.mkdir(parents=True, exist_ok=True)
+    card_path.write_text(json.dumps(card, indent=2, sort_keys=True), encoding="utf-8")
+    return card
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--trade-outcomes", default="logs/trade_outcomes.jsonl")
+    parser.add_argument("--cmc-db", default="data/cmc_premium.db")
+    parser.add_argument("--output", default="models/entry_quality_v1.pkl")
+    parser.add_argument("--threshold", type=float, default=0.55)
+    args = parser.parse_args()
+    card = train_entry_quality_model(
+        trade_outcomes_path=args.trade_outcomes,
+        cmc_db_path=args.cmc_db,
+        output_path=args.output,
+        threshold=args.threshold,
+    )
+    print(json.dumps({"output": args.output, "metrics": card["metrics"], "gate": card["promotion_gate"]}, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

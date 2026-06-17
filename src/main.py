@@ -971,7 +971,9 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
         )
         if shadow_logger is not None:
             try:
-                shadow_logger.log_all_variants(cycle_number, market_snapshot, regime_result)
+                shadow_logger.log_all_variants(
+                    cycle_number, market_snapshot, regime_result, candidate=candidate
+                )
             except Exception as exc:
                 LOGGER.warning("Shadow logging failed: %s", exc)
 
@@ -1006,8 +1008,17 @@ def _build_shadow_logger(price_cache: PriceCache, settings: Settings) -> Any | N
         from src.research.shadow_decisions import ShadowDecisionsLogger
         from src.strategy.jump_model_detector import JumpModelDetector
 
+        model_predictor = None
+        if getattr(settings, "enable_model_shadow", False):
+            from src.strategy.model_predictor import ModelPredictor
+
+            model_predictor = ModelPredictor(
+                getattr(settings, "model_shadow_path", "models/entry_quality_v1.pkl"),
+                threshold=getattr(settings, "model_shadow_threshold", 0.55),
+            )
         return ShadowDecisionsLogger(
             jump_model=JumpModelDetector(price_cache),
+            model_predictor=model_predictor,
             settings=settings,
             decision_log_path="logs/decision_shadow.jsonl",
         )

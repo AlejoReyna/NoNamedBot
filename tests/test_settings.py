@@ -191,3 +191,23 @@ def test_min_entry_factors_is_bounded_to_core_factor_count() -> None:
 
     with pytest.raises(ValidationError):
         Settings(min_entry_factors=5)
+
+
+def test_load_settings_reads_model_shadow_flags(monkeypatch: object, tmp_path: Path) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "ENABLE_MODEL_SHADOW=true\n"
+        "MODEL_SHADOW_PATH=models/custom.pkl\n"
+        "MODEL_SHADOW_THRESHOLD=0.61\n"
+        "ML_UNIVERSE_SYMBOLS=bnb,cake\n",
+        encoding="utf-8",
+    )
+    for name in ("ENABLE_MODEL_SHADOW", "MODEL_SHADOW_PATH", "MODEL_SHADOW_THRESHOLD", "ML_UNIVERSE_SYMBOLS"):
+        monkeypatch.delenv(name, raising=False)  # type: ignore[attr-defined]
+
+    settings = load_settings(str(env_path))
+
+    assert settings.enable_model_shadow is True
+    assert settings.model_shadow_path == "models/custom.pkl"
+    assert settings.model_shadow_threshold == 0.61
+    assert settings.ml_universe_symbols == ["BNB", "CAKE"]
