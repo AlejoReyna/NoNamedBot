@@ -2213,8 +2213,16 @@ def _extract_from_balance_items(items: list[Any], symbol: str) -> float | None:
     return None
 
 
+# Sell at most this fraction of the read balance so the swap amount stays under
+# the true on-chain spendable balance (absorbs decimal truncation / stale reads).
+EXIT_BALANCE_SAFETY_FACTOR = 0.999
+# Balances at or below this are dust/phantom (e.g. 1e-18 = one base unit); treat
+# as zero so the stale position is removed rather than swapped.
+EXIT_DUST_FLOOR = 1e-12
+
+
 def _exit_amount_from_live_balance(position: Position, toolkit: BnbToolkitWrapper | None) -> float:
-    """Use at most the current wallet balance when selling a persisted position."""
+    """Use at most (a safety fraction of) the current wallet balance when selling."""
 
     position_amount = max(0.0, float(position.amount_tokens))
     if toolkit is None:
@@ -2231,17 +2239,25 @@ def _exit_amount_from_live_balance(position: Position, toolkit: BnbToolkitWrappe
         return position_amount
 
     wallet_amount = max(0.0, _extract_symbol_balance(balance_response, position.symbol))
-    if wallet_amount <= 0:
+    # Treat sub-dust balances as zero so the caller removes the stale position
+    # instead of attempting a doomed swap (e.g. ATOM at 1e-18 -> 400 Bad Request).
+    if wallet_amount <= EXIT_DUST_FLOOR:
         return 0.0
+    # Sell slightly under the read balance. The on-chain spendable amount is
+    # often a hair less than the read (decimal truncation to raw token units, or
+    # a marginally stale balance), so selling the exact read value reverts with
+    # "transfer amount exceeds balance". The haircut guarantees amount <= balance;
+    # the dust left behind is negligible. Applies to emergency AND normal exits.
+    sellable = min(position_amount, wallet_amount) * EXIT_BALANCE_SAFETY_FACTOR
     if wallet_amount < position_amount:
         LOGGER.warning(
-            "Reducing %s exit amount from persisted %.12g to live wallet balance %.12g",
+            "Reducing %s exit amount from persisted %.12g to live wallet balance %.12g (x%.4f safety)",
             position.symbol,
             position_amount,
             wallet_amount,
+            EXIT_BALANCE_SAFETY_FACTOR,
         )
-        return wallet_amount
-    return position_amount
+    return sellable
 
 
 def _process_position_exits(
