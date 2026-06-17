@@ -64,11 +64,20 @@ def record_entry(
     estimated_slippage_pct: float | None = None,
     entry_tx_hash: str | None = None,
     trade_id: str | None = None,
+    # Market context logged for richer ML features (all optional / backward-compat)
+    atr_pct: float | None = None,
+    regime: str | None = None,
+    bnb_1h_pct: float | None = None,
+    bnb_24h_pct: float | None = None,
 ) -> str:
     """Record the factors an entry was taken on. Returns the ``trade_id``.
 
     Pass ``trade_id`` (e.g. one stamped onto the persisted Position) to keep the
     entry/exit join stable across restarts; otherwise a fresh id is generated.
+
+    The optional market-context params (atr_pct, regime, bnb_*) are logged
+    alongside the factor scores so the ML dataset has richer entry-time signal
+    without any leakage risk — all values are available before the swap executes.
     """
 
     symbol_key = str(symbol).upper()
@@ -91,6 +100,10 @@ def record_entry(
             "factor_scores": factor_scores or {},
             "estimated_slippage_pct": estimated_slippage_pct,
             "entry_tx_hash": entry_tx_hash,
+            "atr_pct": atr_pct,
+            "regime": regime,
+            "bnb_1h_pct": bnb_1h_pct,
+            "bnb_24h_pct": bnb_24h_pct,
         },
     )
     return trade_id

@@ -863,6 +863,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                         risk_decision,
                         candidate,
                         portfolio_value,
+                        market_snapshot=market_snapshot,
                     )
                     liquidity = attempt.liquidity
                     entry_position_pct = attempt.position_pct
@@ -1368,6 +1369,7 @@ def _attempt_entry_v25(
     risk_decision: RiskDecision,
     candidate: EntryCandidate,
     portfolio_value: float,
+    market_snapshot: dict | None = None,
 ) -> EntryAttempt:
     if position_manager.get_position(candidate.symbol) is not None:
         return EntryAttempt(False, "position already open", 0.0, None)
@@ -1471,6 +1473,8 @@ def _attempt_entry_v25(
         trade_id=trade_id,
     )
     try:
+        _bnb = (market_snapshot or {}).get("BNB") or {}
+        _bnb = _bnb if isinstance(_bnb, dict) else {}
         trade_outcome_log.record_entry(
             getattr(settings, "trade_outcome_log_path", trade_outcome_log.DEFAULT_PATH),
             symbol=candidate.symbol,
@@ -1482,6 +1486,10 @@ def _attempt_entry_v25(
             estimated_slippage_pct=candidate.slippage_normal,
             entry_tx_hash=_execution_tx_hash(swap_result),
             trade_id=trade_id,
+            atr_pct=atr_pct,
+            regime=getattr(regime_result.regime, "value", str(regime_result.regime)),
+            bnb_1h_pct=_maybe_number(_bnb.get("percent_change_1h")),
+            bnb_24h_pct=_maybe_number(_bnb.get("percent_change_24h")),
         )
     except Exception as exc:  # logging must never block an entry
         LOGGER.debug("Could not record trade entry outcome (v25): %s", exc)
