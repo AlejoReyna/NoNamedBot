@@ -64,7 +64,7 @@ def _candidate_models() -> dict[str, Any]:
     return models
 
 
-def _predict_probability(model: Any, x_test: pd.DataFrame) -> list[float]:
+def _predict_probability(model: Any, x_test: Any) -> list[float]:
     if hasattr(model, "predict_proba"):
         return [float(value) for value in model.predict_proba(x_test)[:, 1]]
     preds = model.predict(x_test)
@@ -82,7 +82,11 @@ def evaluate_walk_forward(
     """Evaluate model against the rule baseline on held-out time slices."""
 
     assert_no_leakage(features)
-    x = frame[features].fillna(0.0)
+    # Fit/predict on positional arrays (not named DataFrames) so the estimator is
+    # feature-name-agnostic and matches exactly how the live ModelPredictor scores
+    # it (an ordered list keyed by artifact.feature_names). This keeps train and
+    # serve identical and avoids sklearn's feature-name mismatch warning.
+    x = frame[features].fillna(0.0).to_numpy()
     y = frame["entry_win"].astype(int)
     pnl = pd.to_numeric(frame["realized_pnl_usdc"], errors="coerce").fillna(0.0)
     max_splits = max(2, min(splits, len(frame) - 1))
@@ -98,8 +102,8 @@ def evaluate_walk_forward(
         y_test = y.iloc[test_idx]
         if y_train.nunique() < 2:
             continue
-        fitted = model.fit(x.iloc[train_idx], y_train)
-        probabilities = _predict_probability(fitted, x.iloc[test_idx])
+        fitted = model.fit(x[train_idx], y_train)
+        probabilities = _predict_probability(fitted, x[test_idx])
         predictions = [1 if prob >= threshold else 0 for prob in probabilities]
         if y_test.nunique() >= 2:
             aucs.append(float(roc_auc_score(y_test, probabilities)))
@@ -122,6 +126,28 @@ def evaluate_walk_forward(
     )
 
 
+def _build_promotion_gate(
+    metrics: dict[str, float], min_selected_trades: int, min_training_rows: int
+) -> dict[str, Any]:
+    """Pass only when the model beats the rule baseline AND traded enough to mean it."""
+
+    checks = {
+        "beats_rule_pnl": metrics["pnl_delta_usdc"] > 0.0,
+        "auc_above_chance": metrics["mean_auc"] >= 0.5,
+        "enough_selected_trades": metrics["selected_trades"] >= min_selected_trades,
+        "enough_training_rows": metrics["training_rows"] >= min_training_rows,
+    }
+    return {
+        "passed": all(checks.values()),
+        "checks": checks,
+        "thresholds": {
+            "min_selected_trades": min_selected_trades,
+            "min_training_rows": min_training_rows,
+        },
+        "rule_baseline": "all rule-engine entries in held-out walk-forward folds",
+    }
+
+
 def train_entry_quality_model(
     *,
     trade_outcomes_path: str | Path = "logs/trade_outcomes.jsonl",
@@ -129,8 +155,17 @@ def train_entry_quality_model(
     output_path: str | Path = "models/entry_quality_v1.pkl",
     model_card_path: str | Path | None = None,
     threshold: float = 0.55,
+    min_selected_trades: int = 10,
+    min_training_rows: int = 30,
 ) -> dict[str, Any]:
-    """Build the dataset, evaluate candidates, and export the best artifact."""
+    """Build the dataset, evaluate candidates, and export the best artifact.
+
+    ``min_selected_trades`` / ``min_training_rows`` guard the promotion gate: a
+    model that vetoes (almost) everything trivially shows ``model_pnl > rule_pnl``
+    in a losing window by trading nothing, and a model trained on a handful of
+    rows is noise. The gate only passes when the model actually selects enough
+    trades and was trained on enough data — not just on a positive PnL delta.
+    """
 
     frame = build_dataset(trade_outcomes_path, cmc_db_path)
     if frame.empty:
@@ -151,7 +186,9 @@ def train_entry_quality_model(
         evaluations,
         key=lambda name: (evaluations[name].model_pnl_usdc - evaluations[name].rule_pnl_usdc, evaluations[name].mean_auc),
     )
-    final_model = models[best_name].fit(frame[features].fillna(0.0), frame["entry_win"].astype(int))
+    final_model = models[best_name].fit(
+        frame[features].fillna(0.0).to_numpy(), frame["entry_win"].astype(int)
+    )
     best = evaluations[best_name]
     metrics = {
         "mean_auc": best.mean_auc,
@@ -182,10 +219,7 @@ def train_entry_quality_model(
         "features": features,
         "metrics": metrics,
         "all_evaluations": {name: result.__dict__ for name, result in evaluations.items()},
-        "promotion_gate": {
-            "passed": metrics["pnl_delta_usdc"] > 0.0 and metrics["mean_auc"] >= 0.5,
-            "rule_baseline": "all rule-engine entries in held-out walk-forward folds",
-        },
+        "promotion_gate": _build_promotion_gate(metrics, min_selected_trades, min_training_rows),
     }
     card_path = Path(model_card_path) if model_card_path else Path(output_path).with_suffix(".model_card.json")
     card_path.parent.mkdir(parents=True, exist_ok=True)
@@ -199,12 +233,16 @@ def main() -> int:
     parser.add_argument("--cmc-db", default="data/cmc_premium.db")
     parser.add_argument("--output", default="models/entry_quality_v1.pkl")
     parser.add_argument("--threshold", type=float, default=0.55)
+    parser.add_argument("--min-selected-trades", type=int, default=10)
+    parser.add_argument("--min-training-rows", type=int, default=30)
     args = parser.parse_args()
     card = train_entry_quality_model(
         trade_outcomes_path=args.trade_outcomes,
         cmc_db_path=args.cmc_db,
         output_path=args.output,
         threshold=args.threshold,
+        min_selected_trades=args.min_selected_trades,
+        min_training_rows=args.min_training_rows,
     )
     print(json.dumps({"output": args.output, "metrics": card["metrics"], "gate": card["promotion_gate"]}, indent=2))
     return 0
