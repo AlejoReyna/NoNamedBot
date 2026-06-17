@@ -2029,6 +2029,11 @@ def _ensure_bnb_reference(snapshot: dict[str, dict[str, Any]], cmc_client: CMCMC
         payload = cmc_client._fetch_keyless(
             "get_crypto_quotes_latest", {"id": "1839"}  # id-only: ticker lookups can hit knockoffs
         )
+        # Keyless quotes nest price/percent_change under quote.USD; flatten to the
+        # top level (same as the paid path) so the field reads below resolve.
+        # Without this every BNB field is None, the regime detector scores 0.0,
+        # and the bot is stuck in permanent risk_off and never enters.
+        payload = cmc_client._normalize_keyless_quotes_payload(payload)
         by_symbol = cmc_client._by_symbol(payload)
         bnb = by_symbol.get("BNB")
         if isinstance(bnb, dict):
