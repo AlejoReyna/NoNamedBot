@@ -585,8 +585,15 @@ class CMCMCPClient:
                 "high_24h": self._first_number_from_many(combined, ("high_24h", "high_24h_price")),
                 "low_24h": self._first_number_from_many(combined, ("low_24h", "low_24h_price")),
                 "bnb_1h_trend_pct": bnb_trend,
-                "rsi": self._first_number_from_many(combined, ("rsi", "rsi_14", "technical.rsi")),
-                "macd": self._first_number_from_many(combined, ("macd", "technical.macd")),
+                # The x402 technicals tool nests RSI as rsi.{rsi7,rsi14,rsi21}
+                # and MACD as macd.macdLine; rsi14 is the standard 14-period
+                # value. Keep the flat aliases for any other source.
+                "rsi": self._first_number_from_many(
+                    combined, ("rsi.rsi14", "rsi_14", "rsi14", "rsi", "technical.rsi")
+                ),
+                "macd": self._first_number_from_many(
+                    combined, ("macd.macdLine", "macd", "technical.macd")
+                ),
                 "estimated_slippage_pct": self._resolve_estimated_slippage_pct(
                     combined=combined,
                     volume_24h=volume_24h,
@@ -972,24 +979,32 @@ class CMCMCPClient:
         for key in keys:
             found = cls._read_path(payload, key)
             if found is not None:
-                try:
-                    val = float(found)
-                    if skip_zero and val == 0:
-                        continue
+                val = cls._coerce_number(found)
+                if val is not None and not (skip_zero and val == 0):
                     return val
-                except (TypeError, ValueError):
-                    continue
         for key in keys:
             found = cls._recursive_lookup(payload, key.split(".")[-1])
             if found is not None:
-                try:
-                    val = float(found)
-                    if skip_zero and val == 0:
-                        continue
+                val = cls._coerce_number(found)
+                if val is not None and not (skip_zero and val == 0):
                     return val
-                except (TypeError, ValueError):
-                    continue
         return default
+
+    @staticmethod
+    def _coerce_number(found: Any) -> float | None:
+        """Best-effort float, tolerating CMC's comma-grouped string numbers.
+
+        The x402 technical-analysis tool returns values like "1,706.82" (and
+        RSI as "44.87"); a bare float() raises on the thousands separator, which
+        previously dropped every technical reading.
+        """
+
+        if isinstance(found, str):
+            found = found.replace(",", "").strip()
+        try:
+            return float(found)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _read_path(payload: dict[str, Any], path: str) -> Any:
