@@ -84,6 +84,7 @@ jobs:
           cd "$DEPLOY_PATH"
 
           if [ "$RESTART_ONLY" != "true" ]; then
+            git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
             git fetch origin
             git checkout main
             git pull --ff-only
