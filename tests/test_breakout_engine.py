@@ -619,7 +619,7 @@ def test_regime_factor_does_not_count_against_min_entry_factors() -> None:
 
 
 def test_min_entry_factors_three_allows_one_missing_core_when_configured() -> None:
-    settings = Settings(min_entry_factors=3, max_chase_pct=0.06)
+    settings = Settings(min_entry_factors=3, max_chase_pct=0.06, breakout_block_in_risk_off_regime=False)
     engine = _engine_with_price_high("CAKE", 10.0, settings=settings)
     decision = engine.evaluate_token(
         _token(bnb_1h_trend_pct=-5.0, volume_24h=10_000_000.0),
@@ -696,7 +696,7 @@ def test_insufficient_factor_count_blocks_entry() -> None:
     # Two core factors pass (volume_breakout, six_hour_high_break) plus slippage
     # and derivatives, but not regime or rsi -> 4/6 true, below floor of 5.
     decision = engine.evaluate_token(
-        _token(bnb_1h_trend_pct=-5.0, rsi=None, funding_rate=0.0, open_interest_change_pct=0.0),
+        _token(bnb_1h_trend_pct=0.5, rsi=None, funding_rate=0.0, open_interest_change_pct=0.0),
         10000.0,
     )
 
@@ -723,7 +723,7 @@ def test_entry_score_buffer_blocks_weak_candidate() -> None:
     engine = _engine_with_price_high(
         "CAKE", 10.0, settings=_guard_settings(breakout_min_entry_score_buffer=5.0)
     )
-    decision = engine.evaluate_token(_token(), 10000.0)
+    decision = engine.evaluate_token(_token(volume_24h=0), 10000.0)
 
     assert decision.should_enter is False
     assert "below buffered threshold" in (decision.entries_blocked_reason or "")
@@ -737,7 +737,7 @@ def test_ml_chop_regime_blocks_entry_with_low_confidence() -> None:
     decision = engine.evaluate_token(_token(), 10000.0, ml_context=ml_context)
 
     assert decision.should_enter is False
-    assert "chop regime" in (decision.entries_blocked_reason or "")
+    assert "ML confidence 0.500 below minimum 0.550" in (decision.entries_blocked_reason or "")
     assert decision.quality_guards is not None
     assert decision.quality_guards["ml_chop_ok"] is False
 

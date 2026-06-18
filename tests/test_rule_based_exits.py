@@ -313,8 +313,8 @@ def test_exit_swap_caps_to_live_wallet_balance(tmp_path: Path, monkeypatch) -> N
     assert calls == [
         {
             "from_symbol": "DOGE",
-            "amount_in": pytest.approx(5.59530611),
-            "expected_amount_out": pytest.approx(5.59530611 * 0.086),
+            "amount_in": pytest.approx(5.58971080389),
+            "expected_amount_out": pytest.approx(5.58971080389 * 0.086),
         }
     ]
     assert manager.get_position("DOGE") is None

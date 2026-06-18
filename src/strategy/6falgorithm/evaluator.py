@@ -83,26 +83,24 @@ def evaluate_universe_breakout(
     if selected is None:
         selected = passers[0]
 
+    ml_context = getattr(selected, "ml_context", None)
+    ml_audit = _build_ml_audit(
+        ml_bundle=ml_bundle,
+        ml_context=ml_context,
+        selected=selected,
+        passers=passers,
+        ranking_audit=ranking_audit,
+    )
     candidate = breakout_decision_to_candidate(
         selected,
         snapshot,
         portfolio_value,
         settings,
         risk_decision,
+        ml_audit=ml_audit,
     )
     if candidate is None:
         return None
-
-    ml_context = getattr(selected, "ml_context", None)
-    candidate = candidate.with_ml_audit(
-        _build_ml_audit(
-            ml_bundle=ml_bundle,
-            ml_context=ml_context,
-            selected=selected,
-            passers=passers,
-            ranking_audit=ranking_audit,
-        )
-    )
     return candidate
 
 
