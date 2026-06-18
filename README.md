@@ -354,6 +354,30 @@ See `src/config/settings.py` and `.env.example` for the complete list.
 
 ---
 
+## Breakout Engine Scoring v2.0
+
+The v2.0 scoring upgrade introduces a **regime-aware, continuous-factor** entry model with tighter guardrails and full A/B telemetry.
+
+- **Regime-adjusted weights** shift emphasis between volume, momentum, and breakout strength based on the token's ATR ratio (`high vol` → momentum ↑, `low vol` → volume ↑).
+- **Graded RSI** replaces the old binary band with a continuous curve peaking at 65, zeroing at 45 and 85.
+- **Continuous derivatives** score funding and open-interest jointly; missing data scores neutral (`0.5`) until a real Binance feed is wired.
+
+### Key changes at a glance
+
+- **Tighter entry threshold:** `BREAKOUT_ENTRY_SCORE_MIN` raised from `45.0` to `50.0` to reduce false positives.
+- **Hard regime block:** `BREAKOUT_BLOCK_IN_RISK_OFF_REGIME` is now `true` — entries are blocked outright in risk-off markets (not just sized down).
+- **Full factor-matrix telemetry:** `FACTOR_MATRIX_LOG_ENABLED` is now `true` by default, writing one JSONL row per symbol per cycle for offline A/B testing and model training.
+
+### Documentation
+
+| Document | What you'll find |
+| --- | --- |
+| [`docs/BREAKOUT_ENGINE_MIGRATION.md`](docs/BREAKOUT_ENGINE_MIGRATION.md) | Full migration guide: 4 P0 bugs, 5 P1 improvements, A/B protocol, rollback plan, deployment checklist |
+| [`docs/BREAKOUT_ENGINE_SCORING.md`](docs/BREAKOUT_ENGINE_SCORING.md) | The new scoring formula: six continuous factors, regime-adjusted weights, graded RSI, sentiment modifiers |
+| [`docs/ENV_TEMPLATE.md`](docs/ENV_TEMPLATE.md) | All new/changed env vars with one-line descriptions, example values, and which improvement/bug they belong to |
+
+---
+
 ## Known gaps
 
 - [ ] Autonomous loop has not yet persisted a **funded micro-live** swap end-to-end (manual TWAK swap is proven).
