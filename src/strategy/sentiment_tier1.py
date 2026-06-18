@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass(frozen=True)
@@ -43,11 +43,15 @@ class SentimentTier1:
         cmc_keyless_base: str = "https://pro-api.coinmarketcap.com/trial-pro-api",
         bsc_rpc_url: str = "",
         cache_ttl_seconds: int = 300,
+        cmc_mcp_client: Any | None = None,
+        sentiment_tier2: Any | None = None,
     ) -> None:
         self.cmc_base = cmc_keyless_base.rstrip("/")
         self.bsc_rpc = bsc_rpc_url
         self.cache_ttl = max(0, int(cache_ttl_seconds))
         self._cache: dict[str, tuple[float, dict]] = {}
+        self.cmc_mcp_client = cmc_mcp_client
+        self.sentiment_tier2 = sentiment_tier2
 
     def _fetch_json(self, endpoint: str) -> Optional[dict]:
         """Fetch JSON with a per-endpoint in-memory TTL cache."""
@@ -124,6 +128,28 @@ class SentimentTier1:
             "liquidations_24h": self._optional_float(payload.get("liquidations_24h")),
         }
 
+    def get_network_activity(self, symbol: str) -> float | None:
+        """Return BSC transfer log count as a network activity proxy.
+
+        Fail-safe: returns None if the tier2 client is unavailable or the call fails.
+        """
+
+        if not self.sentiment_tier2:
+            return None
+        try:
+            from src.config.tokens import get_bsc_token_address
+
+            address = get_bsc_token_address(symbol)
+        except Exception:
+            return None
+        try:
+            count = self.sentiment_tier2.log_bsc_transfer_count(address)
+            if count is None:
+                return None
+            return float(count)
+        except Exception:
+            return None
+
     def compute_sentiment(self) -> SentimentResult:
         """Compute a clamped soft delta for the regime score."""
 
@@ -175,6 +201,86 @@ class SentimentTier1:
             sentiment_delta=max(-2.5, min(1.0, delta)),
             regime_fragility=fragility,
         )
+
+    def get_token_sentiment(self, symbol: str) -> dict[str, Any]:
+        """Return per-token sentiment from CMC MCP news and narratives.
+
+        Best-effort: if the CMC MCP client is unavailable or the call fails,
+        returns an empty dict (caller should treat as neutral).
+        """
+
+        result: dict[str, Any] = {}
+        if not self.cmc_mcp_client:
+            return result
+        normalized = symbol.upper()
+        try:
+            news_payload = self.cmc_mcp_client.get_crypto_latest_news([normalized])
+            narratives_payload = self.cmc_mcp_client.get_trending_crypto_narratives([normalized])
+        except Exception:
+            return result
+
+        news_items = self._extract_items(news_payload)
+        narratives_items = self._extract_items(narratives_payload)
+
+        # Simple keyword-based sentiment from news titles
+        news_bearish = 0
+        news_bullish = 0
+        for item in news_items:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("title") or item.get("headline") or "").lower()
+            if not text:
+                continue
+            for word in ("crash", "dump", "bearish", "sell", "fall", "decline", "drop", "plunge"):
+                if word in text:
+                    news_bearish += 1
+            for word in ("bullish", "pump", "breakout", "rally", "surge", "moon", "buy"):
+                if word in text:
+                    news_bullish += 1
+
+        # Simple narrative sentiment
+        kol_bullish = 0
+        kol_bearish = 0
+        for item in narratives_items:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("title") or item.get("narrative") or item.get("description") or "").lower()
+            if not text:
+                continue
+            for word in ("bullish", "pump", "breakout", "rally", "surge", "moon", "long"):
+                if word in text:
+                    kol_bullish += 1
+            for word in ("bearish", "dump", "crash", "short", "correction", "fall"):
+                if word in text:
+                    kol_bearish += 1
+
+        result["news_bearish_last_4h"] = news_bearish > news_bullish and news_bearish > 0
+        result["kol_bullish"] = kol_bullish > kol_bearish and kol_bullish > 0
+        result["funding_neutral"] = self._is_funding_neutral()
+        return result
+
+    def _is_funding_neutral(self) -> bool:
+        """Return True if the current funding rate is within a neutral band."""
+
+        derivatives = self.get_derivatives_metrics()
+        if not derivatives:
+            return True
+        funding = derivatives.get("funding_rate_avg")
+        if funding is None:
+            return True
+        return -0.0005 <= funding <= 0.001
+
+    @staticmethod
+    def _extract_items(payload: dict[str, Any]) -> list[Any]:
+        if not isinstance(payload, dict):
+            return []
+        for key in ("data", "items", "results", "news", "narratives"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                return list(value.values())
+        return []
 
     @staticmethod
     def _first_record(value: object) -> dict | None:

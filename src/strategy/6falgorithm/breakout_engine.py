@@ -174,9 +174,11 @@ class BreakoutEngine:
         self,
         settings: Settings,
         twak_interface: TWAKInterface | None = None,
+        sentiment_tier1: Any | None = None,
     ) -> None:
         self.settings = settings
         self.twak_interface = twak_interface or TWAKInterface()
+        self.sentiment_tier1 = sentiment_tier1
         self.price_cache = LocalCache("price_cache.json")
         self.volume_cache = LocalCache("volume_cache.json")
         self.macro_cache = LocalCache("macro_cache.json")
@@ -234,7 +236,13 @@ class BreakoutEngine:
             )
 
         candidate = self._evaluate_cheap_candidate(token_data, portfolio_value_usdc)
-        entry_score = self._entry_score(candidate, momentum_z_score=0.0)
+        token_sentiment: dict[str, Any] = {}
+        if self.sentiment_tier1 is not None:
+            try:
+                token_sentiment = self.sentiment_tier1.get_token_sentiment(candidate.symbol)
+            except Exception:
+                token_sentiment = {}
+        entry_score = self._entry_score(candidate, momentum_z_score=0.0, token_sentiment=token_sentiment)
         estimated_slippage: float | None = None
         quote_state = "not_quoted"
         if self._should_quote_candidate(candidate, entry_score):
@@ -367,10 +375,11 @@ class BreakoutEngine:
         entry_score: float | None = None,
         slippage_quote_state: str = "not_quoted",
         ml_context: Any | None = None,
+        token_sentiment: dict[str, Any] | None = None,
     ) -> BreakoutDecision:
         """Build a full decision after optional TWAK slippage evaluation."""
 
-        resolved_score = self._entry_score(candidate, momentum_z_score=0.0) if entry_score is None else entry_score
+        resolved_score = self._entry_score(candidate, momentum_z_score=0.0, token_sentiment=token_sentiment) if entry_score is None else entry_score
         slippage_under_cap = (
             estimated_slippage is not None
             and estimated_slippage >= 0
@@ -633,10 +642,21 @@ class BreakoutEngine:
             )
             candidates.append(candidate)
 
+        # Fetch token sentiments in batch for candidates
+        token_sentiments: dict[str, dict[str, Any]] = {}
+        if self.sentiment_tier1 is not None:
+            for candidate in candidates:
+                try:
+                    token_sentiments[candidate.symbol] = self.sentiment_tier1.get_token_sentiment(candidate.symbol)
+                except Exception:
+                    token_sentiments[candidate.symbol] = {}
+
+        for candidate in candidates:
             unquoted_decision = self._decision_from_candidate(
                 candidate,
                 estimated_slippage=None,
                 ml_context=ml_contexts.get(candidate.symbol),
+                token_sentiment=token_sentiments.get(candidate.symbol, {}),
             )
             if self._is_better_decision(unquoted_decision, candidate.volume_24h, best_decision, best_volume):
                 best_decision = unquoted_decision
@@ -647,6 +667,7 @@ class BreakoutEngine:
             candidate.symbol: self._entry_score(
                 candidate,
                 momentum_z_score=momentum_scores.get(candidate.symbol, 0.0),
+                token_sentiment=token_sentiments.get(candidate.symbol, {}),
             )
             for candidate in candidates
         }
@@ -659,6 +680,7 @@ class BreakoutEngine:
                     estimated_slippage=None,
                     entry_score=scores_by_symbol.get(best_symbol),
                     ml_context=ml_contexts.get(best_symbol),
+                    token_sentiment=token_sentiments.get(best_symbol, {}),
                 )
         quote_candidates = sorted(
             (
@@ -684,6 +706,7 @@ class BreakoutEngine:
                 scores_by_symbol.get(candidate.symbol, 0.0),
                 slippage_quote_state=quote_state,
                 ml_context=ml_contexts.get(candidate.symbol),
+                token_sentiment=token_sentiments.get(candidate.symbol, {}),
             )
             if decision.should_enter:
                 passers.append(decision)
@@ -735,7 +758,7 @@ class BreakoutEngine:
     def _should_quote_candidate(self, candidate: _CheapCandidate, entry_score: float) -> bool:
         return not candidate.chase_cap_exceeded and entry_score >= self._quote_score_floor
 
-    def _entry_score(self, candidate: _CheapCandidate, momentum_z_score: float) -> float:
+    def _entry_score(self, candidate: _CheapCandidate, momentum_z_score: float, token_sentiment: dict[str, Any] | None = None) -> float:
         score = 0.0
         score += self._score_weight("breakout") * self._clamp01(candidate.breakout_strength)
         score += self._score_weight("volume") * self._clamp01(candidate.volume_surge_score)
@@ -743,7 +766,13 @@ class BreakoutEngine:
         score += self._score_weight("rsi") * (1.0 if candidate.rsi_in_range else 0.0)
         score += self._score_weight("derivatives") * (1.0 if candidate.derivatives_risk_clear else 0.0)
         score += self._score_weight("macro") * self._clamp01(candidate.macro_score)
-        return round(score, 4)
+        # Token-specific sentiment modifiers (CMC MCP news + narratives)
+        if token_sentiment:
+            if token_sentiment.get("news_bearish_last_4h"):
+                score -= 10.0
+            if token_sentiment.get("kol_bullish") and token_sentiment.get("funding_neutral"):
+                score += 5.0
+        return max(0.0, round(score, 4))
 
     def _score_weight(self, name: str) -> float:
         return max(0.0, float(getattr(self.settings, f"breakout_score_weight_{name}", 0.0) or 0.0))

@@ -24,8 +24,8 @@ def load_ohlcv_parquet(path: Path) -> pd.DataFrame:
     return frame.sort_values("timestamp").reset_index(drop=True)
 
 
-def load_cmc_snapshots(path: Path) -> pd.DataFrame:
-    if not path.exists():
+def load_cmc_snapshots(path: Path | None) -> pd.DataFrame:
+    if path is None or not path.exists():
         return pd.DataFrame(columns=["timestamp", "symbol"])
     frame = pd.read_parquet(path)
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
@@ -60,7 +60,7 @@ def _resolve_label_thresholds(ohlcv_dir: Path, symbols: list[str]) -> tuple[floa
 def build_feature_matrix_from_sources(
     *,
     ohlcv_dir: Path,
-    cmc_path: Path,
+    cmc_path: Path | None,
     symbols: list[str],
     execution_log_path: str | Path | None = None,
 ) -> pd.DataFrame:
