@@ -404,7 +404,8 @@ def test_insufficient_core_factors_reports_count() -> None:
     )
 
     assert decision.should_enter is False
-    assert decision.reason == "entry score 11.2 below quote floor 48.0"
+    assert decision.reason == "entry score 9.8 below quote floor 48.0"
+
 
 
 def test_eligible_rules_list_contains_149_entries() -> None:

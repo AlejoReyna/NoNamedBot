@@ -384,7 +384,7 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
         "breakout_score_weight_momentum": _get_float("BREAKOUT_SCORE_WEIGHT_MOMENTUM", 15.0),
         "breakout_score_weight_rsi": _get_float("BREAKOUT_SCORE_WEIGHT_RSI", 10.0),
         "breakout_score_weight_derivatives": _get_float("BREAKOUT_SCORE_WEIGHT_DERIVATIVES", 10.0),
-        "breakout_score_weight_macro": _get_float("BREAKOUT_SCORE_WEIGHT_MACRO", 5.0),
+        "breakout_score_weight_macro": _get_float("BREAKOUT_SCORE_WEIGHT_MACRO", 15.0),
         "breakout_min_true_factor_count": _get_int("BREAKOUT_MIN_TRUE_FACTOR_COUNT", 3),
         "breakout_block_in_risk_off_regime": _get_bool("BREAKOUT_BLOCK_IN_RISK_OFF_REGIME", True),
         "breakout_require_rsi_in_range": _get_bool("BREAKOUT_REQUIRE_RSI_IN_RANGE", True),
