@@ -65,9 +65,10 @@ def _patch_run_agent_dependencies(
             self.twak_interface = twak_interface
 
     class FakeEngine:
-        def __init__(self, settings: Settings, twak_interface: FakeTWAK) -> None:
+        def __init__(self, settings: Settings, twak_interface: FakeTWAK, sentiment_tier1: float | None = None) -> None:
             self.settings = settings
             self.twak_interface = twak_interface
+            self.sentiment_tier1 = sentiment_tier1
 
         def evaluate_universe(
             self,
