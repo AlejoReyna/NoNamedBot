@@ -54,6 +54,19 @@ class MLFeatureCache:
             )
             """
         )
+        # Migrate cmc_metrics: add missing columns safely
+        cursor = conn.execute("PRAGMA table_info(cmc_metrics)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        new_columns = {
+            "social_dominance": "REAL",
+            "social_volume_change_24h": "REAL",
+            "market_cap_dominance": "REAL",
+            "volume_change_24h": "REAL",
+            "open_interest_change_pct": "REAL",
+        }
+        for col_name, col_type in new_columns.items():
+            if col_name not in existing_columns:
+                conn.execute(f"ALTER TABLE cmc_metrics ADD COLUMN {col_name} {col_type}")
         return conn
 
     def _init_db(self) -> None:
@@ -146,6 +159,13 @@ class MLFeatureCache:
             return None
         return number / 100.0 if number > 1.0 else number
 
+    @staticmethod
+    def _optional_float(value: Any) -> float | None:
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
     def record_cmc_metrics(
         self,
         snapshot: dict[str, dict[str, Any]],
@@ -165,13 +185,30 @@ class MLFeatureCache:
                     funding_value = float(funding_rate) if funding_rate is not None else None
                 except (TypeError, ValueError):
                     funding_value = None
+                social_dominance = self._optional_float(payload.get("social_dominance"))
+                social_volume_change_24h = self._optional_float(payload.get("social_volume_change_24h"))
+                market_cap_dominance = self._optional_float(payload.get("market_cap_dominance"))
+                volume_change_24h = self._optional_float(payload.get("volume_change_24h"))
+                open_interest_change_pct = self._optional_float(payload.get("open_interest_change_pct"))
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO cmc_metrics
-                    (timestamp, symbol, fear_greed_index, funding_rate)
-                    VALUES (?, ?, ?, ?)
+                    (timestamp, symbol, fear_greed_index, funding_rate,
+                     social_dominance, social_volume_change_24h, market_cap_dominance,
+                     volume_change_24h, open_interest_change_pct)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (ts_text, normalized, fear_greed, funding_value),
+                    (
+                        ts_text,
+                        normalized,
+                        fear_greed,
+                        funding_value,
+                        social_dominance,
+                        social_volume_change_24h,
+                        market_cap_dominance,
+                        volume_change_24h,
+                        open_interest_change_pct,
+                    ),
                 )
             conn.commit()
 
@@ -214,5 +251,71 @@ class MLFeatureCache:
                 LIMIT ?
                 """,
                 (normalized, cutoff, limit),
+            ).fetchall()
+        return [float(row[0]) for row in rows]
+
+    def get_fear_greed_with_delta(
+        self, hours_ago: float = FGI_PRIOR_HOURS
+    ) -> tuple[float | None, float | None]:
+        """Return prior fear/greed index and delta from approximately hours_ago."""
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+        with self._connect() as conn:
+            current_row = conn.execute(
+                """
+                SELECT fear_greed_index
+                FROM cmc_metrics
+                WHERE fear_greed_index IS NOT NULL
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+            ).fetchone()
+            prior_row = conn.execute(
+                """
+                SELECT fear_greed_index
+                FROM cmc_metrics
+                WHERE timestamp <= ? AND fear_greed_index IS NOT NULL
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                (cutoff,),
+            ).fetchone()
+        if current_row is None or prior_row is None:
+            return (None, None)
+        current = float(current_row[0])
+        prior = float(prior_row[0])
+        return (prior, current - prior)
+
+    _CMC_METRIC_COLUMNS = {
+        "fear_greed_index",
+        "funding_rate",
+        "social_dominance",
+        "social_volume_change_24h",
+        "market_cap_dominance",
+        "volume_change_24h",
+        "open_interest_change_pct",
+    }
+
+    def get_cmc_metric_history(
+        self,
+        symbol: str,
+        metric: str,
+        days: float = 7.0,
+    ) -> list[float]:
+        """Return recent readings for a named cmc_metrics column."""
+
+        if metric not in self._CMC_METRIC_COLUMNS:
+            return []
+        normalized = symbol.upper()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT {metric}
+                FROM cmc_metrics
+                WHERE symbol = ? AND timestamp >= ? AND {metric} IS NOT NULL
+                ORDER BY timestamp ASC
+                """,
+                (normalized, cutoff),
             ).fetchall()
         return [float(row[0]) for row in rows]

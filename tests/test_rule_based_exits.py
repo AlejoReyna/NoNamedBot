@@ -12,6 +12,7 @@ Covers the three coupled changes:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -27,7 +28,10 @@ from src.strategy.regime_detector import MarketRegime
 
 
 def _settings(tmp_path: Path, **overrides: object) -> Settings:
-    base = dict(position_state_path=str(tmp_path / "positions.json"))
+    base = dict(
+        position_state_path=str(tmp_path / "positions.json"),
+        sell_history_log_path=str(tmp_path / "sell_history.jsonl"),
+    )
     base.update(overrides)
     return Settings(**base)  # type: ignore[arg-type]
 
@@ -272,9 +276,15 @@ def test_exit_swap_caps_to_live_wallet_balance(tmp_path: Path, monkeypatch) -> N
             del args, kwargs
 
     class _Toolkit:
+        def __init__(self) -> None:
+            self._calls = 0
+
         def get_balance(self, symbol: str) -> dict[str, object]:
             assert symbol == "DOGE"
-            return {"symbol": "DOGE", "balance": 5.59530611}
+            self._calls += 1
+            # First read decides the sell amount; second read is post-sell verification.
+            balance = 5.59530611 if self._calls == 1 else 0.0
+            return {"symbol": "DOGE", "balance": balance}
 
     def _swap(
         settings_arg,
@@ -313,8 +323,119 @@ def test_exit_swap_caps_to_live_wallet_balance(tmp_path: Path, monkeypatch) -> N
     assert calls == [
         {
             "from_symbol": "DOGE",
-            "amount_in": pytest.approx(5.59530611),
-            "expected_amount_out": pytest.approx(5.59530611 * 0.086),
+            "amount_in": pytest.approx(5.58971080389),
+            "expected_amount_out": pytest.approx(5.58971080389 * 0.086),
         }
     ]
     assert manager.get_position("DOGE") is None
+
+
+def test_exit_swap_not_verified_keeps_position_open(tmp_path: Path, monkeypatch) -> None:
+    """If the swap returns a hash but the balance did not drop, the local position
+    must stay open for retry and nothing should be written to sell history."""
+    from src import main as main_mod
+
+    settings = _settings(tmp_path)
+    manager = PositionManager(settings)
+    manager.open_position(
+        "DOGE",
+        amount_tokens=5.59594069,
+        entry_price=0.089,
+        position_usd=0.498,
+        atr_pct=0.03,
+        regime=MarketRegime.TRENDING_UP,
+    )
+
+    class _Guardrails:
+        def __init__(self) -> None:
+            self.settings = settings
+
+        def record_trade(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            del args, kwargs
+
+    class _Toolkit:
+        def get_balance(self, symbol: str) -> dict[str, object]:
+            assert symbol == "DOGE"
+            # Balance never drops -> verification fails.
+            return {"symbol": "DOGE", "balance": 5.59530611}
+
+    def _swap(*args, **kwargs):
+        del args, kwargs
+        return {"tx_hash": "0x" + "1" * 64}
+
+    monkeypatch.setattr(main_mod, "_execute_logged_swap", _swap)
+
+    main_mod._execute_position_exit(
+        manager,
+        object(),
+        _Guardrails(),
+        "DOGE",
+        0.086,
+        100.0,
+        exit_reason="time_stop",
+        toolkit=_Toolkit(),
+    )
+
+    assert manager.get_position("DOGE") is not None
+    sell_history_path = Path(settings.sell_history_log_path)
+    assert not sell_history_path.exists() or sell_history_path.read_text().strip() == ""
+
+
+def test_sell_history_recorded_on_verified_exit(tmp_path: Path, monkeypatch) -> None:
+    from src import main as main_mod
+
+    settings = _settings(tmp_path)
+    manager = PositionManager(settings)
+    manager.open_position(
+        "DOGE",
+        amount_tokens=5.59594069,
+        entry_price=0.089,
+        position_usd=0.498,
+        atr_pct=0.03,
+        regime=MarketRegime.TRENDING_UP,
+    )
+
+    class _Guardrails:
+        def __init__(self) -> None:
+            self.settings = settings
+
+        def record_trade(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            del args, kwargs
+
+    class _Toolkit:
+        def __init__(self) -> None:
+            self._calls = 0
+
+        def get_balance(self, symbol: str) -> dict[str, object]:
+            self._calls += 1
+            balance = 5.59530611 if self._calls == 1 else 0.0
+            return {"symbol": "DOGE", "balance": balance}
+
+    def _swap(*args, **kwargs):
+        del args, kwargs
+        return {"tx_hash": "0xabc123"}
+
+    monkeypatch.setattr(main_mod, "_execute_logged_swap", _swap)
+
+    main_mod._execute_position_exit(
+        manager,
+        object(),
+        _Guardrails(),
+        "DOGE",
+        0.086,
+        100.0,
+        exit_reason="time_stop",
+        toolkit=_Toolkit(),
+    )
+
+    assert manager.get_position("DOGE") is None
+    sell_history_path = Path(settings.sell_history_log_path)
+    lines = sell_history_path.read_text().strip().splitlines()
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    assert row["symbol"] == "DOGE"
+    assert row["verified"] is True
+    assert row["exit_tx_hash"] == "0xabc123"
+    assert "balance_before" in row
+    assert "balance_after" in row
+    assert row["balance_after"] == pytest.approx(0.0)

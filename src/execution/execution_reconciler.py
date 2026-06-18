@@ -18,6 +18,16 @@ from decimal import Decimal
 from typing import Any
 
 _TWAK_AMOUNT_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)")
+_EXIT_DUST_FLOOR = Decimal("1E-12")
+_EXIT_TOLERANCE_PCT = Decimal("0.005")
+
+
+def _to_decimal(value: Any) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    if value is None:
+        return Decimal("0")
+    return Decimal(str(value))
 
 
 @dataclass(frozen=True)
@@ -123,6 +133,66 @@ class ExecutionReconciler:
             1,
             False,
         )
+
+    def reconcile_exit(
+        self,
+        tx_result: dict,
+        balance_before: dict[str, Any],
+        balance_after: dict[str, Any],
+        amount_sold: Any | None = None,
+        token_in: str | None = None,
+    ) -> ReconciliationResult:
+        """Confirm a sell actually removed the expected token balance.
+
+        ``token_in`` is the token being sold. When omitted the method falls back
+        to ``from_symbol`` / ``token_in`` / ``symbol`` keys in ``tx_result``.
+        ``amount_sold`` is the amount the router was asked to sell; when omitted
+        the check assumes the entire pre-sell balance should have been cleared.
+        """
+
+        tx_hash = str(tx_result.get("hash") or tx_result.get("tx_hash") or "")
+        token = (token_in or self._token_in(tx_result) or "UNKNOWN").upper()
+        before = _to_decimal(balance_before.get(token, "0"))
+        after = _to_decimal(balance_after.get(token, "0"))
+        delta = before - after
+        expected = _to_decimal(amount_sold) if amount_sold is not None else before
+
+        receipt = tx_result.get("receipt") if isinstance(tx_result.get("receipt"), dict) else {}
+        gas_used = int(receipt.get("gasUsed", receipt.get("gas_used", 0)) or 0)
+        block_number = int(receipt.get("blockNumber", receipt.get("block_number", 0)) or 0)
+        receipt_status = int(receipt.get("status", tx_result.get("status", 1)) or 1)
+
+        expected_remaining = (before - expected).max(Decimal("0"))
+        verified = False
+        if receipt_status != 1:
+            verified = False
+        elif expected <= 0 and after <= _EXIT_DUST_FLOOR:
+            verified = True
+        elif before <= _EXIT_DUST_FLOOR and after <= _EXIT_DUST_FLOOR:
+            verified = True
+        elif delta >= expected * (Decimal("1") - _EXIT_TOLERANCE_PCT) and after <= expected_remaining + _EXIT_DUST_FLOOR:
+            verified = True
+
+        status = "SUCCESS" if verified else "FAILED"
+        return self._result(
+            status,
+            tx_hash,
+            token,
+            expected,
+            delta,
+            gas_used,
+            block_number,
+            receipt_status,
+            verified,
+        )
+
+    @staticmethod
+    def _token_in(tx_result: dict) -> str:
+        for key in ("from_symbol", "token_in", "symbol"):
+            value = tx_result.get(key)
+            if value:
+                return str(value).upper()
+        return ""
 
     @staticmethod
     def _result(

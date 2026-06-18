@@ -12,6 +12,7 @@ import sys
 import time
 import types
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -63,7 +64,7 @@ from src.strategy.scalping_guardrails import ScalpingGuardrails
 from src.strategy.scalping_position_manager import ScalpingPositionManager
 from src.strategy.guardrails import Guardrails, RiskDecision, RiskState, TradeRecord
 from src.strategy.position_manager import Position, PositionManager, calculate_position_pct
-from src.research import trade_outcome_log
+from src.research import sell_history, trade_outcome_log
 from src.strategy.regime_detector import MarketRegime, RegimeDetector, RegimeResult
 from src.strategy.sentiment_tier1 import SentimentResult, SentimentTier1
 from src.strategy.volatility import PriceCache
@@ -511,6 +512,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
     guardrails = strategy_bundle.guardrails
     scoring.evaluate_universe = strategy_bundle.evaluate_universe
     shadow_logger = _build_shadow_logger(price_cache, settings)
+    ml_bundle = _build_ml_bundle(settings)
     positions_loaded = position_manager.load_positions()
     needs_balance_reconstruction = not positions_loaded and not settings.paper_trade
     if positions_loaded:
@@ -797,6 +799,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                     twak_interface,
                     exclude_symbols=exclude_symbols,
                     sentiment_result=sentiment_result,
+                    ml_bundle=ml_bundle,
                 )
                 # Defensive backstop: drop any discretionary candidate that still
                 # carries an active blackout (e.g. a path that bypassed excludes).
@@ -945,6 +948,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             telemetry_exclude_symbols,
             sentiment_result,
             candidate,
+            ml_bundle=ml_bundle,
         )
         legacy_reason = decision_reasons[-1] if decision_reasons else "ok"
         if candidate is None and telemetry_candidate is not None:
@@ -1024,6 +1028,20 @@ def _build_shadow_logger(price_cache: PriceCache, settings: Settings) -> Any | N
             decision_log_path="logs/decision_shadow.jsonl",
         )
     except ImportError:
+        return None
+
+
+def _build_ml_bundle(settings: Settings) -> Any | None:
+    """Create the ML bundle when enabled; fail closed to None on any error."""
+
+    if not getattr(settings, "ml_enabled", False):
+        return None
+    try:
+        from src.ml.bundle import MLBundle
+
+        return MLBundle.from_settings(settings)
+    except Exception as exc:
+        LOGGER.warning("ML bundle disabled (fail-closed): %s", exc)
         return None
 
 
@@ -1725,6 +1743,7 @@ def _telemetry_candidate_for_log(
     exclude_symbols: set[str],
     sentiment_result: SentimentResult | None,
     selected: EntryCandidate | None,
+    ml_bundle: Any | None = None,
 ) -> EntryCandidate | None:
     """Return the best evaluated symbol for dashboard telemetry when no entry triggers."""
 
@@ -1760,7 +1779,19 @@ def _telemetry_candidate_for_log(
         for symbol, data in market_snapshot.items()
         if symbol.upper() not in {item.upper() for item in exclude_symbols}
     }
-    decision = engine.evaluate_universe(filtered_snapshot, portfolio_value)
+    ml_contexts: dict[str, Any] = {}
+    if ml_bundle is not None:
+        try:
+            ml_bundle.refresh_ohlcv_if_stale()
+            ml_contexts = ml_bundle.build_contexts(filtered_snapshot)
+        except Exception as exc:
+            LOGGER.warning("ML bundle context build failed for telemetry: %s", exc)
+            ml_contexts = {}
+    try:
+        decision = engine.evaluate_universe(filtered_snapshot, portfolio_value, ml_contexts=ml_contexts)
+    except TypeError:
+        decision = engine.evaluate_universe(filtered_snapshot, portfolio_value)
+    ml_audit = _build_telemetry_ml_audit(ml_bundle, getattr(decision, "ml_context", None), decision)
     telemetry = breakout_decision_to_candidate(
         decision,
         market_snapshot,
@@ -1768,6 +1799,7 @@ def _telemetry_candidate_for_log(
         settings,
         risk_decision,
         for_telemetry=True,
+        ml_audit=ml_audit,
     )
     if telemetry is not None:
         return telemetry
@@ -1780,6 +1812,35 @@ def _telemetry_candidate_for_log(
         settings=settings,
         exclude_symbols=exclude_symbols,
     )
+
+
+def _build_telemetry_ml_audit(
+    ml_bundle: Any | None,
+    ml_context: Any | None,
+    decision: Any | None = None,
+) -> dict[str, Any] | None:
+    """Build a lightweight ML audit payload for the telemetry-only path."""
+
+    if ml_bundle is None:
+        return None
+    audit: dict[str, Any] = {
+        "ml_enabled": True,
+        "ml_active": bool(getattr(ml_bundle, "is_ranking_active", False)),
+        "ml_shadow_mode": bool(getattr(getattr(ml_bundle, "settings", None), "ml_shadow_mode", True)),
+        "ml_validation_auc": float(getattr(ml_bundle, "validation_auc", 0.0) or 0.0),
+    }
+    if ml_context is not None:
+        audit["ml_regime"] = getattr(ml_context, "regime", None)
+        audit["ml_confidence"] = round(float(getattr(ml_context, "confidence", 0.0) or 0.0), 6)
+        audit["ml_position_size_multiplier"] = getattr(ml_context, "position_size_multiplier", None)
+    else:
+        audit["ml_regime"] = None
+        audit["ml_confidence"] = None
+        audit["ml_position_size_multiplier"] = None
+    if decision is not None:
+        audit["quality_guards"] = dict(getattr(decision, "quality_guards", {}) or {})
+        audit["entries_blocked_reason"] = getattr(decision, "entries_blocked_reason", None)
+    return audit
 
 
 def _telemetry_candidate_from_priced_targets(
@@ -1901,6 +1962,7 @@ def _breakout_decision_from_candidate(
         entry_score=candidate.entry_score,
         position_size_multiplier=candidate.position_size_multiplier,
         factor_metrics=dict(getattr(candidate, "factor_metrics", {}) or {}),
+        ml_audit=dict(getattr(candidate, "ml_audit", {}) or {}) or None,
     )
 
 
@@ -2229,12 +2291,19 @@ EXIT_BALANCE_SAFETY_FACTOR = 0.999
 EXIT_DUST_FLOOR = 1e-12
 
 
-def _exit_amount_from_live_balance(position: Position, toolkit: BnbToolkitWrapper | None) -> float:
-    """Use at most (a safety fraction of) the current wallet balance when selling."""
+def _live_exit_balance(
+    position: Position, toolkit: BnbToolkitWrapper | None
+) -> tuple[float, float]:
+    """Return (raw_wallet_balance, sellable_amount) for an exit.
+
+    ``raw_wallet_balance`` is the live wallet amount before the swap.
+    ``sellable_amount`` is the amount we tell the router to sell, with a small
+    safety haircut to avoid "transfer amount exceeds balance" reverts.
+    """
 
     position_amount = max(0.0, float(position.amount_tokens))
     if toolkit is None:
-        return position_amount
+        return position_amount, position_amount
     try:
         balance_response = toolkit.get_balance(position.symbol)
     except Exception as exc:
@@ -2244,13 +2313,13 @@ def _exit_amount_from_live_balance(position: Position, toolkit: BnbToolkitWrappe
             position_amount,
             exc,
         )
-        return position_amount
+        return position_amount, position_amount
 
     wallet_amount = max(0.0, _extract_symbol_balance(balance_response, position.symbol))
     # Treat sub-dust balances as zero so the caller removes the stale position
     # instead of attempting a doomed swap (e.g. ATOM at 1e-18 -> 400 Bad Request).
     if wallet_amount <= EXIT_DUST_FLOOR:
-        return 0.0
+        return wallet_amount, 0.0
     # Sell slightly under the read balance. The on-chain spendable amount is
     # often a hair less than the read (decimal truncation to raw token units, or
     # a marginally stale balance), so selling the exact read value reverts with
@@ -2265,7 +2334,54 @@ def _exit_amount_from_live_balance(position: Position, toolkit: BnbToolkitWrappe
             wallet_amount,
             EXIT_BALANCE_SAFETY_FACTOR,
         )
+    return wallet_amount, sellable
+
+
+def _exit_amount_from_live_balance(position: Position, toolkit: BnbToolkitWrapper | None) -> float:
+    """Use at most (a safety fraction of) the current wallet balance when selling."""
+
+    _, sellable = _live_exit_balance(position, toolkit)
     return sellable
+
+
+def _read_balance_with_timeout(
+    toolkit: BnbToolkitWrapper | None,
+    symbol: str,
+    timeout: float = 5.0,
+    retries: int = 2,
+) -> float | None:
+    """Read a token balance with a short timeout and retries.
+
+    Returns ``None`` if the toolkit is unavailable or every attempt fails, so a
+    transient RPC hiccup never blocks the trading cycle.
+    """
+
+    if toolkit is None or not hasattr(toolkit, "get_balance"):
+        return None
+    for attempt in range(retries + 1):
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(toolkit.get_balance, symbol)
+                response = future.result(timeout=timeout)
+            return max(0.0, _extract_symbol_balance(response, symbol))
+        except FuturesTimeoutError:
+            LOGGER.warning(
+                "Balance read for %s timed out (attempt %d/%d)",
+                symbol,
+                attempt + 1,
+                retries + 1,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "Balance read for %s failed (attempt %d/%d): %s",
+                symbol,
+                attempt + 1,
+                retries + 1,
+                exc,
+            )
+        if attempt < retries:
+            time.sleep(min(2.0, 1.0 * (attempt + 1)))
+    return None
 
 
 def _process_position_exits(
@@ -2334,7 +2450,7 @@ def _execute_position_exit(
     if position is None:
         return
     execution_slippage = _require_execution_slippage(guardrails.settings.max_slippage_pct)
-    amount_in = _exit_amount_from_live_balance(position, toolkit)
+    balance_before, amount_in = _live_exit_balance(position, toolkit)
     if amount_in <= 0:
         LOGGER.warning(
             "Exit swap for %s (%s) skipped; live wallet balance is zero, removing stale local position",
@@ -2371,6 +2487,41 @@ def _execute_position_exit(
     if not _execution_has_tx_hash(result):
         LOGGER.error("Exit swap for %s returned no tx hash; local position remains open", symbol)
         return
+
+    # Verify the on-chain balance change before removing the local position.
+    verified = False
+    balance_after: float | None = None
+    if toolkit is None:
+        verified = True
+        LOGGER.debug("Skipping post-sell balance verification for %s; no toolkit available", symbol)
+    else:
+        balance_after = _read_balance_with_timeout(toolkit, symbol)
+        if balance_after is None:
+            LOGGER.warning(
+                "Post-sell balance read for %s failed; leaving local position open for retry",
+                symbol,
+            )
+            return
+        reconcile_result = ExecutionReconciler(toolkit).reconcile_exit(
+            result,
+            {symbol: balance_before},
+            {symbol: balance_after},
+            amount_sold=amount_in,
+            token_in=symbol,
+        )
+        verified = reconcile_result.status == "SUCCESS"
+        if not verified:
+            LOGGER.warning(
+                "Sell verification failed for %s (%s): balance_before=%.12g "
+                "balance_after=%.12g amount_sold=%.12g; local position left open, will retry",
+                symbol,
+                exit_reason,
+                balance_before,
+                balance_after,
+                amount_in,
+            )
+            return
+
     hold_time_seconds = None
     if isinstance(position_manager, ScalpingPositionManager):
         hold_time_seconds = position_manager.hold_time_seconds(symbol)
@@ -2391,6 +2542,23 @@ def _execute_position_exit(
             )
         except Exception as exc:  # logging must never block an exit
             LOGGER.debug("Could not record trade exit outcome: %s", exc)
+        try:
+            sell_history.record_verified_exit(
+                getattr(guardrails.settings, "sell_history_log_path", sell_history.DEFAULT_PATH),
+                symbol=closed.symbol,
+                trade_id=getattr(closed, "trade_id", None),
+                exit_price=current_price,
+                amount_sold=amount_in,
+                expected_amount_out=expected_amount_out,
+                balance_before=balance_before,
+                balance_after=balance_after,
+                exit_tx_hash=_execution_tx_hash(result),
+                exit_reason=exit_reason,
+                realized_pnl_usdc=realized_pnl,
+                verified=verified,
+            )
+        except Exception as exc:  # logging must never block an exit
+            LOGGER.debug("Could not record verified sell history: %s", exc)
         trade = TradeRecord(
             symbol=closed.symbol,
             side="sell",
@@ -2708,6 +2876,7 @@ def _log_cycle_decision(
     )
     position_size_usdc = decision.position_size_usdc if decision is not None else 0.0
     priced_target_count = len(_priced_target_symbols(market_snapshot))
+    ml_audit = getattr(decision, "ml_audit", None)
 
     record = log_decision(
         settings,
@@ -2729,6 +2898,7 @@ def _log_cycle_decision(
         exit_reason=exit_reason,
         hold_time_seconds=hold_time_seconds,
         factor_metrics=factor_metrics,
+        ml_audit=ml_audit,
     )
 
     factors = f"{true_factor_count}/6" if decision is not None else "-"

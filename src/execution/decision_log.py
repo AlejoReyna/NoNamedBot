@@ -40,6 +40,7 @@ class DecisionLogger:
         exit_reason: str | None = None,
         hold_time_seconds: int | None = None,
         factor_metrics: dict[str, str] | None = None,
+        ml_audit: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Append one strategy decision record and return it."""
 
@@ -70,6 +71,8 @@ class DecisionLogger:
             record["exit_reason"] = exit_reason
         if hold_time_seconds is not None:
             record["hold_time_seconds"] = hold_time_seconds
+        if ml_audit is not None:
+            record["ml_audit"] = ml_audit
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as handle:
@@ -99,6 +102,7 @@ def log_decision(
     exit_reason: str | None = None,
     hold_time_seconds: int | None = None,
     factor_metrics: dict[str, str] | None = None,
+    ml_audit: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Append a strategy decision record using the configured settings path."""
 
@@ -123,4 +127,5 @@ def log_decision(
         exit_reason=exit_reason,
         hold_time_seconds=hold_time_seconds,
         factor_metrics=factor_metrics,
+        ml_audit=ml_audit,
     )

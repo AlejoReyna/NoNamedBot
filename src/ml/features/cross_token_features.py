@@ -64,13 +64,15 @@ def compute_cross_token_features(
         corr = 0.0
         beta = 0.0
     else:
-        aligned_token = token_ret.tail(min_len)
-        aligned_bnb = bnb_ret.tail(min_len)
+        aligned_token = pd.Series(token_ret.tail(min_len).values)
+        aligned_bnb = pd.Series(bnb_ret.tail(min_len).values)
         corr = float(aligned_token.corr(aligned_bnb))
         if math.isnan(corr):
             corr = 0.0
         bnb_var = float(aligned_bnb.var(ddof=0))
         beta = float(aligned_token.cov(aligned_bnb) / bnb_var) if bnb_var > 0 else 0.0
+        if math.isnan(beta):
+            beta = 0.0
 
     sector = SECTOR_TAGS.get(normalized, "other")
     sector_rets = [value for key, value in universe_returns_16.items() if SECTOR_TAGS.get(key, "other") == sector]

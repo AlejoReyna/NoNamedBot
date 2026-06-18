@@ -91,19 +91,18 @@ def build_feature_matrix_from_sources(
             max_drawdown_thresh=max_drawdown,
             close_location_thresh=close_location,
         )
-        ohlcv_by_symbol = {symbol.upper(): ohlcv}
-        if not bnb_ohlcv.empty:
-            ohlcv_by_symbol["BNB"] = bnb_ohlcv
 
         for idx in range(MIN_LOOKBACK, len(ohlcv) - LABEL_HORIZON):
             label = int(labels.iloc[idx])
             if label < 0:
                 continue
             window = ohlcv.iloc[: idx + 1].reset_index(drop=True)
+            bnb_window = bnb_ohlcv.iloc[: idx + 1].reset_index(drop=True) if not bnb_ohlcv.empty else pd.DataFrame()
             candle_ts = window["timestamp"].iloc[-1]
             cmc_snapshot = asof_cmc_row(cmc_rows, symbol, candle_ts)
+            ohlcv_by_symbol = {symbol.upper(): window, **({"BNB": bnb_window} if not bnb_window.empty else {})}
             universe_context = FeaturePipeline.build_universe_context(
-                {symbol.upper(): window, **({"BNB": bnb_ohlcv} if not bnb_ohlcv.empty else {})},
+                ohlcv_by_symbol,
                 {symbol.upper(): cmc_snapshot},
                 token_win_rates=token_win_rates,
             )

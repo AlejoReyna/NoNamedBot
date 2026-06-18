@@ -43,6 +43,7 @@ def breakout_decision_to_candidate(
     risk_decision: RiskDecision,
     *,
     for_telemetry: bool = False,
+    ml_audit: dict[str, Any] | None = None,
 ) -> EntryCandidate | None:
     """Convert a BreakoutDecision into an EntryCandidate when signal is present."""
 
@@ -65,7 +66,7 @@ def breakout_decision_to_candidate(
     slippage_small = maybe_number(token_data.get("estimated_slippage_small_pct"))
     if slippage_small is None and slippage_normal is not None:
         slippage_small = max(0.0, slippage_normal * 0.5)
-    return EntryCandidate(
+    candidate = EntryCandidate(
         symbol=symbol,
         price=price,
         position_size_usdc=position_size,
@@ -80,7 +81,11 @@ def breakout_decision_to_candidate(
         position_size_multiplier=position_size_multiplier,
         strategy_mode="breakout",
         factor_metrics=dict(getattr(decision, "factor_metrics", {}) or {}),
+        ml_audit=dict(getattr(decision, "ml_audit", {}) or {}) or None,
+        quality_guards=dict(getattr(decision, "quality_guards", {}) or {}) or None,
+        entries_blocked_reason=getattr(decision, "entries_blocked_reason", None),
     )
+    return candidate.with_ml_audit(ml_audit)
 
 
 def coerce_entry_candidate(
@@ -117,4 +122,7 @@ def coerce_entry_candidate(
         position_size_multiplier=maybe_number(getattr(candidate, "position_size_multiplier", None)) or 1.0,
         strategy_mode=str(getattr(candidate, "strategy_mode", "breakout")),
         factor_metrics=dict(getattr(candidate, "factor_metrics", {}) or {}),
+        ml_audit=dict(getattr(candidate, "ml_audit", {}) or {}) or None,
+        quality_guards=dict(getattr(candidate, "quality_guards", {}) or {}) or None,
+        entries_blocked_reason=getattr(candidate, "entries_blocked_reason", None),
     )

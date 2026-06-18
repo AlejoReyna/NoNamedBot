@@ -119,7 +119,7 @@ def test_emergency_liquidate_caps_to_live_wallet_balance(monkeypatch: object, tm
 
     main_module.emergency_liquidate(position_manager, object(), guardrails, FakeToolkit())  # type: ignore[arg-type]
 
-    assert calls == [pytest.approx(5.59530611)]
+    assert calls == [pytest.approx(5.58971080389)]
     assert position_manager.get_position("DOGE") is None
 
 

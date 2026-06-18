@@ -45,7 +45,7 @@ def test_build_dataset_joins_entry_exit_and_excludes_exit_features(tmp_path: obj
     # Whitelist: timestamps / prices / sizes / ids must never be model features.
     for excluded in ("opened_at", "entry_price", "size_usdc", "trade_id"):
         assert excluded not in features
-    assert set(features) == {"factor_volume_breakout", "factor_rsi_in_range", "entry_score", "true_factor_count"}
+    assert set(features) == {"factor_volume_breakout", "factor_rsi_in_range", "entry_score", "true_factor_count", "estimated_slippage_pct", "atr_pct", "regime_trending_up", "regime_risk_off", "bnb_1h_pct", "bnb_24h_pct"}
     assert_no_leakage(features)
 
 

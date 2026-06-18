@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +48,10 @@ class BreakoutDecision:
     # display the real numbers the booleans were derived from. Keyed by factor name.
     factor_metrics: dict[str, str] = field(default_factory=dict)
     ml_context: Any | None = None
+    ml_audit: dict[str, Any] | None = None
+    # Quality-guard results for telemetry. None when no guard was evaluated.
+    quality_guards: dict[str, bool] | None = None
+    entries_blocked_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -236,12 +240,12 @@ class BreakoutEngine:
         if self._should_quote_candidate(candidate, entry_score):
             estimated_slippage, quote_state = self._estimate_candidate_slippage(candidate)
         decision = self._decision_from_candidate(
-            candidate, estimated_slippage, entry_score, slippage_quote_state=quote_state
+            candidate, estimated_slippage, entry_score, slippage_quote_state=quote_state, ml_context=ml_context
         )
         self.price_cache.save()
         self.volume_cache.save()
         self.macro_cache.save()
-        return replace(decision, ml_context=ml_context)
+        return decision
 
     def _evaluate_cheap_candidate(
         self,
@@ -362,6 +366,7 @@ class BreakoutEngine:
         estimated_slippage: float | None,
         entry_score: float | None = None,
         slippage_quote_state: str = "not_quoted",
+        ml_context: Any | None = None,
     ) -> BreakoutDecision:
         """Build a full decision after optional TWAK slippage evaluation."""
 
@@ -391,11 +396,30 @@ class BreakoutEngine:
             and not candidate.chase_cap_exceeded
         )
 
+        quality_guards: dict[str, bool] = {
+            "score_above_threshold": should_enter or resolved_score >= threshold,
+            "slippage_under_cap": slippage_under_cap,
+            "chase_cap_ok": not candidate.chase_cap_exceeded,
+        }
+        entries_blocked_reason: str | None = None
+
+        if should_enter:
+            should_enter, entries_blocked_reason, quality_guards = self._apply_quality_guards(
+                candidate,
+                resolved_score,
+                threshold,
+                true_factor_count,
+                ml_context,
+                quality_guards,
+            )
+
         if should_enter:
             reason = (
                 f"entry score {resolved_score:.1f} >= {threshold:.1f}; "
                 f"slippage under cap ({true_factor_count}/{TOTAL_FACTOR_COUNT} factors true)"
             )
+        elif entries_blocked_reason is not None:
+            reason = entries_blocked_reason
         elif candidate.chase_cap_exceeded:
             reference = candidate.broken_reference_high
             if reference is None:
@@ -446,7 +470,62 @@ class BreakoutEngine:
             position_size_multiplier=candidate.macro_size_multiplier,
             factor_metrics=factor_metrics,
             slippage_quote_state=slippage_quote_state,
+            ml_context=ml_context,
+            quality_guards=quality_guards,
+            entries_blocked_reason=entries_blocked_reason,
         )
+
+    def _apply_quality_guards(
+        self,
+        candidate: _CheapCandidate,
+        resolved_score: float,
+        threshold: float,
+        true_factor_count: int,
+        ml_context: Any | None,
+        quality_guards: dict[str, bool],
+    ) -> tuple[bool, str | None, dict[str, bool]]:
+        """Apply ML-aware and rule-based quality gates after the base score clears.
+
+        Returns (should_enter, blocked_reason, updated_quality_guards).
+        """
+
+        settings = self.settings
+        min_factor_count = int(getattr(settings, "breakout_min_true_factor_count", 0))
+        block_risk_off = bool(getattr(settings, "breakout_block_in_risk_off_regime", False))
+        require_rsi = bool(getattr(settings, "breakout_require_rsi_in_range", False))
+        score_buffer = float(getattr(settings, "breakout_min_entry_score_buffer", 0.0))
+        ml_min_confidence = float(getattr(settings, "breakout_ml_min_confidence", 0.0))
+        block_chop = bool(getattr(settings, "breakout_block_in_chop_regime", False))
+        chop_buffer = float(getattr(settings, "breakout_chop_confidence_buffer", 0.0))
+
+        # ML-aware guards (only when an ML context is provided).
+        if ml_context is not None:
+            ml_confidence = float(getattr(ml_context, "confidence", 0.0) or 0.0)
+            ml_regime = getattr(ml_context, "regime", None)
+            quality_guards["ml_confidence_ok"] = ml_min_confidence <= 0 or ml_confidence >= ml_min_confidence
+            quality_guards["ml_chop_ok"] = not block_chop or ml_regime != "chop" or ml_confidence >= ml_min_confidence + chop_buffer
+
+            if ml_min_confidence > 0 and ml_confidence < ml_min_confidence:
+                return False, f"ML confidence {ml_confidence:.3f} below minimum {ml_min_confidence:.3f}", quality_guards
+            if block_chop and ml_regime == "chop" and ml_confidence < ml_min_confidence + chop_buffer:
+                return False, f"chop regime (confidence {ml_confidence:.3f})", quality_guards
+
+        # Rule-based guards (always applied; these are the fail-closed floor).
+        quality_guards["factor_count_ok"] = min_factor_count <= 0 or true_factor_count >= min_factor_count
+        quality_guards["risk_off_ok"] = not block_risk_off or candidate.regime_not_risk_off
+        quality_guards["rsi_ok"] = not require_rsi or candidate.rsi_in_range
+        quality_guards["score_buffer_ok"] = score_buffer <= 0 or resolved_score >= threshold + score_buffer
+
+        if block_risk_off and not candidate.regime_not_risk_off:
+            return False, "rule-based regime is risk-off", quality_guards
+        if min_factor_count > 0 and true_factor_count < min_factor_count:
+            return False, f"only {true_factor_count}/{TOTAL_FACTOR_COUNT} entry factors passed (min {min_factor_count})", quality_guards
+        if require_rsi and not candidate.rsi_in_range:
+            return False, "RSI missing or outside 55–75 band", quality_guards
+        if score_buffer > 0 and resolved_score < threshold + score_buffer:
+            return False, f"entry score {resolved_score:.1f} below buffered threshold {threshold + score_buffer:.1f}", quality_guards
+
+        return True, None, quality_guards
 
     def _build_factor_metrics(
         self,
@@ -526,9 +605,11 @@ class BreakoutEngine:
         self,
         market_snapshot: dict[str, dict[str, Any]],
         portfolio_value_usdc: float,
+        ml_contexts: dict[str, Any] | None = None,
     ) -> list[BreakoutDecision]:
         """Scan target symbols and return all slippage-confirmed entry decisions."""
 
+        ml_contexts = ml_contexts or {}
         bnb_reference = self._bnb_reference(market_snapshot)
         candidates: list[_CheapCandidate] = []
         best_decision: BreakoutDecision | None = None
@@ -552,7 +633,11 @@ class BreakoutEngine:
             )
             candidates.append(candidate)
 
-            unquoted_decision = self._decision_from_candidate(candidate, estimated_slippage=None)
+            unquoted_decision = self._decision_from_candidate(
+                candidate,
+                estimated_slippage=None,
+                ml_context=ml_contexts.get(candidate.symbol),
+            )
             if self._is_better_decision(unquoted_decision, candidate.volume_24h, best_decision, best_volume):
                 best_decision = unquoted_decision
                 best_volume = candidate.volume_24h
@@ -573,6 +658,7 @@ class BreakoutEngine:
                     best_candidate,
                     estimated_slippage=None,
                     entry_score=scores_by_symbol.get(best_symbol),
+                    ml_context=ml_contexts.get(best_symbol),
                 )
         quote_candidates = sorted(
             (
@@ -597,6 +683,7 @@ class BreakoutEngine:
                 slippage_value,
                 scores_by_symbol.get(candidate.symbol, 0.0),
                 slippage_quote_state=quote_state,
+                ml_context=ml_contexts.get(candidate.symbol),
             )
             if decision.should_enter:
                 passers.append(decision)
@@ -629,10 +716,11 @@ class BreakoutEngine:
         self,
         market_snapshot: dict[str, dict[str, Any]],
         portfolio_value_usdc: float,
+        ml_contexts: dict[str, Any] | None = None,
     ) -> BreakoutDecision:
         """Scan target symbols and pick the highest-scoring candidate."""
 
-        decisions = self.evaluate_all(market_snapshot, portfolio_value_usdc)
+        decisions = self.evaluate_all(market_snapshot, portfolio_value_usdc, ml_contexts=ml_contexts)
         passers = [decision for decision in decisions if decision.should_enter]
         if passers:
             return passers[0]
