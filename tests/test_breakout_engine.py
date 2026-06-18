@@ -764,3 +764,143 @@ def test_strong_momentum_candidate_passes_all_guards() -> None:
     assert decision.should_enter is True
     assert decision.quality_guards is not None
     assert all(decision.quality_guards.values())
+
+
+# ---------------------------------------------------------------------------
+# ATR helper
+# ---------------------------------------------------------------------------
+
+def _seed_atr_prices(engine, symbol, prices):
+    now = time.time()
+    engine.price_cache.data[symbol] = [
+        {"timestamp": now - (i * 300), "value": price}
+        for i, price in enumerate(reversed(prices))
+    ]
+
+
+# ---------------------------------------------------------------------------
+# P0 bug-fix and P1 improvement test coverage
+# ---------------------------------------------------------------------------
+
+def test_derivatives_neutral_on_missing_scores_0_5_not_1_0() -> None:
+    engine = _engine_with_price_high(
+        "CAKE",
+        10.0,
+        settings=Settings(max_chase_pct=0.06, derivatives_neutral_on_missing=True),
+    )
+    decision = engine.evaluate_token(
+        _token(rsi=None, funding_rate=None, open_interest_change_pct=None),
+        10000.0,
+    )
+
+    assert decision.entry_score is not None
+    assert decision.entry_score == pytest.approx(65.0)
+
+
+def test_evaluate_token_uses_cached_momentum_z() -> None:
+    engine = _engine()
+    _seed_breakout_caches(engine, ["CAKE", "LINK"])
+    snapshot = {
+        "CAKE": _token(token_percent_change_1h=0.10, token_percent_change_24h=0.20),
+        "LINK": _token(symbol="LINK", token_percent_change_1h=0.05, token_percent_change_24h=0.10),
+    }
+    engine.evaluate_all(snapshot, 10000.0)
+
+    # Verify the cache was populated
+    assert getattr(engine, "_last_momentum_z_scores", {}).get("CAKE", 0.0) > 0
+
+    # Reset caches so the only difference vs. baseline is the cached momentum z
+    engine.price_cache.data = {"CAKE": [{"timestamp": time.time(), "value": 10.1}]}
+    engine.volume_cache.data = {"CAKE": [{"timestamp": time.time() - 3600, "value": 500_000.0}]}
+
+    decision = engine.evaluate_token(
+        _token(token_percent_change_1h=None, token_percent_change_24h=None),
+        10000.0,
+    )
+
+    # Baseline without cached z is 70 (35 breakout + 25 volume + 0 momentum + 10 rsi + 0 derivatives + 0 macro)
+    assert decision.entry_score is not None
+    assert decision.entry_score > 70.0
+
+
+def test_rsi_graded_not_binary() -> None:
+    settings = Settings(breakout_require_rsi_in_range=False, max_chase_pct=0.06)
+    score_65 = _engine_with_price_high("CAKE", 10.0, settings=settings).evaluate_token(_token(rsi=65.0), 10000.0).entry_score
+    score_55 = _engine_with_price_high("CAKE", 10.0, settings=settings).evaluate_token(_token(rsi=55.0), 10000.0).entry_score
+    score_80 = _engine_with_price_high("CAKE", 10.0, settings=settings).evaluate_token(_token(rsi=80.0), 10000.0).entry_score
+    score_none = _engine_with_price_high("CAKE", 10.0, settings=settings).evaluate_token(_token(rsi=None), 10000.0).entry_score
+
+    assert score_65 is not None and score_55 is not None
+    assert score_65 > score_55
+    assert score_80 is not None and score_none is not None
+    assert score_80 > score_none
+
+
+def test_quote_floor_above_threshold() -> None:
+    engine = _engine_with_price_high("CAKE", 10.0, settings=Settings(max_chase_pct=0.06))
+    engine.price_cache.data = {}
+    decision = engine.evaluate_token(
+        _token(
+            price=10.5,
+            high_6h=10.0,
+            volume_1h=720.0,
+            rolling_24h_hourly_volume_avg=1000.0,
+            volume_24h=5_000_000.0,
+            market_cap=100_000_000.0,
+            rsi=None,
+            funding_rate=0.05,
+            bnb_1h_trend_pct=0.5,
+        ),
+        10000.0,
+    )
+
+    assert decision.entry_score is not None
+    assert decision.entry_score == pytest.approx(44.0)
+    assert decision.slippage_quote_state == "not_quoted"
+
+
+def test_atr_gate_blocks_low_volatility() -> None:
+    engine = _engine_with_price_high("CAKE", 10.0)
+    _seed_atr_prices(engine, "CAKE", [10.0] * 20)
+    decision = engine.evaluate_token(
+        _token(
+            price=10.5,
+            volume_24h=10_000_000.0,
+            market_cap=100_000_000.0,
+            bnb_1h_trend_pct=0.5,
+        ),
+        10000.0,
+    )
+
+    assert decision.should_enter is False
+    assert "ATR" in decision.reason or "low volatility" in decision.reason
+
+
+def test_macro_stablecoin_slope_added() -> None:
+    engine = _engine()
+    now = time.time()
+    engine.macro_cache.data["STABLECOIN_MARKET_CAP"] = [
+        {"timestamp": now - 24 * 3600, "value": 100.0}
+    ]
+    score, multiplier = engine._macro_context({"macro_stablecoin_market_cap": 110.0})
+
+    assert score > 0.5
+
+
+def test_dynamic_weights_sum_to_100() -> None:
+    engine = _engine()
+    for vol_regime in (2.0, 0.5, 1.0):
+        weights = engine._regime_adjusted_weights(vol_regime)
+        total = sum(weights.values())
+        assert abs(total - 100.0) < 0.01, f"weights sum to {total} for regime {vol_regime}"
+
+
+def test_continuous_derivatives_extreme_negative_funding() -> None:
+    engine = _engine()
+    score = engine._derivatives_component(funding_rate=-0.0005, open_interest_change_pct=5.0)
+    assert score > 0.7
+
+
+def test_min_entry_factors_alias_respected() -> None:
+    settings = Settings(min_entry_factors=4)
+    assert settings.breakout_min_true_factor_count == 4
