@@ -34,6 +34,7 @@ def evaluate_universe_breakout(
     exclude_symbols: set[str] | None = None,
     use_breakout_engine: bool = True,
     ml_bundle: Any | None = None,
+    sentiment_tier1: Any | None = None,
 ) -> EntryCandidate | None:
     """Evaluate the universe using the 6-factor BreakoutEngine or legacy fallback."""
 
@@ -48,7 +49,7 @@ def evaluate_universe_breakout(
             exclude_symbols=exclude_symbols,
         )
 
-    engine = BreakoutEngine(settings, twak_interface)
+    engine = BreakoutEngine(settings, twak_interface, sentiment_tier1=sentiment_tier1)
     filtered_snapshot = {
         symbol: data
         for symbol, data in snapshot.items()

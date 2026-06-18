@@ -12,13 +12,18 @@ Interface contract:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+import pandas as pd
+
 from src.config.settings import Settings
 from src.strategy.sentiment_tier1 import SentimentTier1
 from src.strategy.volatility import PriceCache
+
+LOGGER = logging.getLogger(__name__)
 
 
 class MarketRegime(Enum):
@@ -51,10 +56,12 @@ class RegimeDetector:
         price_cache: PriceCache,
         sentiment: SentimentTier1,
         settings: Settings,
+        regime_predictor: Any | None = None,
     ) -> None:
         self.price_cache = price_cache
         self.sentiment = sentiment
         self.settings = settings
+        self.regime_predictor = regime_predictor
 
     def detect(self, snapshot: dict[str, dict[str, Any]]) -> RegimeResult:
         """Classify the market from normalized decimal percentage inputs."""
@@ -117,37 +124,65 @@ class RegimeDetector:
         sentiment_fragility: str,
     ) -> RegimeResult:
         if score >= 3.0:
-            return RegimeResult(
-                MarketRegime.TRENDING_UP,
-                score,
-                reasons,
-                1.0,
-                4,
-                self.settings.max_slippage_pct,
-                sentiment_delta,
-                sentiment_fragility,
-            )
-        if score >= 1.0:
-            return RegimeResult(
-                MarketRegime.RANGING,
-                score,
-                reasons,
-                0.5,
-                5,
-                min(self.settings.max_slippage_pct, 0.0075),
-                sentiment_delta,
-                sentiment_fragility,
-            )
+            regime = MarketRegime.TRENDING_UP
+            base_multiplier = 1.0
+            min_factors = 4
+            max_slippage = self.settings.max_slippage_pct
+        elif score >= 1.0:
+            regime = MarketRegime.RANGING
+            base_multiplier = 0.5
+            min_factors = 5
+            max_slippage = min(self.settings.max_slippage_pct, 0.0075)
+        else:
+            regime = MarketRegime.RISK_OFF
+            base_multiplier = 0.1
+            min_factors = 5
+            max_slippage = min(self.settings.max_slippage_pct, 0.005)
+
+        # Optional ML regime model modulation
+        if self.regime_predictor is not None:
+            try:
+                bnb_ohlcv = self._price_cache_to_ohlcv_df("BNB")
+                if bnb_ohlcv is not None and not bnb_ohlcv.empty:
+                    prediction = self.regime_predictor.predict(bnb_ohlcv, {})
+                    confidence = prediction.confidence
+                    reasons.append(f"regime_model_confidence={confidence:.2f}")
+                    if confidence > 0.65:
+                        base_multiplier = 1.0
+                    elif confidence >= 0.55:
+                        base_multiplier = min(base_multiplier, 0.6)
+                    else:
+                        base_multiplier = min(base_multiplier, 0.2)
+            except Exception as exc:
+                LOGGER.warning("RegimePredictor modulation failed: %s", exc)
+
         return RegimeResult(
-            MarketRegime.RISK_OFF,
-            score,
-            reasons,
-            0.1,
-            5,
-            min(self.settings.max_slippage_pct, 0.005),
-            sentiment_delta,
-            sentiment_fragility,
+            regime=regime,
+            score=score,
+            reasons=reasons,
+            position_multiplier=base_multiplier,
+            min_entry_factors=min_factors,
+            max_slippage_pct=max_slippage,
+            sentiment_delta=sentiment_delta,
+            sentiment_fragility=sentiment_fragility,
         )
+
+    def _price_cache_to_ohlcv_df(self, symbol: str) -> pd.DataFrame | None:
+        """Convert PriceCache OHLCV deque to a pandas DataFrame for RegimePredictor."""
+        points = list(self.price_cache._data.get(symbol.upper(), ()))
+        if not points:
+            return None
+        return pd.DataFrame([
+            {
+                "open": p.open,
+                "high": p.high,
+                "low": p.low,
+                "close": p.close,
+                "volume": p.volume,
+                "timestamp": p.timestamp,
+            }
+            for p in points
+        ])
 
     @staticmethod
     def _universe_changes(snapshot: dict[str, dict[str, Any]]) -> list[float]:

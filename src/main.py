@@ -504,10 +504,21 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
         bsc_rpc_url=settings.bsc_rpc_url or "",
         cache_ttl_seconds=_sentiment_cache_ttl(settings),
     )
-    regime_detector = RegimeDetector(price_cache, sentiment, settings)
+    # Load optional regime ML model for position-size modulation
+    regime_predictor = None
+    regime_model_path = Path("models/regime_lgb_v2.pkl")
+    if regime_model_path.exists():
+        try:
+            from src.ml.regime_predictor import RegimePredictor
+
+            regime_predictor = RegimePredictor.load(str(regime_model_path))
+            LOGGER.info("Loaded regime model from %s", regime_model_path)
+        except Exception as exc:
+            LOGGER.warning("Could not load regime model: %s", exc)
+    regime_detector = RegimeDetector(price_cache, sentiment, settings, regime_predictor=regime_predictor)
     liquidity_analyzer = LiquidityAnalyzer()
     execution_reconciler = ExecutionReconciler(toolkit)
-    strategy_bundle = create_strategy_bundle(settings, price_cache, twak_interface)
+    strategy_bundle = create_strategy_bundle(settings, price_cache, twak_interface, sentiment_tier1=sentiment)
     position_manager = strategy_bundle.position_manager
     guardrails = strategy_bundle.guardrails
     scoring.evaluate_universe = strategy_bundle.evaluate_universe
@@ -798,6 +809,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                     settings,
                     twak_interface,
                     exclude_symbols=exclude_symbols,
+                    sentiment_tier1=sentiment,
                     sentiment_result=sentiment_result,
                     ml_bundle=ml_bundle,
                 )
@@ -949,6 +961,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             sentiment_result,
             candidate,
             ml_bundle=ml_bundle,
+            sentiment=sentiment,
         )
         legacy_reason = decision_reasons[-1] if decision_reasons else "ok"
         if candidate is None and telemetry_candidate is not None:
@@ -1266,6 +1279,7 @@ def _evaluate_universe_v25(
     settings: Settings,
     twak_interface: TWAKInterface | None = None,
     exclude_symbols: set[str] | None = None,
+    sentiment_tier1: Any | None = None,
     sentiment_result: SentimentResult | None = None,
     ml_bundle: Any | None = None,
 ) -> EntryCandidate | None:
@@ -1280,6 +1294,7 @@ def _evaluate_universe_v25(
                 settings=settings,
                 twak_interface=twak_interface,
                 exclude_symbols=exclude_symbols or set(),
+                sentiment_tier1=sentiment_tier1,
                 sentiment_result=sentiment_result,
                 ml_bundle=ml_bundle,
             )
@@ -1744,6 +1759,7 @@ def _telemetry_candidate_for_log(
     sentiment_result: SentimentResult | None,
     selected: EntryCandidate | None,
     ml_bundle: Any | None = None,
+    sentiment: Any | None = None,
 ) -> EntryCandidate | None:
     """Return the best evaluated symbol for dashboard telemetry when no entry triggers."""
 
@@ -1773,7 +1789,7 @@ def _telemetry_candidate_for_log(
             strategy_bundle,
         )
 
-    engine = BreakoutEngine(settings, twak_interface)
+    engine = BreakoutEngine(settings, twak_interface, sentiment_tier1=sentiment)
     filtered_snapshot = {
         symbol: data
         for symbol, data in market_snapshot.items()

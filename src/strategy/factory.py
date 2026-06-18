@@ -42,6 +42,7 @@ def create_strategy_bundle(
     settings: Settings,
     price_cache: PriceCache,
     twak_interface: TWAKInterface | None = None,
+    sentiment_tier1: Any | None = None,
 ) -> StrategyBundle:
     """Instantiate guardrails, position manager, and universe evaluator."""
 
@@ -93,6 +94,7 @@ def create_strategy_bundle(
         settings: Settings | None = None,
         twak_interface: TWAKInterface | None = None,
         exclude_symbols: set[str] | None = None,
+        sentiment_tier1: Any | None = None,
         **_: Any,
     ) -> Any:
         active_settings = settings or guardrails.settings
@@ -105,6 +107,7 @@ def create_strategy_bundle(
             twak_interface=twak_interface,
             exclude_symbols=exclude_symbols,
             use_breakout_engine=True,
+            sentiment_tier1=sentiment_tier1,
         )
 
     return StrategyBundle(

@@ -286,6 +286,28 @@ class CMCMCPClient:
 
         return self._call_tool("get_crypto_technical_analysis", {"id": self._symbols_to_id_arg(symbols)})
 
+    def get_crypto_latest_news(self, symbols: list[str]) -> dict[str, Any]:
+        """Call CMC MCP get_crypto_latest_news for the requested symbols."""
+
+        return self._call_tool(
+            "get_crypto_latest_news",
+            {
+                "id": self._symbols_to_id_arg(symbols),
+                "symbol": self._symbols_to_symbol_arg(symbols),
+            },
+        )
+
+    def get_trending_crypto_narratives(self, symbols: list[str]) -> dict[str, Any]:
+        """Call CMC MCP trending_crypto_narratives for the requested symbols."""
+
+        return self._call_tool(
+            "trending_crypto_narratives",
+            {
+                "id": self._symbols_to_id_arg(symbols),
+                "symbol": self._symbols_to_symbol_arg(symbols),
+            },
+        )
+
     def get_global_crypto_derivatives_metrics(self) -> dict[str, Any]:
         """Call CMC MCP get_global_crypto_derivatives_metrics."""
 

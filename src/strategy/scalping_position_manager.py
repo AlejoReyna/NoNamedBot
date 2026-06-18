@@ -34,6 +34,7 @@ class ScalpingPositionManager(PositionManager):
         amount_tokens: float,
         entry_price: float,
         entry_value_usdc: float,
+        trade_id: str | None = None,
     ) -> Position:
         normalized = symbol.upper()
         if self.is_symbol_on_cooldown(normalized):
@@ -50,6 +51,7 @@ class ScalpingPositionManager(PositionManager):
             opened_at=now,
             current_price=entry_price,
             current_price_at=now,
+            trade_id=trade_id,
         )
         self._positions[normalized] = position
         self.persist_positions()
