@@ -49,7 +49,7 @@ def _snapshot(
     bnb_price: float = 110.0,
 ) -> dict[str, dict[str, float]]:
     data = {
-        "BNB": {
+        "BTC": {
             "price": bnb_price,
             "percent_change_1h": bnb_1h,
             "percent_change_6h": bnb_6h,
