@@ -124,6 +124,15 @@ class FeaturePipeline:
             funding_history=ctx.funding_history.get(normalized),
             rank_pctile=rank_pctile,
         )
+        # Log once per symbol if premium fields are absent
+        if cmc_snapshot.get("fear_greed_index") is None and cmc_snapshot.get("funding_rate") is None:
+            import logging
+
+            logging.getLogger(__name__).debug(
+                "[CMC_FEATURES_DEGRADED] %s: premium fields absent from snapshot; "
+                "fear_greed/funding/social features are defaulted. x402 may be inactive.",
+                normalized,
+            )
         cross_features = compute_cross_token_features(
             normalized,
             ohlcv_df,
