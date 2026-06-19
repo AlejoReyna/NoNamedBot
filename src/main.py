@@ -2355,6 +2355,39 @@ EXIT_BALANCE_SAFETY_FACTOR = 0.999
 # as zero so the stale position is removed rather than swapped.
 EXIT_DUST_FLOOR = 1e-12
 
+# Process-level cache of exit swaps that have been submitted but not yet
+# reconciled. Key is the position symbol; value is the submitted tx hash.
+# This prevents the retry cascade described in the BSC exit-swap dust-loop
+# fix. A persisted pending_exit_tx_hash on Position would survive restarts;
+# the in-memory cache is the minimal viable guard.
+_PENDING_EXIT_HASHES: dict[str, str] = {}
+
+
+def _poll_exit_receipt(
+    toolkit: BnbToolkitWrapper,
+    tx_hash: str,
+    max_seconds: float = 30.0,
+) -> dict[str, Any] | None:
+    """Poll eth_getTransactionReceipt with exponential backoff.
+
+    Returns the receipt dict once ``status`` is available, or ``None`` on
+    timeout. Uses simple sleeps; this runs inside the main control loop so
+    the total wait is capped at ``max_seconds``.
+    """
+
+    getter = getattr(toolkit, "get_transaction_receipt", None)
+    if getter is None:
+        return None
+    deadline = time.time() + max_seconds
+    delay = 1.0
+    while time.time() < deadline:
+        receipt = getter(tx_hash)
+        if receipt is not None and "status" in receipt:
+            return receipt
+        time.sleep(min(delay, deadline - time.time()))
+        delay *= 2.0
+    return None
+
 
 def _live_exit_balance(
     position: Position, toolkit: BnbToolkitWrapper | None
@@ -2514,6 +2547,45 @@ def _execute_position_exit(
     position = position_manager.get_position(symbol)
     if position is None:
         return
+
+    # Phase 3 idempotency: never submit a new exit while a prior hash is still
+    # pending or already confirmed. If the receipt is confirmed, close the
+    # position without re-submitting. If it failed, drop the pending entry and
+    # retry. If it is still unconfirmed, skip this cycle.
+    pending_hash = _PENDING_EXIT_HASHES.get(symbol)
+    if pending_hash is not None:
+        if toolkit is None:
+            LOGGER.warning(
+                "Exit for %s has pending hash %s but no toolkit to verify; skipping cycle",
+                symbol,
+                pending_hash,
+            )
+            return
+        receipt = _poll_exit_receipt(toolkit, pending_hash)
+        if receipt is not None and receipt.get("status") == 1:
+            LOGGER.info(
+                "Pending exit for %s already confirmed (%s); closing local position without re-submitting",
+                symbol,
+                pending_hash,
+            )
+            _PENDING_EXIT_HASHES.pop(symbol, None)
+            position_manager.close_position(symbol)
+            return
+        if receipt is not None and receipt.get("status") == 0:
+            LOGGER.warning(
+                "Pending exit for %s failed on-chain (%s); will retry with fresh amount",
+                symbol,
+                pending_hash,
+            )
+            _PENDING_EXIT_HASHES.pop(symbol, None)
+        else:
+            LOGGER.warning(
+                "Pending exit for %s still unconfirmed (%s); skipping cycle to avoid duplicate swap",
+                symbol,
+                pending_hash,
+            )
+            return
+
     execution_slippage = _require_execution_slippage(guardrails.settings.max_slippage_pct)
     balance_before, amount_in = _live_exit_balance(position, toolkit)
     if amount_in <= 0:
@@ -2552,6 +2624,9 @@ def _execute_position_exit(
     if not _execution_has_tx_hash(result):
         LOGGER.error("Exit swap for %s returned no tx hash; local position remains open", symbol)
         return
+    tx_hash = _execution_tx_hash(result)
+    if tx_hash:
+        _PENDING_EXIT_HASHES[symbol] = tx_hash
 
     # Verify the on-chain balance change before removing the local position.
     verified = False
@@ -2566,6 +2641,7 @@ def _execute_position_exit(
                 "Post-sell balance read for %s failed; leaving local position open for retry",
                 symbol,
             )
+            _PENDING_EXIT_HASHES.pop(symbol, None)
             return
         reconcile_result = ExecutionReconciler(toolkit).reconcile_exit(
             result,
@@ -2585,6 +2661,7 @@ def _execute_position_exit(
                 balance_after,
                 amount_in,
             )
+            _PENDING_EXIT_HASHES.pop(symbol, None)
             return
 
     hold_time_seconds = None
@@ -2592,6 +2669,7 @@ def _execute_position_exit(
         hold_time_seconds = position_manager.hold_time_seconds(symbol)
     closed = position_manager.close_position(symbol)
     if closed is not None:
+        _PENDING_EXIT_HASHES.pop(symbol, None)
         realized_pnl = (current_price - closed.entry_price) * amount_in
         try:
             trade_outcome_log.record_exit(

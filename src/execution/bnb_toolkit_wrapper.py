@@ -208,6 +208,24 @@ class BnbToolkitWrapper:
         amount = raw_balance / (10**decimals)
         return self._balance_payload(account, symbol, token, amount, raw_balance, decimals)
 
+    def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
+        """Fetch a transaction receipt by hash, returning None if not available."""
+
+        if self.paper_trade:
+            return {"status": 1, "gasUsed": 0, "blockNumber": 0}
+        w3 = self._get_web3_client()
+        try:
+            receipt = w3.eth.get_transaction_receipt(tx_hash)
+            if receipt is None:
+                return None
+            return {
+                "status": int(receipt.get("status", 1)) if isinstance(receipt, dict) else int(receipt.status),
+                "gasUsed": int(receipt.get("gasUsed", 0)) if isinstance(receipt, dict) else int(receipt.gasUsed),
+                "blockNumber": int(receipt.get("blockNumber", 0)) if isinstance(receipt, dict) else int(receipt.blockNumber),
+            }
+        except Exception:
+            return None
+
     def _get_web3_client(self) -> Any:
         if self.w3 is not None:
             return self.w3

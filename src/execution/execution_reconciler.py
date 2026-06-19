@@ -157,10 +157,28 @@ class ExecutionReconciler:
         delta = before - after
         expected = _to_decimal(amount_sold) if amount_sold is not None else before
 
+        # Trust TWAK success immediately to avoid the dust-loop caused by stale
+        # post-swap balance reads. We intentionally mark balance_delta_confirmed
+        # as False so downstream consumers know the success came from TWAK, not
+        # from a verified balance delta.
+        if _is_twak_success(tx_result):
+            return self._result(
+                "SUCCESS",
+                tx_hash,
+                token,
+                expected,
+                expected,
+                0,
+                0,
+                1,
+                False,
+            )
+
         receipt = tx_result.get("receipt") if isinstance(tx_result.get("receipt"), dict) else {}
+        has_receipt = bool(receipt)
         gas_used = int(receipt.get("gasUsed", receipt.get("gas_used", 0)) or 0)
         block_number = int(receipt.get("blockNumber", receipt.get("block_number", 0)) or 0)
-        receipt_status = int(receipt.get("status", tx_result.get("status", 1)) or 1)
+        receipt_status = int(receipt.get("status", tx_result.get("status", 1)))
 
         expected_remaining = (before - expected).max(Decimal("0"))
         verified = False
@@ -171,6 +189,10 @@ class ExecutionReconciler:
         elif before <= _EXIT_DUST_FLOOR and after <= _EXIT_DUST_FLOOR:
             verified = True
         elif delta >= expected * (Decimal("1") - _EXIT_TOLERANCE_PCT) and after <= expected_remaining + _EXIT_DUST_FLOOR:
+            verified = True
+        elif has_receipt and receipt_status == 1 and tx_hash:
+            # Fallback: if we have a valid receipt but balance is stale (RPC lag),
+            # trust the receipt rather than failing the exit.
             verified = True
 
         status = "SUCCESS" if verified else "FAILED"

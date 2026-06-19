@@ -439,3 +439,125 @@ def test_sell_history_recorded_on_verified_exit(tmp_path: Path, monkeypatch) -> 
     assert "balance_before" in row
     assert "balance_after" in row
     assert row["balance_after"] == pytest.approx(0.0)
+
+
+
+def test_pending_exit_hash_prevents_duplicate_swap_submission(tmp_path: Path, monkeypatch) -> None:
+    """A prior exit hash that is still unconfirmed must block a new swap."""
+    from src import main as main_mod
+
+    settings = _settings(tmp_path)
+    manager = PositionManager(settings)
+    manager.open_position(
+        "DOGE",
+        amount_tokens=5.59594069,
+        entry_price=0.089,
+        position_usd=0.498,
+        atr_pct=0.03,
+        regime=MarketRegime.TRENDING_UP,
+    )
+
+    class _Guardrails:
+        def __init__(self) -> None:
+            self.settings = settings
+
+        def record_trade(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            del args, kwargs
+
+    class _Toolkit:
+        def get_balance(self, symbol: str) -> dict[str, object]:
+            assert symbol == "DOGE"
+            return {"symbol": "DOGE", "balance": 5.59530611}
+
+        def get_transaction_receipt(self, tx_hash: str) -> dict[str, object] | None:
+            # Simulate an unconfirmed transaction (not yet mined).
+            return None
+
+    swap_calls: list[None] = []
+
+    def _swap(*args, **kwargs):
+        del args, kwargs
+        swap_calls.append(None)
+        return {"tx_hash": "0x" + "2" * 64}
+
+    monkeypatch.setattr(main_mod, "_execute_logged_swap", _swap)
+    monkeypatch.setattr(main_mod, "_poll_exit_receipt", lambda _toolkit, _tx_hash, **_kwargs: None)
+    main_mod._PENDING_EXIT_HASHES["DOGE"] = "0x" + "1" * 64
+    try:
+        main_mod._execute_position_exit(
+            manager,
+            object(),
+            _Guardrails(),
+            "DOGE",
+            0.086,
+            100.0,
+            exit_reason="time_stop",
+            toolkit=_Toolkit(),
+        )
+    finally:
+        main_mod._PENDING_EXIT_HASHES.pop("DOGE", None)
+
+    assert manager.get_position("DOGE") is not None
+    assert len(swap_calls) == 0
+
+
+def test_confirmed_pending_exit_hash_closes_position_without_reswap(tmp_path: Path, monkeypatch) -> None:
+    """A prior exit hash that is already confirmed should close the position."""
+    from src import main as main_mod
+
+    settings = _settings(tmp_path)
+    manager = PositionManager(settings)
+    manager.open_position(
+        "DOGE",
+        amount_tokens=5.59594069,
+        entry_price=0.089,
+        position_usd=0.498,
+        atr_pct=0.03,
+        regime=MarketRegime.TRENDING_UP,
+    )
+
+    class _Guardrails:
+        def __init__(self) -> None:
+            self.settings = settings
+
+        def record_trade(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            del args, kwargs
+
+    class _Toolkit:
+        def get_balance(self, symbol: str) -> dict[str, object]:
+            assert symbol == "DOGE"
+            return {"symbol": "DOGE", "balance": 5.59530611}
+
+        def get_transaction_receipt(self, tx_hash: str) -> dict[str, object]:
+            return {"status": 1, "gasUsed": 100000, "blockNumber": 123}
+
+    swap_calls: list[None] = []
+
+    def _swap(*args, **kwargs):
+        del args, kwargs
+        swap_calls.append(None)
+        return {"tx_hash": "0x" + "2" * 64}
+
+    monkeypatch.setattr(main_mod, "_execute_logged_swap", _swap)
+    monkeypatch.setattr(
+        main_mod,
+        "_poll_exit_receipt",
+        lambda _toolkit, _tx_hash, **_kwargs: {"status": 1, "gasUsed": 100000, "blockNumber": 123},
+    )
+    main_mod._PENDING_EXIT_HASHES["DOGE"] = "0x" + "1" * 64
+    try:
+        main_mod._execute_position_exit(
+            manager,
+            object(),
+            _Guardrails(),
+            "DOGE",
+            0.086,
+            100.0,
+            exit_reason="time_stop",
+            toolkit=_Toolkit(),
+        )
+    finally:
+        main_mod._PENDING_EXIT_HASHES.pop("DOGE", None)
+
+    assert manager.get_position("DOGE") is None
+    assert len(swap_calls) == 0
