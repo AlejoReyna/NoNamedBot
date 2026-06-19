@@ -6,6 +6,7 @@ import argparse
 import inspect
 import json
 import logging
+import os
 import re
 import signal
 import sys
@@ -495,6 +496,22 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
     run_id = f"run-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
     Path("logs").mkdir(parents=True, exist_ok=True)
     cmc_client = CMCMCPClient(settings)
+    if not settings.use_dual_market_data:
+        has_key = bool(
+            os.getenv("CMC_X402_EPHEMERAL_KEY", "").strip()
+            or os.getenv("EVM_PRIVATE_KEY", "").strip()
+        )
+        if not has_key:
+            LOGGER.warning(
+                "x402 INACTIVE: CMC_X402_EPHEMERAL_KEY and EVM_PRIVATE_KEY are both unset. "
+                "CMC premium features (RSI, funding_rate, fear_greed, social) will be absent. "
+                "Set either key to re-enable paid enrichment."
+            )
+        elif settings.use_keyless_primary:
+            LOGGER.warning(
+                "x402 INACTIVE: USE_KEYLESS_PRIMARY=true overrides dual-market-data mode. "
+                "CMC premium features are degraded to defaults."
+            )
     toolkit = BnbToolkitWrapper(settings)
     twak_interface = _twak_interface_from_settings(settings, paper_trade=settings.paper_trade)
     router = PancakeSwapRouter(twak_interface)

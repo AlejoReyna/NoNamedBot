@@ -377,7 +377,12 @@ class CMCMCPClient:
         if not quotes:
             LOGGER.warning("Keyless quotes unavailable")
             return {}
-        return self._snapshot_from_quotes(normalized_symbols, quotes)
+        snapshot = self._snapshot_from_quotes(normalized_symbols, quotes)
+        fear_greed = self._fetch_keyless_fear_greed()
+        if fear_greed is not None:
+            for row in snapshot.values():
+                row.setdefault("fear_greed_index", fear_greed)
+        return snapshot
 
     def fetch_x402_enriched_snapshot(
         self,
@@ -842,7 +847,10 @@ class CMCMCPClient:
             self.spend_governor.record_spend(tool=tool_name)
         except Exception as exc:
             LOGGER.warning("CMC MCP x402 call %s failed: %s", tool_name, exc)
-            self.spend_governor.record_failure(tool=tool_name, reason=str(exc))
+            # If the error is pre-payment (key missing, SDK init failure), don't charge
+            reason = str(exc)
+            assume_charged = "returned None" not in reason and "payment key missing" not in reason.lower()
+            self.spend_governor.record_failure(tool=tool_name, reason=reason, assume_charged=assume_charged)
             return self._fetch_keyless(tool_name, arguments)
 
         if not isinstance(payload, dict):
@@ -890,7 +898,10 @@ class CMCMCPClient:
             self.spend_governor.record_spend(tool=tool_name)
         except Exception as exc:
             LOGGER.warning("CMC MCP x402 call %s failed: %s", tool_name, exc)
-            self.spend_governor.record_failure(tool=tool_name, reason=str(exc))
+            # If the error is pre-payment (key missing, SDK init failure), don't charge
+            reason = str(exc)
+            assume_charged = "returned None" not in reason and "payment key missing" not in reason.lower()
+            self.spend_governor.record_failure(tool=tool_name, reason=reason, assume_charged=assume_charged)
             return {}
 
         if not isinstance(payload, dict):
