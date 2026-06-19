@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Literal, Optional
 
@@ -65,7 +66,10 @@ class Settings(BaseModel):
     price_cache_maxlen: int = 2880
     max_position_pct: float = 0.05
     max_daily_trades: int = 3
-    max_daily_loss_pct: float = 0.03
+    max_daily_trades_by_regime: dict[str, int] | None = None
+    global_max_daily_trades: int = 6
+    min_position_size_usd: float = 2.0
+    max_daily_loss_pct: float = 0.02
     max_slippage_pct: float = 0.01
     swap_approval_retry_max: int = Field(default=3, ge=0)
     swap_approval_retry_delay_seconds: float = Field(default=7.0, ge=0.0)
@@ -79,7 +83,7 @@ class Settings(BaseModel):
     # positions that never hit target or trailing stop (0 disables). The
     # competition window flatten liquidates the whole book to USDC shortly
     # before the deadline so the final score is realized cash, not paper.
-    max_hold_hours: float = 0.0
+    max_hold_hours: float = 8.0
     competition_end_utc: str = ""
     flatten_before_end_minutes: int = 30
     risk_off_max_slippage_pct: float = 0.005
@@ -231,6 +235,19 @@ def _get_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _get_dict(name: str, default: dict[str, Any]) -> dict[str, Any]:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return dict(default)
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, dict):
+            return {str(k): int(v) for k, v in parsed.items()}
+    except Exception:
+        pass
+    return dict(default)
+
+
 def _get_float(name: str, default: float) -> float:
     value = os.getenv(name)
     if value is None or value.strip() == "":
@@ -329,7 +346,10 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
         "price_cache_maxlen": _get_int("PRICE_CACHE_MAXLEN", 2880),
         "max_position_pct": _get_float("MAX_POSITION_PCT", 0.05),
         "max_daily_trades": _get_int("MAX_DAILY_TRADES", 3),
-        "max_daily_loss_pct": _get_float("MAX_DAILY_LOSS_PCT", 0.03),
+        "max_daily_trades_by_regime": _get_dict("MAX_DAILY_TRADES_BY_REGIME", {"trending_up": 4, "ranging": 2, "risk_off": 0}),
+        "global_max_daily_trades": _get_int("GLOBAL_MAX_DAILY_TRADES", 6),
+        "min_position_size_usd": _get_float("MIN_POSITION_SIZE_USD", 2.0),
+        "max_daily_loss_pct": _get_float("MAX_DAILY_LOSS_PCT", 0.02),
         "max_slippage_pct": _get_float("MAX_SLIPPAGE_PCT", 0.01),
         "swap_approval_retry_max": _get_int("SWAP_APPROVAL_RETRY_MAX", 3),
         "swap_approval_retry_delay_seconds": _get_float("SWAP_APPROVAL_RETRY_DELAY_SECONDS", 7.0),
@@ -342,7 +362,7 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
         "trailing_stop_pct": _get_float("TRAILING_STOP_PCT", 0.06),
         "take_profit_pct": _get_float("TAKE_PROFIT_PCT", 0.08),
         "base_risk_per_trade_pct": _get_float("BASE_RISK_PER_TRADE_PCT", 0.0035),
-        "max_hold_hours": _get_float("MAX_HOLD_HOURS", 0.0),
+        "max_hold_hours": _get_float("MAX_HOLD_HOURS", 8.0),
         "competition_end_utc": os.getenv("COMPETITION_END_UTC", ""),
         "flatten_before_end_minutes": _get_int("FLATTEN_BEFORE_END_MINUTES", 30),
         "risk_off_max_slippage_pct": _get_float("RISK_OFF_MAX_SLIPPAGE_PCT", 0.005),

@@ -656,7 +656,11 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
         liquidity: Any | None = None
         action = "WAIT"
         entry_position_pct = 0.0
-        entries_allowed = _risk_allows_new_entries(guardrails, risk_decision, portfolio_value, settings)
+        entries_allowed = _risk_allows_new_entries(
+            guardrails, risk_decision, portfolio_value, settings,
+            regime_result=regime_result,
+            position_manager=position_manager,
+        )
         if window_flatten_active:
             entries_allowed = False
         entries_blocked_reason = None if entries_allowed else _entries_blocked_reason(
@@ -664,6 +668,8 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             risk_decision,
             portfolio_value,
             settings,
+            regime_result=regime_result,
+            position_manager=position_manager,
         )
         if window_flatten_active:
             entries_blocked_reason = "competition_window_flatten"
@@ -1181,13 +1187,19 @@ def _risk_allows_new_entries(
     risk_decision: RiskDecision,
     portfolio_value: float,
     settings: Settings,
+    *,
+    regime_result: object | None = None,
+    position_manager: PositionManager | None = None,
 ) -> bool:
     if not risk_decision.allow_new_entries:
         return False
     if settings.strategy_mode == "scalping" and isinstance(guardrails, ScalpingGuardrails):
         return guardrails.scalping_entries_allowed(portfolio_value)
-    daily_count = int(getattr(guardrails, "_daily_trade_count", 0))
-    return daily_count < risk_decision.max_daily_trades
+    open_position_count = len(position_manager.list_open_positions()) if position_manager else 0
+    regime_str = ""
+    if regime_result is not None:
+        regime_str = getattr(getattr(regime_result, "regime", None), "value", str(regime_result)) or ""
+    return guardrails.can_open_new_trade(open_position_count, regime_str)
 
 
 def _entries_blocked_reason(
@@ -1195,6 +1207,9 @@ def _entries_blocked_reason(
     risk_decision: RiskDecision,
     portfolio_value: float,
     settings: Settings,
+    *,
+    regime_result: object | None = None,
+    position_manager: PositionManager | None = None,
 ) -> str | None:
     """Return a stable reason code when new entries are globally blocked."""
 
@@ -1203,8 +1218,11 @@ def _entries_blocked_reason(
     if settings.strategy_mode == "scalping" and isinstance(guardrails, ScalpingGuardrails):
         if not guardrails.scalping_entries_allowed(portfolio_value):
             return "scalping_guardrails"
-    daily_count = int(getattr(guardrails, "_daily_trade_count", 0))
-    if daily_count >= risk_decision.max_daily_trades:
+    open_position_count = len(position_manager.list_open_positions()) if position_manager else 0
+    regime_str = ""
+    if regime_result is not None:
+        regime_str = getattr(getattr(regime_result, "regime", None), "value", str(regime_result)) or ""
+    if not guardrails.can_open_new_trade(open_position_count, regime_str):
         if risk_decision.state == RiskState.REDUCED_RISK:
             return "reduced_risk_daily_trade_limit"
         return "daily_trade_limit"
@@ -1468,6 +1486,25 @@ def _attempt_entry_v25(
         position_pct = position_usd / portfolio_value if portfolio_value > 0 else 0.0
     if position_usd <= 0:
         return EntryAttempt(False, "portfolio floor prevents spend", position_pct, liquidity)
+    min_position_size = float(getattr(settings, "min_position_size_usd", 2.0) or 2.0)
+    if position_usd < min_position_size:
+        LOGGER.warning(
+            "Skipping %s entry: position size $%.2f below minimum floor $%.2f",
+            candidate.symbol,
+            position_usd,
+            min_position_size,
+        )
+        return EntryAttempt(False, f"position size below min floor {min_position_size}", position_pct, liquidity)
+    open_position_count = len(position_manager.list_open_positions())
+    current_regime = getattr(getattr(regime_result, "regime", None), "value", str(regime_result.regime)) if regime_result else ""
+    guardrails.validate_new_trade(
+        candidate.symbol,
+        position_usd,
+        portfolio_value,
+        risk_decision.max_slippage_pct,
+        open_position_count=open_position_count,
+        current_regime=current_regime,
+    )
 
     expected_amount_out = _decimal_div(position_usd, candidate.price)
     balance_before = _balance_before_for_reconciliation(toolkit, candidate.symbol)
@@ -2750,6 +2787,8 @@ def _maybe_enter_position(
     market_snapshot: dict[str, dict[str, Any]],
     portfolio_value: float,
     twak_interface: TWAKInterface,
+    *,
+    regime_result: object | None = None,
 ) -> None:
     if not decision.should_enter or decision.symbol is None:
         LOGGER.info("No entry: %s", decision.reason)
@@ -2794,11 +2833,24 @@ def _maybe_enter_position(
     if decision.position_size_usdc <= 0:
         LOGGER.warning("Signal ignored for %s because portfolio floor prevents spend", decision.symbol)
         return
+    min_position_size = float(getattr(guardrails.settings, "min_position_size_usd", 2.0) or 2.0)
+    if decision.position_size_usdc < min_position_size:
+        LOGGER.warning(
+            "Skipping %s entry: position size $%.2f below minimum floor $%.2f",
+            decision.symbol,
+            decision.position_size_usdc,
+            min_position_size,
+        )
+        return
+    open_position_count = len(position_manager.list_open_positions())
+    current_regime = getattr(getattr(regime_result, "regime", None), "value", "") if regime_result else ""
     guardrails.validate_new_trade(
         decision.symbol,
         decision.position_size_usdc,
         portfolio_value,
         slippage,
+        open_position_count=open_position_count,
+        current_regime=current_regime,
     )
     price = _number(token_data.get("price"))
     if price <= 0:
