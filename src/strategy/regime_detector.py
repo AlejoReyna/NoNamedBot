@@ -25,6 +25,10 @@ from src.strategy.volatility import PriceCache
 
 LOGGER = logging.getLogger(__name__)
 
+# Consecutive cycles a worse signal must persist before a regime downgrade commits.
+# Upgrades are always immediate. Set to 1 to disable hysteresis.
+_DOWNGRADE_HOLD_CYCLES: int = 3
+
 
 class MarketRegime(Enum):
     """Coarse deterministic market regimes."""
@@ -32,6 +36,14 @@ class MarketRegime(Enum):
     TRENDING_UP = "trending_up"
     RANGING = "ranging"
     RISK_OFF = "risk_off"
+
+
+# Regime ordering for hysteresis comparisons (higher = better market condition).
+_REGIME_ORDER: dict[str, int] = {
+    MarketRegime.TRENDING_UP.value: 2,
+    MarketRegime.RANGING.value: 1,
+    MarketRegime.RISK_OFF.value: 0,
+}
 
 
 @dataclass(frozen=True)
@@ -49,7 +61,22 @@ class RegimeResult:
 
 
 class RegimeDetector:
-    """Rules-based detector with sentiment as a soft score modifier only."""
+    """Rules-based detector with BTC as the primary macro signal.
+
+    Scoring (range -2.5 to +6.0):
+        BTC 1h % change > 0          → +1.0
+        BTC 6h % change > 0          → +1.0
+        BTC 24h % change > 0         → +1.0
+        BSC universe breadth ≥ 60%   → +1.0 (< 35% → -1.0)
+        BTC price above EMA-288      → +1.0 (below → -1.0)
+        Sentiment delta              → variable (typically -2.5 to +1.0)
+
+    Thresholds: TRENDING_UP ≥ 3.0 · RANGING ≥ 1.0 · RISK_OFF < 1.0
+
+    Hysteresis: a downgrade requires _DOWNGRADE_HOLD_CYCLES consecutive
+    cycles where the raw score would produce a lower regime.  Upgrades
+    commit immediately so the bot never misses a risk-on window.
+    """
 
     def __init__(
         self,
@@ -62,27 +89,32 @@ class RegimeDetector:
         self.sentiment = sentiment
         self.settings = settings
         self.regime_predictor = regime_predictor
+        # Hysteresis state — intentionally not reset between cycles
+        self._last_regime: MarketRegime | None = None
+        self._downgrade_hold: int = 0
 
     def detect(self, snapshot: dict[str, dict[str, Any]]) -> RegimeResult:
         """Classify the market from normalized decimal percentage inputs."""
 
-        bnb = snapshot.get("BNB", {})
+        btc = snapshot.get("BTC", {})
         reasons: list[str] = []
         score = 0.0
 
-        bnb_1h = self._number(bnb.get("percent_change_1h"), 0.0)
-        bnb_6h = self._number(bnb.get("percent_change_6h"), 0.0)
-        bnb_24h = self._number(bnb.get("percent_change_24h"), 0.0)
-        if bnb_1h > 0:
+        # ── BTC price-action factors (3 pts max) ────────────────────────────
+        btc_1h = self._number(btc.get("percent_change_1h"), 0.0)
+        btc_6h = self._number(btc.get("percent_change_6h"), 0.0)
+        btc_24h = self._number(btc.get("percent_change_24h"), 0.0)
+        if btc_1h > 0:
             score += 1.0
-            reasons.append("bnb_1h_positive")
-        if bnb_6h > 0:
+            reasons.append("btc_1h_positive")
+        if btc_6h > 0:
             score += 1.0
-            reasons.append("bnb_6h_positive")
-        if bnb_24h > 0:
+            reasons.append("btc_6h_positive")
+        if btc_24h > 0:
             score += 1.0
-            reasons.append("bnb_24h_positive")
+            reasons.append("btc_24h_positive")
 
+        # ── BSC universe breadth (±1 pt) ────────────────────────────────────
         changes_6h = self._universe_changes(snapshot)
         if changes_6h:
             breadth = sum(1 for value in changes_6h if value > 0) / len(changes_6h)
@@ -93,28 +125,60 @@ class RegimeDetector:
                 score -= 1.0
                 reasons.append("universe_breadth_weak")
 
-        bnb_price = self._optional_number(bnb.get("price"))
-        bnb_ema_288 = self.price_cache.get_ema("BNB", periods=288)
-        if bnb_price is not None and bnb_ema_288 is not None:
-            if bnb_price > bnb_ema_288:
+        # ── BTC vs EMA-288 (±1 pt, requires 24 h of 5-min data) ────────────
+        btc_price = self._optional_number(btc.get("price"))
+        btc_ema_288 = self.price_cache.get_ema("BTC", periods=288)
+        if btc_price is not None and btc_ema_288 is not None:
+            if btc_price > btc_ema_288:
                 score += 1.0
-                reasons.append("bnb_above_ema288")
+                reasons.append("btc_above_ema288")
             else:
                 score -= 1.0
-                reasons.append("bnb_below_ema288")
+                reasons.append("btc_below_ema288")
 
+        # ── Sentiment delta (variable, −2.5 to +1.0 typical) ────────────────
         sentiment_result = self.sentiment.compute_sentiment()
         score += sentiment_result.sentiment_delta
         if sentiment_result.regime_fragility != "NONE":
             reasons.append(f"sentiment_{sentiment_result.regime_fragility}")
 
-        atr_1h = self.price_cache.get_atr_pct("BNB", periods=14)
-        atr_24h = self.price_cache.get_atr_pct("BNB", periods=288)
+        # ── Volatility breaker (annotation only, does not alter score) ───────
+        atr_1h = self.price_cache.get_atr_pct("BTC", periods=14)
+        atr_24h = self.price_cache.get_atr_pct("BTC", periods=288)
         if atr_1h is not None and atr_24h is not None:
-            if atr_1h > 3 * atr_24h and bnb_1h < -0.015:
+            if atr_1h > 3 * atr_24h and btc_1h < -0.015:
                 reasons.append("volatility_breaker_reported")
 
-        return self._result(score, reasons, sentiment_result.sentiment_delta, sentiment_result.regime_fragility)
+        candidate = self._result(
+            score, reasons,
+            sentiment_result.sentiment_delta,
+            sentiment_result.regime_fragility,
+        )
+
+        # ── Hysteresis ────────────────────────────────────────────────────────
+        # Upgrades commit immediately.  Downgrades require _DOWNGRADE_HOLD_CYCLES
+        # consecutive cycles of a lower raw score before the new regime applies.
+        if (
+            self._last_regime is not None
+            and _REGIME_ORDER[candidate.regime.value] < _REGIME_ORDER[self._last_regime.value]
+        ):
+            self._downgrade_hold += 1
+            if self._downgrade_hold < _DOWNGRADE_HOLD_CYCLES:
+                hold_reasons = list(reasons) + [
+                    f"hysteresis_hold_{self._downgrade_hold}of{_DOWNGRADE_HOLD_CYCLES}"
+                ]
+                return self._build_result(
+                    self._last_regime, score, hold_reasons,
+                    sentiment_result.sentiment_delta,
+                    sentiment_result.regime_fragility,
+                )
+            # Threshold reached — commit the downgrade and reset counter.
+            self._downgrade_hold = 0
+        else:
+            self._downgrade_hold = 0
+
+        self._last_regime = candidate.regime
+        return candidate
 
     def _result(
         self,
@@ -123,6 +187,7 @@ class RegimeDetector:
         sentiment_delta: float,
         sentiment_fragility: str,
     ) -> RegimeResult:
+        """Derive regime + params from score, then optionally apply ML modulation."""
         if score >= 3.0:
             regime = MarketRegime.TRENDING_UP
             base_multiplier = 1.0
@@ -142,9 +207,9 @@ class RegimeDetector:
         # Optional ML regime model modulation
         if self.regime_predictor is not None:
             try:
-                bnb_ohlcv = self._price_cache_to_ohlcv_df("BNB")
-                if bnb_ohlcv is not None and not bnb_ohlcv.empty:
-                    prediction = self.regime_predictor.predict(bnb_ohlcv, {})
+                btc_ohlcv = self._price_cache_to_ohlcv_df("BTC")
+                if btc_ohlcv is not None and not btc_ohlcv.empty:
+                    prediction = self.regime_predictor.predict(btc_ohlcv, {})
                     confidence = prediction.confidence
                     reasons.append(f"regime_model_confidence={confidence:.2f}")
                     if confidence > 0.65:
@@ -155,6 +220,43 @@ class RegimeDetector:
                         base_multiplier = min(base_multiplier, 0.2)
             except Exception as exc:
                 LOGGER.warning("RegimePredictor modulation failed: %s", exc)
+
+        return RegimeResult(
+            regime=regime,
+            score=score,
+            reasons=reasons,
+            position_multiplier=base_multiplier,
+            min_entry_factors=min_factors,
+            max_slippage_pct=max_slippage,
+            sentiment_delta=sentiment_delta,
+            sentiment_fragility=sentiment_fragility,
+        )
+
+    def _build_result(
+        self,
+        regime: MarketRegime,
+        score: float,
+        reasons: list[str],
+        sentiment_delta: float,
+        sentiment_fragility: str,
+    ) -> RegimeResult:
+        """Build a RegimeResult for an explicit regime without ML modulation.
+
+        Used by the hysteresis hold path to preserve the last regime's
+        execution parameters while surfacing the current raw score.
+        """
+        if regime == MarketRegime.TRENDING_UP:
+            base_multiplier = 1.0
+            min_factors = 4
+            max_slippage = self.settings.max_slippage_pct
+        elif regime == MarketRegime.RANGING:
+            base_multiplier = 0.5
+            min_factors = 5
+            max_slippage = min(self.settings.max_slippage_pct, 0.0075)
+        else:
+            base_multiplier = 0.1
+            min_factors = 5
+            max_slippage = min(self.settings.max_slippage_pct, 0.005)
 
         return RegimeResult(
             regime=regime,
@@ -186,7 +288,7 @@ class RegimeDetector:
 
     @staticmethod
     def _universe_changes(snapshot: dict[str, dict[str, Any]]) -> list[float]:
-        excluded = {"USDT", "USDC", "BUSD", "BNB"}
+        excluded = {"USDT", "USDC", "BUSD", "BNB", "BTC"}
         values: list[float] = []
         for symbol, data in snapshot.items():
             if symbol.upper() in excluded:

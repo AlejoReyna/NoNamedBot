@@ -267,6 +267,7 @@ CMC_IDS_BY_SYMBOL: dict[str, str] = {
     "DOGE": "74",
     "BONK": "23095",
     "FLOKI": "10804",
+    "BTC": "1",
     "BNB": "1839",
     "WBNB": "7192",
     "BTCB": "4023",

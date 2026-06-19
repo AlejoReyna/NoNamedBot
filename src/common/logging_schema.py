@@ -52,6 +52,7 @@ class LiveDecisionLog(LogEntry):
     source: str = "LIVE"
     regime: str = "unknown"
     regime_score: float = 0.0
+    regime_reasons: list[str] = field(default_factory=list)
     ema_72: float | None = None
     ema_144: float | None = None
     ema_288: float | None = None

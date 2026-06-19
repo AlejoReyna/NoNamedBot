@@ -1105,11 +1105,11 @@ def _fallback_regime_result(
     settings: Settings,
     sentiment_result: SentimentResult,
 ) -> RegimeResult:
-    bnb = snapshot.get("BNB", {})
+    btc = snapshot.get("BTC", {})
     positive_count = sum(
         1
         for key in ("percent_change_1h", "percent_change_6h", "percent_change_24h")
-        if _number(bnb.get(key), 0.0) > 0
+        if _number(btc.get(key), 0.0) > 0
     )
     if positive_count >= 2:
         regime = MarketRegime.RANGING
@@ -1673,9 +1673,10 @@ def _write_v25_cycle_logs(
             reasons=[reason for reason in reasons if reason],
             regime=regime_result.regime.value,
             regime_score=regime_result.score,
-            ema_72=price_cache.get_ema("BNB", 72),
-            ema_144=price_cache.get_ema("BNB", 144),
-            ema_288=price_cache.get_ema("BNB", 288),
+            regime_reasons=list(regime_result.reasons),
+            ema_72=price_cache.get_ema("BTC", 72),
+            ema_144=price_cache.get_ema("BTC", 144),
+            ema_288=price_cache.get_ema("BTC", 288),
             atr_pct=price_cache.get_atr_pct(symbol, 14) if symbol else None,
             position_pct=position_pct,
             slippage_quote=getattr(liquidity, "slippage_normal", None) if liquidity is not None else None,
@@ -2129,11 +2130,13 @@ def _fetch_snapshot(
             force_x402_refresh=force_x402,
         )
         _ensure_bnb_reference(snapshot, cmc_client)
+        _ensure_btc_reference(snapshot, cmc_client)
         return snapshot
 
     def _load() -> dict[str, dict[str, Any]]:
         snapshot = cmc_client.fetch_market_snapshot(TARGET_SYMBOLS)
         _ensure_bnb_reference(snapshot, cmc_client)
+        _ensure_btc_reference(snapshot, cmc_client)
         return snapshot
 
     return get_market_snapshot_cache().get_or_fetch(settings.cmc_snapshot_ttl_seconds, _load)
@@ -2188,6 +2191,52 @@ def _ensure_bnb_reference(snapshot: dict[str, dict[str, Any]], cmc_client: CMCMC
             }
     except Exception as exc:
         LOGGER.warning("Could not fetch BNB reference snapshot: %s", exc)
+
+
+def _ensure_btc_reference(snapshot: dict[str, dict[str, Any]], cmc_client: CMCMCPClient) -> None:
+    """Inject a BTC entry into the snapshot for regime detection.
+
+    BTC is not in TARGET_SYMBOLS (only BTCB is on BSC), so it must be fetched
+    as a side-call — identical pattern to _ensure_bnb_reference. Uses keyless
+    CMC to avoid the $0.01/cycle x402 paid leak. CMC id=1 (bitcoin).
+    """
+    if "BTC" in snapshot:
+        return
+    try:
+        payload = cmc_client._fetch_keyless(
+            "get_crypto_quotes_latest", {"id": "1"}  # id=1 is Bitcoin
+        )
+        btc = cmc_client._by_symbol(payload).get("BTC")
+        if isinstance(btc, dict):
+            quote = btc.get("quote")
+            usd: dict[str, Any] = {}
+            if isinstance(quote, dict):
+                usd = quote.get("USD") or {}
+            elif isinstance(quote, list):
+                usd = next(
+                    (q for q in quote if isinstance(q, dict) and str(q.get("symbol", "")).upper() == "USD"),
+                    {},
+                )
+
+            def _q(key: str) -> Any:
+                value = usd.get(key)
+                return value if value is not None else btc.get(key)
+
+            volume_24h = _maybe_number(_q("volume_24h"))
+            snapshot["BTC"] = {
+                "symbol": "BTC",
+                "price": _maybe_number(_q("price")),
+                "market_cap": _maybe_number(_q("market_cap")),
+                "volume_24h": volume_24h,
+                "rolling_24h_hourly_volume_avg": volume_24h / 24 if volume_24h else None,
+                "percent_change_1h": _maybe_number(_q("percent_change_1h")),
+                "percent_change_6h": _maybe_number(_q("percent_change_6h")),
+                "percent_change_24h": _maybe_number(_q("percent_change_24h")),
+                "high_24h": _maybe_number(_q("high_24h")),
+                "low_24h": _maybe_number(_q("low_24h")),
+            }
+    except Exception as exc:
+        LOGGER.warning("Could not fetch BTC reference snapshot: %s", exc)
 
 
 def _load_positions_or_reconstruct(
