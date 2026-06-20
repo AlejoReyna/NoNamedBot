@@ -95,6 +95,9 @@ def create_strategy_bundle(
         twak_interface: TWAKInterface | None = None,
         exclude_symbols: set[str] | None = None,
         sentiment_tier1: Any | None = None,
+        x402_cost_usdc: float = 0.0,
+        enriched_symbols: set[str] | None = None,
+        position_symbols: set[str] | None = None,
         **_: Any,
     ) -> Any:
         active_settings = settings or guardrails.settings
@@ -108,6 +111,9 @@ def create_strategy_bundle(
             exclude_symbols=exclude_symbols,
             use_breakout_engine=True,
             sentiment_tier1=sentiment_tier1,
+            x402_cost_usdc=x402_cost_usdc,
+            enriched_symbols=enriched_symbols,
+            position_symbols=position_symbols,
         )
 
     return StrategyBundle(

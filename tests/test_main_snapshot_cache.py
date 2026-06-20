@@ -18,10 +18,19 @@ class FakeCMCClient:
         return {"CAKE": {"symbol": "CAKE", "price": float(self.calls)}}
 
 
+class _SpendGovernor:
+    def __init__(self) -> None:
+        self._spend = 0.0
+
+    def snapshot(self) -> dict[str, Any]:
+        return {"daily_spend_usdc": self._spend}
+
+
 class DualFakeCMCClient:
     def __init__(self) -> None:
         self.x402_calls = 0
         self.keyless_calls = 0
+        self.spend_governor = _SpendGovernor()
 
     def fetch_x402_enriched_snapshot(
         self,
@@ -50,8 +59,8 @@ def test_fetch_snapshot_reuses_cmc_client_within_ttl() -> None:
     first = main_module._fetch_snapshot(settings, client)  # type: ignore[arg-type]
     second = main_module._fetch_snapshot(settings, client)  # type: ignore[arg-type]
 
-    assert first == {"CAKE": {"symbol": "CAKE", "price": 1.0}}
-    assert second == first
+    assert first[0] == {"CAKE": {"symbol": "CAKE", "price": 1.0}}
+    assert second[0] == first[0]
     assert client.calls == 1
     get_market_snapshot_cache().reset()
 
@@ -74,9 +83,9 @@ def test_fetch_snapshot_dual_mode_refreshes_keyless_each_cycle(monkeypatch: obje
     now["value"] += 300
     second = main_module._fetch_snapshot(settings, client)  # type: ignore[arg-type]
 
-    assert first["CAKE"]["price"] == 1.0
-    assert second["CAKE"]["price"] == 2.0
-    assert second["CAKE"]["estimated_slippage_pct"] == 0.002
+    assert first[0]["CAKE"]["price"] == 1.0
+    assert second[0]["CAKE"]["price"] == 2.0
+    assert second[0]["CAKE"]["estimated_slippage_pct"] == 0.002
     assert client.x402_calls == 1
     assert client.keyless_calls == 2
     get_dual_market_snapshot_cache().reset()

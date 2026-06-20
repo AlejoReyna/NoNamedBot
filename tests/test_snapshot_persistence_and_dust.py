@@ -34,11 +34,20 @@ def _settings(**overrides: Any) -> Settings:
     return Settings(**base)
 
 
+class _SpendGovernor:
+    def __init__(self) -> None:
+        self._spend = 0.0
+
+    def snapshot(self) -> dict[str, Any]:
+        return {"daily_spend_usdc": self._spend}
+
+
 class DualFakeCMCClient:
     def __init__(self) -> None:
         self.x402_calls = 0
         self.keyless_calls = 0
         self.x402_symbols: list[list[str]] = []
+        self.spend_governor = _SpendGovernor()
         self.keyless_payload: dict[str, dict[str, Any]] = {
             "CAKE": {"symbol": "CAKE", "price": 1.0, "volume_24h": 1000.0}
         }

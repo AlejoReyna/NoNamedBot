@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +17,7 @@ from src.config.tokens import (
     is_momentum_candidate_symbol,
     is_tradable_symbol,
 )
+from src.data.x402_optimizer import scale_alpha, ALPHA
 from src.execution.twak_interface import TWAKInterface
 
 LOGGER = logging.getLogger(__name__)
@@ -92,6 +94,9 @@ class _CheapCandidate:
     cmc_rank: int | None = None
     watchlist_count: int | None = None
     circulating_supply: float | None = None
+    # Fix #1 / #8: integration metadata for freshness and keyless degradation.
+    data_age_seconds: float = 0.0
+    technicals_available: bool = True
 
 
 
@@ -203,6 +208,8 @@ class BreakoutEngine:
         token_data: dict[str, Any],
         portfolio_value_usdc: float,
         ml_context: Any | None = None,
+        x402_cost_usdc: float = 0.0,
+        technicals_available: bool = True,
     ) -> BreakoutDecision:
         """Evaluate one token against the entry filter."""
 
@@ -248,7 +255,13 @@ class BreakoutEngine:
                 ml_context=ml_context,
             )
 
-        candidate = self._evaluate_cheap_candidate(token_data, portfolio_value_usdc)
+        data_age_seconds = float(token_data.get("data_age_seconds", 0.0) or 0.0)
+        candidate = self._evaluate_cheap_candidate(
+            token_data,
+            portfolio_value_usdc,
+            data_age_seconds=data_age_seconds,
+            technicals_available=technicals_available,
+        )
         if not candidate.atr_pass:
             return BreakoutDecision(
                 should_enter=False,
@@ -266,7 +279,14 @@ class BreakoutEngine:
             except Exception:
                 token_sentiment = {}
         cached_z = self._last_momentum_z_scores.get(candidate.symbol, 0.0)
-        entry_score = self._entry_score(candidate, momentum_z_score=cached_z, token_sentiment=token_sentiment, atr_ratio=candidate.atr_ratio)
+        entry_score = self._entry_score(
+            candidate,
+            momentum_z_score=cached_z,
+            token_sentiment=token_sentiment,
+            atr_ratio=candidate.atr_ratio,
+            x402_cost_usdc=x402_cost_usdc,
+            portfolio_value_usdc=portfolio_value_usdc,
+        )
 
         estimated_slippage: float | None = None
         quote_state = "not_quoted"
@@ -286,6 +306,8 @@ class BreakoutEngine:
         token_data: dict[str, Any],
         portfolio_value_usdc: float,
         bnb_data: dict[str, Any] | None = None,
+        data_age_seconds: float = 0.0,
+        technicals_available: bool = True,
     ) -> _CheapCandidate:
         """Evaluate all candidate factors that do not require TWAK."""
 
@@ -317,8 +339,11 @@ class BreakoutEngine:
             position_size *= float(getattr(self.settings, "regime_size_multiplier", 0.5))
         position_size *= macro_size_multiplier
 
+        # Fix #8: when technicals are unavailable (keyless-only path), do not
+        # require RSI and treat it as missing-instead-of-failed for scoring.
         if rsi is None:
-            self._warn_missing_factor_once(symbol, "rsi_in_range")
+            if technicals_available:
+                self._warn_missing_factor_once(symbol, "rsi_in_range")
             rsi_in_range = False
         else:
             rsi_in_range = 55.0 <= rsi <= 75.0
@@ -388,6 +413,9 @@ class BreakoutEngine:
             cmc_rank=cmc_rank,
             watchlist_count=watchlist_count,
             circulating_supply=circulating_supply,
+            # Fix #1 / #8: pass integration metadata into the candidate.
+            data_age_seconds=max(0.0, float(data_age_seconds)),
+            technicals_available=bool(technicals_available),
         )
 
     def _compute_atr_14(self, symbol: str) -> tuple[float | None, float | None]:
@@ -423,7 +451,24 @@ class BreakoutEngine:
         returned nothing. The caller uses ``"not_quoted"`` for candidates that
         were never sent for a quote at all, so the three cases stay distinct in
         telemetry instead of collapsing into a single ``None``.
+
+        Fix #4: if the snapshot already carries a fresh slippage estimate
+        (age < 30 s), use it; otherwise force a fresh TWAK re-quote so a stale
+        quote from a previous cycle is never traded.
         """
+
+        token_data = candidate.token_data or {}
+        cached_slippage = self._positive_number(token_data.get("estimated_slippage_pct"))
+        # Fix #4: only trust a cached slippage estimate when its age is explicitly
+        # provided and fresh (< 30 s).  A snapshot field with no age metadata is
+        # treated as stale and forces a TWAK re-quote.
+        quote_age_seconds = token_data.get("slippage_quote_age_seconds")
+        if (
+            cached_slippage is not None
+            and quote_age_seconds is not None
+            and float(quote_age_seconds) < 30.0
+        ):
+            return cached_slippage, "quoted"
 
         try:
             value = self.twak_interface.estimate_slippage_pct(
@@ -447,10 +492,23 @@ class BreakoutEngine:
         slippage_quote_state: str = "not_quoted",
         ml_context: Any | None = None,
         token_sentiment: dict[str, Any] | None = None,
+        x402_cost_usdc: float = 0.0,
+        portfolio_value_usdc: float = 0.0,
     ) -> BreakoutDecision:
         """Build a full decision after optional TWAK slippage evaluation."""
 
-        resolved_score = self._entry_score(candidate, momentum_z_score=0.0, token_sentiment=token_sentiment, atr_ratio=candidate.atr_ratio) if entry_score is None else entry_score
+        resolved_score = (
+            self._entry_score(
+                candidate,
+                momentum_z_score=0.0,
+                token_sentiment=token_sentiment,
+                atr_ratio=candidate.atr_ratio,
+                x402_cost_usdc=x402_cost_usdc,
+                portfolio_value_usdc=portfolio_value_usdc,
+            )
+            if entry_score is None
+            else entry_score
+        )
         slippage_under_cap = (
             estimated_slippage is not None
             and estimated_slippage >= 0
@@ -591,16 +649,18 @@ class BreakoutEngine:
                 return False, f"chop regime (confidence {ml_confidence:.3f})", quality_guards
 
         # Rule-based guards (always applied; these are the fail-closed floor).
+        # Fix #8: do not require RSI when technicals are unavailable.
+        effective_require_rsi = require_rsi and candidate.technicals_available
         quality_guards["factor_count_ok"] = min_factor_count <= 0 or true_factor_count >= min_factor_count
         quality_guards["risk_off_ok"] = not block_risk_off or candidate.regime_not_risk_off
-        quality_guards["rsi_ok"] = not require_rsi or candidate.rsi_in_range
+        quality_guards["rsi_ok"] = not effective_require_rsi or candidate.rsi_in_range
         quality_guards["score_buffer_ok"] = score_buffer <= 0 or resolved_score >= threshold + score_buffer
 
         if block_risk_off and not candidate.regime_not_risk_off:
             return False, "rule-based regime is risk-off", quality_guards
         if min_factor_count > 0 and true_factor_count < min_factor_count:
             return False, f"only {true_factor_count}/{TOTAL_FACTOR_COUNT} entry factors passed (min {min_factor_count})", quality_guards
-        if require_rsi and not candidate.rsi_in_range:
+        if effective_require_rsi and not candidate.rsi_in_range:
             return False, "RSI missing or outside 55–75 band", quality_guards
         if score_buffer > 0 and resolved_score < threshold + score_buffer:
             return False, f"entry score {resolved_score:.1f} below buffered threshold {threshold + score_buffer:.1f}", quality_guards
@@ -686,17 +746,30 @@ class BreakoutEngine:
         market_snapshot: dict[str, dict[str, Any]],
         portfolio_value_usdc: float,
         ml_contexts: dict[str, Any] | None = None,
+        x402_cost_usdc: float = 0.0,
+        enriched_symbols: set[str] | None = None,
+        position_symbols: set[str] | None = None,
     ) -> list[BreakoutDecision]:
         """Scan target symbols and return all slippage-confirmed entry decisions."""
 
         ml_contexts = ml_contexts or {}
+        enriched_symbols = {s.upper() for s in (enriched_symbols or set())}
+        position_symbols = {s.upper() for s in (position_symbols or set())}
+        regime_refs = {"BNB", "BTC", "WBNB"}
         bnb_reference = self._bnb_reference(market_snapshot)
         candidates: list[_CheapCandidate] = []
         best_decision: BreakoutDecision | None = None
         best_volume = -1.0
         saw_target_symbol = False
         require_contract = bool(getattr(self.settings, "require_verified_bsc_contract", True))
+        evaluated_count = 0
+        skipped_count = 0
         for symbol, token_data in market_snapshot.items():
+            normalized = symbol.upper()
+            # Fix #5: only score enriched symbols, open positions, or regime refs.
+            if enriched_symbols and normalized not in enriched_symbols | position_symbols | regime_refs:
+                skipped_count += 1
+                continue
             if not is_tradable_symbol(symbol) or not is_momentum_candidate_symbol(symbol):
                 continue
             # Skip symbols TWAK cannot execute (no verified BEP-20 contract): they
@@ -705,15 +778,39 @@ class BreakoutEngine:
             if require_contract and not has_verified_bsc_contract(symbol):
                 continue
             saw_target_symbol = True
-            enriched_data = {"symbol": symbol.upper(), **token_data}
+            evaluated_count += 1
+            enriched_data = {"symbol": normalized, **token_data}
             if not is_liquid(enriched_data):
                 continue
+            # Fix #8: technicals are "available" when the snapshot actually
+            # contains them (keyless/paper often does) or when we paid for x402
+            # enrichment this cycle.  Do not disable the RSI weight just because
+            # the enrichment scope is wider/narrower.
+            has_rsi = token_data.get("rsi") is not None
+            paid_technicals = (
+                normalized in enriched_symbols
+                and bool(getattr(self.settings, "x402_fetch_technicals", True))
+            )
+            technicals_available = bool(has_rsi or paid_technicals)
+            data_age_seconds = float(token_data.get("data_age_seconds", 0.0) or 0.0)
             candidate = self._evaluate_cheap_candidate(
-                enriched_data, portfolio_value_usdc, bnb_data=bnb_reference
+                enriched_data,
+                portfolio_value_usdc,
+                bnb_data=bnb_reference,
+                data_age_seconds=data_age_seconds,
+                technicals_available=technicals_available,
             )
             if not candidate.atr_pass:
                 continue
             candidates.append(candidate)
+        # Fix #5: log enrichment-vs-universe mismatch once per evaluation.
+        if enriched_symbols and (evaluated_count + skipped_count) > 0:
+            LOGGER.info(
+                "Evaluating %d/%d enriched symbols; remaining %d skipped (keyless-only).",
+                evaluated_count,
+                evaluated_count + skipped_count,
+                skipped_count,
+            )
 
         # Fetch token sentiments in batch for candidates
         token_sentiments: dict[str, dict[str, Any]] = {}
@@ -730,6 +827,8 @@ class BreakoutEngine:
                 estimated_slippage=None,
                 ml_context=ml_contexts.get(candidate.symbol),
                 token_sentiment=token_sentiments.get(candidate.symbol, {}),
+                x402_cost_usdc=x402_cost_usdc,
+                portfolio_value_usdc=portfolio_value_usdc,
             )
             if self._is_better_decision(unquoted_decision, candidate.volume_24h, best_decision, best_volume):
                 best_decision = unquoted_decision
@@ -743,6 +842,8 @@ class BreakoutEngine:
                 momentum_z_score=momentum_scores.get(candidate.symbol, 0.0),
                 token_sentiment=token_sentiments.get(candidate.symbol, {}),
                 atr_ratio=candidate.atr_ratio,
+                x402_cost_usdc=x402_cost_usdc,
+                portfolio_value_usdc=portfolio_value_usdc,
             )
             for candidate in candidates
         }
@@ -756,11 +857,19 @@ class BreakoutEngine:
                     entry_score=scores_by_symbol.get(best_symbol),
                     ml_context=ml_contexts.get(best_symbol),
                     token_sentiment=token_sentiments.get(best_symbol, {}),
+                    x402_cost_usdc=x402_cost_usdc,
+                    portfolio_value_usdc=portfolio_value_usdc,
                 )
+        # Fix #5: TWAK quotes are limited to enriched candidates only.
+        enriched_candidates = [
+            candidate
+            for candidate in candidates
+            if not enriched_symbols or candidate.symbol in enriched_symbols
+        ]
         quote_candidates = sorted(
             (
                 candidate
-                for candidate in candidates
+                for candidate in enriched_candidates
                 if self._should_quote_candidate(candidate, scores_by_symbol.get(candidate.symbol, 0.0))
             ),
             key=lambda candidate: (
@@ -782,6 +891,8 @@ class BreakoutEngine:
                 slippage_quote_state=quote_state,
                 ml_context=ml_contexts.get(candidate.symbol),
                 token_sentiment=token_sentiments.get(candidate.symbol, {}),
+                x402_cost_usdc=x402_cost_usdc,
+                portfolio_value_usdc=portfolio_value_usdc,
             )
             if decision.should_enter:
                 passers.append(decision)
@@ -816,10 +927,20 @@ class BreakoutEngine:
         market_snapshot: dict[str, dict[str, Any]],
         portfolio_value_usdc: float,
         ml_contexts: dict[str, Any] | None = None,
+        x402_cost_usdc: float = 0.0,
+        enriched_symbols: set[str] | None = None,
+        position_symbols: set[str] | None = None,
     ) -> BreakoutDecision:
         """Scan target symbols and pick the highest-scoring candidate."""
 
-        decisions = self.evaluate_all(market_snapshot, portfolio_value_usdc, ml_contexts=ml_contexts)
+        decisions = self.evaluate_all(
+            market_snapshot,
+            portfolio_value_usdc,
+            ml_contexts=ml_contexts,
+            x402_cost_usdc=x402_cost_usdc,
+            enriched_symbols=enriched_symbols,
+            position_symbols=position_symbols,
+        )
         passers = [decision for decision in decisions if decision.should_enter]
         if passers:
             return passers[0]
@@ -833,8 +954,36 @@ class BreakoutEngine:
     def _should_quote_candidate(self, candidate: _CheapCandidate, entry_score: float) -> bool:
         return not candidate.chase_cap_exceeded and entry_score >= self._quote_score_floor
 
-    def _entry_score(self, candidate: _CheapCandidate, momentum_z_score: float, token_sentiment: dict[str, Any] | None = None, atr_ratio: float = 1.0) -> float:
-        weights = self._regime_adjusted_weights(atr_ratio)
+    def _estimate_alpha(self, candidate: _CheapCandidate, portfolio_value_usdc: float) -> float:
+        """Fix #2 / #7: rough expected alpha for this candidate at current AUM."""
+        alpha_scaled = scale_alpha(target_aum=portfolio_value_usdc)
+        return sum(alpha_scaled) / len(alpha_scaled) * 0.01
+
+    def _entry_score(
+        self,
+        candidate: _CheapCandidate,
+        momentum_z_score: float,
+        token_sentiment: dict[str, Any] | None = None,
+        atr_ratio: float = 1.0,
+        x402_cost_usdc: float = 0.0,
+        portfolio_value_usdc: float = 0.0,
+    ) -> float:
+        # Fix #1: data freshness decay (lambda=0.35/hr, T_REF=3600s).
+        freshness = math.exp(-0.35 * candidate.data_age_seconds / 3600.0)
+        # Fix #1: max-age guard. Beyond 2×TTL reduce score 50%; beyond 3×TTL reject.
+        ttl_seconds = float(getattr(self.settings, "cmc_snapshot_ttl_seconds", 14400))
+        if candidate.data_age_seconds > ttl_seconds * 3.0:
+            LOGGER.warning(
+                "Rejecting %s: data age %.0fs exceeds 3× TTL %.0fs",
+                candidate.symbol,
+                candidate.data_age_seconds,
+                ttl_seconds,
+            )
+            return 0.0
+        stale_penalty = 0.5 if candidate.data_age_seconds > ttl_seconds * 2.0 else 1.0
+
+        # Fix #8: rebalance weights when technicals (RSI) are unavailable.
+        weights = self._regime_adjusted_weights(atr_ratio, technicals_available=candidate.technicals_available)
         score = 0.0
         score += weights["breakout"] * self._clamp01(candidate.breakout_strength)
         score += weights["volume"] * self._clamp01(candidate.volume_surge_score)
@@ -849,6 +998,15 @@ class BreakoutEngine:
                 score -= 10.0
             if token_sentiment.get("kol_bullish") and token_sentiment.get("funding_neutral"):
                 score += 5.0
+
+        score *= freshness * stale_penalty
+
+        # Fix #2: cost-awareness. Subtract x402 cost as a fraction of expected alpha.
+        if x402_cost_usdc > 0 and portfolio_value_usdc > 0:
+            expected_alpha = max(0.001, self._estimate_alpha(candidate, portfolio_value_usdc))
+            cost_discount = min(0.5, x402_cost_usdc / expected_alpha)
+            score *= 1.0 - cost_discount
+
         return max(0.0, round(score, 4))
 
     def _score_weight(self, name: str) -> float:
@@ -871,7 +1029,7 @@ class BreakoutEngine:
             return 0.0
         return 1.0 - (distance / 20.0)
 
-    def _regime_adjusted_weights(self, atr_ratio: float) -> dict[str, float]:
+    def _regime_adjusted_weights(self, atr_ratio: float, technicals_available: bool = True) -> dict[str, float]:
         """Return weight dict summing to 100 based on ATR regime."""
         base = {
             "breakout": 35.0,
@@ -901,6 +1059,13 @@ class BreakoutEngine:
             }
         else:
             weights = dict(base)
+        # Fix #8: rebalance weights when RSI/technicals are unavailable.
+        if not technicals_available:
+            rsi_weight = weights.pop("rsi", 10.0)
+            total_without_rsi = sum(weights.values())
+            if total_without_rsi > 0:
+                weights = {k: v * 100.0 / total_without_rsi for k, v in weights.items()}
+            weights["rsi"] = 0.0
         # Renormalize to sum 100
         total = sum(weights.values())
         if total != 100.0:

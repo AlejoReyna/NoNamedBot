@@ -36,10 +36,20 @@ def merge_market_snapshots(
     overlay: dict[str, dict[str, Any]],
     *,
     hot_fields: tuple[str, ...] = HOT_SNAPSHOT_FIELDS,
+    now_timestamp: float | None = None,
+    base_timestamp: float | None = None,
+    overlay_timestamp: float | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Merge keyless hot fields over an x402-enriched base snapshot."""
+    """Merge keyless hot fields over an x402-enriched base snapshot.
+
+    Fix #1: attaches ``data_age_seconds`` to every symbol row. Symbols present in
+    the x402-enriched ``base`` use ``base_timestamp``; keyless-only symbols use
+    ``overlay_timestamp``. The caller is responsible for passing the wall-clock
+    fetch timestamps that correspond to each layer.
+    """
 
     merged = copy.deepcopy(base) if base else {}
+    resolved_now = time.time() if now_timestamp is None else float(now_timestamp)
     for symbol, overlay_data in overlay.items():
         if not isinstance(overlay_data, dict):
             continue
@@ -52,10 +62,21 @@ def merge_market_snapshots(
                 if value is not None and value != 0 and value != "":
                     combined[field] = value
             combined["symbol"] = normalized
+            # Fix #1: enriched symbol age comes from the paid layer timestamp.
+            if base_timestamp is not None:
+                combined["data_age_seconds"] = max(0, int(resolved_now - base_timestamp))
         else:
             combined = copy.deepcopy(overlay_data)
             combined["symbol"] = normalized
+            # Fix #1: keyless-only symbol age comes from the free layer timestamp.
+            if overlay_timestamp is not None:
+                combined["data_age_seconds"] = max(0, int(resolved_now - overlay_timestamp))
         merged[normalized] = combined
+    # Fix #1: ensure any base-only symbol also carries an age.
+    if base_timestamp is not None:
+        for symbol, data in merged.items():
+            if isinstance(data, dict) and "data_age_seconds" not in data:
+                data["data_age_seconds"] = max(0, int(resolved_now - base_timestamp))
     return merged
 
 
@@ -114,8 +135,10 @@ class DualMarketSnapshotCache:
     def __init__(self, persist_path: str | Path | None = None) -> None:
         self._x402_enriched: dict[str, dict[str, Any]] = {}
         self._x402_fetched_at: float = 0.0
+        self._x402_fetched_at_epoch: float = 0.0
         self._keyless_quotes: dict[str, dict[str, Any]] = {}
         self._keyless_fetched_at: float = 0.0
+        self._keyless_fetched_at_epoch: float = 0.0
         self._persist_path: Path | None = Path(persist_path) if persist_path else None
         self._load_persisted()
 
@@ -137,6 +160,7 @@ class DualMarketSnapshotCache:
             layer_name="keyless",
             snapshot_attr="_keyless_quotes",
             fetched_at_attr="_keyless_fetched_at",
+            fetched_at_epoch_attr="_keyless_fetched_at_epoch",
             ttl_seconds=ttl_seconds,
             fetcher=fetcher,
             now=time.monotonic(),
@@ -157,6 +181,7 @@ class DualMarketSnapshotCache:
             layer_name="x402",
             snapshot_attr="_x402_enriched",
             fetched_at_attr="_x402_fetched_at",
+            fetched_at_epoch_attr="_x402_fetched_at_epoch",
             ttl_seconds=0 if force_x402_refresh else x402_ttl_seconds,
             fetcher=x402_fetcher,
             now=now,
@@ -165,11 +190,18 @@ class DualMarketSnapshotCache:
             layer_name="keyless",
             snapshot_attr="_keyless_quotes",
             fetched_at_attr="_keyless_fetched_at",
+            fetched_at_epoch_attr="_keyless_fetched_at_epoch",
             ttl_seconds=keyless_ttl_seconds,
             fetcher=keyless_fetcher,
             now=now,
         )
-        merged = merge_market_snapshots(self._x402_enriched, self._keyless_quotes)
+        merged = merge_market_snapshots(
+            self._x402_enriched,
+            self._keyless_quotes,
+            now_timestamp=time.time(),
+            base_timestamp=self._x402_fetched_at_epoch or None,
+            overlay_timestamp=self._keyless_fetched_at_epoch or None,
+        )
         if not merged:
             LOGGER.warning("Dual market snapshot merge produced no symbols")
         return copy.deepcopy(merged)
@@ -180,6 +212,7 @@ class DualMarketSnapshotCache:
         layer_name: str,
         snapshot_attr: str,
         fetched_at_attr: str,
+        fetched_at_epoch_attr: str,
         ttl_seconds: int,
         fetcher: Callable[[], dict[str, dict[str, Any]]],
         now: float,
@@ -206,6 +239,7 @@ class DualMarketSnapshotCache:
         if fresh:
             setattr(self, snapshot_attr, copy.deepcopy(fresh))
             setattr(self, fetched_at_attr, now)
+            setattr(self, fetched_at_epoch_attr, time.time())
             LOGGER.info(
                 "Refreshed %s market snapshot (ttl=%ss symbols=%s)",
                 layer_name,
@@ -226,8 +260,10 @@ class DualMarketSnapshotCache:
     def reset(self) -> None:
         self._x402_enriched = {}
         self._x402_fetched_at = 0.0
+        self._x402_fetched_at_epoch = 0.0
         self._keyless_quotes = {}
         self._keyless_fetched_at = 0.0
+        self._keyless_fetched_at_epoch = 0.0
         if self._persist_path is not None:
             try:
                 self._persist_path.unlink(missing_ok=True)
@@ -256,6 +292,7 @@ class DualMarketSnapshotCache:
         # Translate persisted wall-clock age into this process's monotonic
         # clock so TTL math keeps working after a restart.
         self._x402_fetched_at = time.monotonic() - age
+        self._x402_fetched_at_epoch = float(fetched_at_epoch)
         LOGGER.info(
             "Restored persisted x402 snapshot (age=%.0fs symbols=%s); no paid refresh needed until TTL expires",
             age,
