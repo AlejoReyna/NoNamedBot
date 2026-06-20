@@ -128,6 +128,8 @@ def test_load_settings_auto_enables_dual_with_x402_signer(monkeypatch: object, t
     env_path.write_text("CMC_X402_EPHEMERAL_KEY=0xabc\n", encoding="utf-8")
     monkeypatch.delenv("USE_DUAL_MARKET_DATA", raising=False)
     monkeypatch.delenv("USE_KEYLESS_PRIMARY", raising=False)
+    monkeypatch.delenv("CMC_X402_EPHEMERAL_KEY", raising=False)
+    monkeypatch.delenv("EVM_PRIVATE_KEY", raising=False)
 
     settings = load_settings(str(env_path))
 

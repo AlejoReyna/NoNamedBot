@@ -42,6 +42,7 @@ from src.data.enrichment_planner import hot_candidate_symbols, select_enrichment
 from src.data.market_snapshot_cache import get_dual_market_snapshot_cache, get_market_snapshot_cache
 from src.data.x402_optimizer import (
     AUM_MIN_VIABLE,
+    BETA,
     T0_MIN_EMPIRICAL,
     T2_MIN_PRACTICAL,
     compute_optimal_n,
@@ -2168,10 +2169,6 @@ def _fetch_snapshot(
                     dust_threshold,
                     x402_ttl,
                 )
-        # Enforce operational constraints: empirical minimums for scan/monitor
-        # and practical minimum for hot-candidate refresh without bundles.
-        x402_ttl = max(T0_MIN_EMPIRICAL, x402_ttl)
-
         cache = get_dual_market_snapshot_cache()
 
         def _fetch_keyless() -> dict[str, dict[str, Any]]:
