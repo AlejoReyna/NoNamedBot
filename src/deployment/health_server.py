@@ -75,6 +75,9 @@ def start_health_server(
                 if state.is_stalled():
                     payload["status"] = "stalled"
                 self._send_json(payload, status=status)
+            elif path.startswith("/status"):
+                payload = state.snapshot()
+                self._send_json(payload, status=200)
             elif path.startswith("/logs"):
                 lines = _tail_lines(decision_path, 50)
                 self._send_json({"lines": lines})
