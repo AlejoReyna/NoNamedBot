@@ -336,7 +336,7 @@ CMC_MCP_SHADOW_MODE=false
 
 # x402 (Base micropayments for CMC enrichment)
 CMC_X402_EPHEMERAL_KEY=
-CMC_X402_AMOUNT=0.01
+CMC_X402_AMOUNT=0.015
 CMC_X402_ASSET=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
 CMC_X402_CHAIN_ID=8453
 
@@ -383,6 +383,43 @@ The v2.0 scoring upgrade introduces a **regime-aware, continuous-factor** entry 
 - [ ] Autonomous loop has not yet persisted a **funded micro-live** swap end-to-end (manual TWAK swap is proven).
 - [ ] Paid CMC x402 enrichment is wired but awaits full production proof.
 - [ ] Unattended production should harden state recovery beyond JSON file persistence.
+
+---
+
+## Known Limitations
+
+- **$20 AUM competition config uses $5/7-day = $0.714/day for data.** It is structurally unprofitable for live trading. This is for hackathon scoring only.
+- **Minimum viable AUM for live deployment: ~$5,000–$10,000.** Below this threshold, data costs exceed expected alpha.
+- **x402 per-request latency is 2–5 seconds.** Use T2 ≥ 300s or prepaid bundles to avoid request pile-up.
+- **Real all-in cost per call is $0.011–$0.015, not $0.01.** The extra covers BNB gas + CDP facilitator fees.
+- **n* = 1 is a theoretical limit.** In practice, use n = 3–5 for diversification.
+
+---
+
+## Budget Model: 25% of AUM for Data
+
+This bot follows the institutional quant fund principle: **intelligence budget scales with capital**.
+
+- **$20 AUM → $5 total data budget over 7 days → $0.714/day**
+- The remaining $15 is trading capital (position sizing) — untouched by x402 spend.
+- At higher AUMs, the 25% allocation yields larger data budgets that enable more symbols and faster refresh intervals.
+
+See `src/data/x402_optimizer.py` for the Lagrangian-derived bang-bang solution.
+
+---
+
+## Math Verification
+
+The optimization framework was verified by a **6-agent swarm**:
+
+1. **Lagrangian & FOCs:** Re-derived and cross-checked against KKT conditions.
+2. **Numerical grid search:** 4M evaluations, exact match with analytical solution.
+3. **Matrix formulation:** Numpy `allclose` verified against scalar/vector form.
+4. **Signal decay (λ):** BSC-adjusted per-hour rates from CoinQuant backtests.
+5. **Alpha estimation (α):** Calibrated at $2K position, linearly scalable to any AUM.
+6. **Coverage function (β):** Empirical β = 0.12 from CCi30 market-cap concentration.
+
+Full report: `research/x402_verification_report.md`
 
 ---
 

@@ -21,7 +21,7 @@ class Settings(BaseModel):
     usdc_token_address: Optional[str] = None
     default_stable_symbol: str = "USDC"
     cmc_x402_endpoint: str = "https://mcp.coinmarketcap.com/x402/mcp"
-    cmc_x402_amount: float = 0.01
+    cmc_x402_amount: float = 0.015
     cmc_x402_asset: str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
     cmc_mcp_enabled: bool = False
     cmc_mcp_shadow_mode: bool = True
@@ -29,9 +29,15 @@ class Settings(BaseModel):
     # Do not add CMC_X402_EPHEMERAL_KEY here. Settings is passed into execution
     # objects, and x402 data micropayment keys must stay isolated in src.data.
     cmc_x402_chain_id: int = 8453
-    cmc_x402_max_usdc_per_call: float = 0.01
-    x402_daily_budget_usdc: float = 2.0
-    x402_total_budget_usdc: float = 15.0
+    # All-in cost per call including gas + facilitator fees (not just the x402
+    # API price). SDK max_amount policy means we never overpay — CMC charges
+    # ~$0.01; the extra $0.005 headroom covers BNB gas per request.
+    cmc_x402_max_usdc_per_call: float = 0.015
+    # Data budget follows the 25%-of-AUM principle: $20 AUM × 25% = $5 total
+    # data budget over 7 days = $5/7 ≈ $0.714/day. The remaining $15 is for
+    # trading capital (position sizing) — untouched by x402 spend.
+    x402_daily_budget_usdc: float = round(5.0 / 7, 6)  # ≈ 0.714286
+    x402_total_budget_usdc: float = 5.0
     x402_failure_cooldown_seconds: int = 900
     x402_in_position_ttl_seconds: int = 1800
     # Open positions below this total value (dust) do NOT activate the short
@@ -39,7 +45,11 @@ class Settings(BaseModel):
     x402_min_position_value_usdc: float = 5.0
     # Force a paid refresh when a hot candidate appears and the enriched
     # snapshot is older than this.
-    x402_hot_refresh_age_seconds: int = 600
+    # T2 for competition: budget-constrained to 360s (6 min) to stay within
+    # $0.714/day. T2_MIN_PRACTICAL=300s is the technical floor without bundles;
+    # use 360s here because at n=1 and $0.714/day we can only afford ~47
+    # hot-candidate refreshes per day (86400/360/cost factors).
+    x402_hot_refresh_age_seconds: int = 360
     # Paid enrichment scope: top-N candidates by cheap rank (0 = all targets).
     # The full universe stays visible via the free keyless path every cycle.
     x402_enrich_top_n: int = 50
@@ -310,7 +320,7 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
             "CMC_X402_ENDPOINT",
             "https://mcp.coinmarketcap.com/x402/mcp",
         ),
-        "cmc_x402_amount": _get_float("CMC_X402_AMOUNT", 0.01),
+        "cmc_x402_amount": _get_float("CMC_X402_AMOUNT", 0.015),
         "cmc_x402_asset": os.getenv("CMC_X402_ASSET", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
         "cmc_mcp_enabled": _get_bool("CMC_MCP_ENABLED", False),
         "cmc_mcp_shadow_mode": _get_bool("CMC_MCP_SHADOW_MODE", True),
@@ -319,13 +329,13 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
             os.getenv("CMC_X402_ENDPOINT", "https://mcp.coinmarketcap.com/x402/mcp"),
         ),
         "cmc_x402_chain_id": _get_int("CMC_X402_CHAIN_ID", 8453),
-        "cmc_x402_max_usdc_per_call": _get_float("CMC_X402_MAX_USDC_PER_CALL", 0.01),
-        "x402_daily_budget_usdc": _get_float("X402_DAILY_BUDGET_USDC", 2.0),
-        "x402_total_budget_usdc": _get_float("X402_TOTAL_BUDGET_USDC", 15.0),
+        "cmc_x402_max_usdc_per_call": _get_float("CMC_X402_MAX_USDC_PER_CALL", 0.015),
+        "x402_daily_budget_usdc": _get_float("X402_DAILY_BUDGET_USDC", round(5.0 / 7, 6)),
+        "x402_total_budget_usdc": _get_float("X402_TOTAL_BUDGET_USDC", 5.0),
         "x402_failure_cooldown_seconds": _get_int("X402_FAILURE_COOLDOWN_SECONDS", 900),
         "x402_in_position_ttl_seconds": _get_int("X402_IN_POSITION_TTL_SECONDS", 1800),
         "x402_min_position_value_usdc": _get_float("X402_MIN_POSITION_VALUE_USDC", 5.0),
-        "x402_hot_refresh_age_seconds": _get_int("X402_HOT_REFRESH_AGE_SECONDS", 600),
+        "x402_hot_refresh_age_seconds": _get_int("X402_HOT_REFRESH_AGE_SECONDS", 360),
         "x402_enrich_top_n": _get_int("X402_ENRICH_TOP_N", 50),
         "x402_fetch_technicals": _get_bool("X402_FETCH_TECHNICALS", True),
         "x402_technicals_max_symbols": _get_int("X402_TECHNICALS_MAX_SYMBOLS", 15),

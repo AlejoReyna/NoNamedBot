@@ -430,7 +430,7 @@ def test_fetch_x402_enriched_snapshot_returns_empty_when_budget_blocks_payment(m
             use_keyless_primary=False,
             x402_daily_budget_usdc=0.001,
             x402_total_budget_usdc=0.001,
-            cmc_x402_amount=0.01,
+            cmc_x402_amount=0.015,
         ),
         x402_client=paid,  # type: ignore[arg-type]
     )

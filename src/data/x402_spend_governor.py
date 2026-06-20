@@ -51,6 +51,7 @@ class X402SpendGovernor:
         failure_cooldown_seconds: int = 900,
         ledger_path: str | Path = "logs/x402_spend.json",
         call_log_path: str | Path = "logs/x402_calls.jsonl",
+        budget_circuit: Any | None = None,
     ) -> None:
         self.daily_budget_usdc = max(0.0, float(daily_budget_usdc))
         self.total_budget_usdc = max(0.0, float(total_budget_usdc))
@@ -58,6 +59,7 @@ class X402SpendGovernor:
         self.failure_cooldown_seconds = max(0, int(failure_cooldown_seconds))
         self.ledger_path = Path(ledger_path)
         self.call_log_path = Path(call_log_path)
+        self.budget_circuit = budget_circuit
         self._day = self._today()
         self._daily_spend = 0.0
         self._total_spend = 0.0
@@ -115,6 +117,8 @@ class X402SpendGovernor:
             http_status=http_status,
             reason=None,
         )
+        if self.budget_circuit is not None:
+            self.budget_circuit.record(spent)
 
     def record_failure(
         self,
@@ -144,6 +148,8 @@ class X402SpendGovernor:
             http_status=None,
             reason=reason,
         )
+        if self.budget_circuit is not None:
+            self.budget_circuit.record(charged)
 
     def snapshot(self) -> dict[str, float | str | bool]:
         """Telemetry payload for logs and the health endpoint."""
@@ -246,3 +252,54 @@ class X402SpendGovernor:
         if len(value) <= limit:
             return value
         return f"{value[: limit - 3]}..."
+
+
+class BudgetCircuitBreaker:
+    """Soft throttle layer above X402SpendGovernor.
+
+    When realized daily spend exceeds the planned budget, doubles the
+    hot-candidate refresh interval (T2) to cut call volume by ~50% without
+    fully stopping enrichment.  Resets at UTC midnight alongside the governor.
+    """
+
+    def __init__(self, daily_budget: float, headroom: float = 0.25) -> None:
+        self.daily_budget = max(0.0, float(daily_budget))
+        self.headroom = max(0.0, float(headroom))
+        self._actual_spend: float = 0.0
+        self._cycles_today: int = 0
+        self._day: str = self._today()
+
+    @staticmethod
+    def _today() -> str:
+        return datetime.now(timezone.utc).date().isoformat()
+
+    def _roll_day_if_needed(self) -> None:
+        today = self._today()
+        if today != self._day:
+            self._day = today
+            self._actual_spend = 0.0
+            self._cycles_today = 0
+
+    def record(self, cost_per_cycle: float) -> bool:
+        """Accumulate spend and return True if still within budget+headroom."""
+        self._roll_day_if_needed()
+        self._actual_spend += max(0.0, float(cost_per_cycle))
+        self._cycles_today += 1
+        return self._actual_spend <= self.daily_budget * (1.0 + self.headroom)
+
+    def throttled_refresh_age(self, base_refresh_age_seconds: int) -> int:
+        """Return (possibly doubled) refresh interval when over daily budget."""
+        self._roll_day_if_needed()
+        if self._actual_spend > self.daily_budget:
+            return base_refresh_age_seconds * 2
+        return base_refresh_age_seconds
+
+    def snapshot(self) -> dict[str, float | int | str | bool]:
+        self._roll_day_if_needed()
+        return {
+            "day": self._day,
+            "actual_spend_usdc": round(self._actual_spend, 4),
+            "daily_budget_usdc": self.daily_budget,
+            "cycles_today": self._cycles_today,
+            "over_budget": self._actual_spend > self.daily_budget,
+        }

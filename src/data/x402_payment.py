@@ -71,7 +71,7 @@ class X402PaymentSigner:
         self.chain_id = chain_id or _env_int("CMC_X402_CHAIN_ID", DEFAULT_CHAIN_ID)
         self.max_usdc_per_call = _decimal_or_default(
             max_usdc_per_call if max_usdc_per_call is not None else os.getenv("CMC_X402_MAX_USDC_PER_CALL"),
-            Decimal("0.01"),
+            Decimal("0.015"),
         )
         self.artifact_path = artifact_path
 

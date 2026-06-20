@@ -50,7 +50,7 @@ def probe(client: X402Client, label: str, arguments: dict) -> None:
 def main() -> int:
     client = X402Client(
         endpoint=os.getenv("CMC_MCP_URL", os.getenv("CMC_X402_ENDPOINT", CMC_X402_ENDPOINT)),
-        default_amount=os.getenv("CMC_X402_AMOUNT", "0.01"),
+        default_amount=os.getenv("CMC_X402_AMOUNT", "0.015"),
         default_asset=os.getenv("CMC_X402_ASSET", DEFAULT_PAYMENT_ASSET),
         chain_id=int(os.getenv("CMC_X402_CHAIN_ID", "8453")),
     )

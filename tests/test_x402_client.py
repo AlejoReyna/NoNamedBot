@@ -117,8 +117,8 @@ def test_request_with_x402_requires_post() -> None:
 
 
 def test_x402_max_payment_converts_major_usdc_to_atomic_units() -> None:
-    client = X402Client(default_amount="0.01", default_asset=DEFAULT_PAYMENT_ASSET)
-    assert client._max_payment_atomic() == "10000"
+    client = X402Client(default_amount="0.015", default_asset=DEFAULT_PAYMENT_ASSET)
+    assert client._max_payment_atomic() == "15000"
 
 
 def test_x402_max_payment_accepts_already_atomic_units() -> None:
@@ -128,7 +128,7 @@ def test_x402_max_payment_accepts_already_atomic_units() -> None:
 
 def test_build_sdk_client_registers_base_mainnet_policy() -> None:
     client = X402Client(
-        default_amount="0.01",
+        default_amount="0.015",
         default_asset=DEFAULT_PAYMENT_ASSET,
         chain_id=8453,
         payment_private_key=TEST_PRIVATE_KEY,

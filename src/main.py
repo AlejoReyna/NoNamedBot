@@ -40,6 +40,14 @@ from src.config.tokens import (
 from src.data.cmc_mcp_client import CMCMCPClient
 from src.data.enrichment_planner import hot_candidate_symbols, select_enrichment_symbols
 from src.data.market_snapshot_cache import get_dual_market_snapshot_cache, get_market_snapshot_cache
+from src.data.x402_optimizer import (
+    AUM_MIN_VIABLE,
+    T0_MIN_EMPIRICAL,
+    T2_MIN_PRACTICAL,
+    compute_optimal_n,
+    scale_alpha,
+)
+from src.data.x402_spend_governor import BudgetCircuitBreaker
 from src.execution import liquidity_analyzer as liquidity_analyzer_module
 from src.execution.bnb_toolkit_wrapper import BnbToolkitWrapper
 from src.execution.decision_log import DecisionAction, log_decision
@@ -278,8 +286,8 @@ def _print_x402_wallet_section(settings: Settings) -> None:
         from src.data.x402_spend_governor import X402SpendGovernor
 
         ledger = X402SpendGovernor(
-            daily_budget_usdc=getattr(settings, "x402_daily_budget_usdc", 2.0),
-            total_budget_usdc=getattr(settings, "x402_total_budget_usdc", 15.0),
+            daily_budget_usdc=getattr(settings, "x402_daily_budget_usdc", round(5.0 / 7, 6)),
+            total_budget_usdc=getattr(settings, "x402_total_budget_usdc", 5.0),
             cost_per_call_usdc=settings.cmc_x402_amount,
             failure_cooldown_seconds=getattr(settings, "x402_failure_cooldown_seconds", 900),
         ).snapshot()
@@ -495,7 +503,12 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
 
     run_id = f"run-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
     Path("logs").mkdir(parents=True, exist_ok=True)
-    cmc_client = CMCMCPClient(settings)
+    # Budget circuit breaker: dynamic T2 throttling when daily spend exceeds plan
+    budget_circuit = BudgetCircuitBreaker(
+        daily_budget=settings.x402_daily_budget_usdc,
+        headroom=0.25,
+    )
+    cmc_client = CMCMCPClient(settings, budget_circuit=budget_circuit)
     if not settings.use_dual_market_data:
         has_key = bool(
             os.getenv("CMC_X402_EPHEMERAL_KEY", "").strip()
@@ -545,6 +558,16 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
     needs_balance_reconstruction = not positions_loaded and not settings.paper_trade
     if positions_loaded:
         LOGGER.info("Loaded %s persisted open positions", len(position_manager.list_open_positions()))
+
+    # Warn if AUM is below minimum viable for live trading profitability
+    portfolio_value = _portfolio_value_usdc(toolkit, settings, {}, position_manager)
+    if portfolio_value < AUM_MIN_VIABLE:
+        LOGGER.warning(
+            "AUM $%.2f below minimum viable $%.2f. This config is for competition "
+            "scoring, not live trading. Minimum viable AUM ≈ $5K–$10K.",
+            portfolio_value,
+            AUM_MIN_VIABLE,
+        )
 
     # Re-log the snapshot-cache restore here: the singleton loads at import
     # time, before logging is configured, so its own INFO line is dropped.
@@ -627,6 +650,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                 for position in open_positions
             ),
             position_symbols={position.symbol.upper() for position in open_positions},
+            budget_circuit=budget_circuit,
         )
         _update_price_cache(price_cache, market_snapshot, now_utc)
         window_flatten_active = _maybe_flatten_for_window(
@@ -2120,6 +2144,7 @@ def _fetch_snapshot(
     cmc_client: CMCMCPClient,
     open_position_value_usdc: float = 0.0,
     position_symbols: set[str] | None = None,
+    budget_circuit: BudgetCircuitBreaker | None = None,
 ) -> dict[str, dict[str, Any]]:
     if settings.paper_trade:
         return _paper_market_snapshot()
@@ -2143,6 +2168,9 @@ def _fetch_snapshot(
                     dust_threshold,
                     x402_ttl,
                 )
+        # Enforce operational constraints: empirical minimums for scan/monitor
+        # and practical minimum for hot-candidate refresh without bundles.
+        x402_ttl = max(T0_MIN_EMPIRICAL, x402_ttl)
 
         cache = get_dual_market_snapshot_cache()
 
@@ -2156,6 +2184,11 @@ def _fetch_snapshot(
         force_x402 = False
         x402_age = cache.x402_age_seconds()
         hot_age = getattr(settings, "x402_hot_refresh_age_seconds", 600)
+        # Clamp hot_age to the practical minimum (no bundles = 300s floor)
+        hot_age = max(T2_MIN_PRACTICAL, hot_age)
+        # Dynamic budget throttling: double T2 when over daily budget
+        if budget_circuit is not None:
+            hot_age = budget_circuit.throttled_refresh_age(hot_age)
         if x402_age is not None and x402_age > hot_age and x402_age < x402_ttl:
             hot_symbols = hot_candidate_symbols(keyless_snapshot, settings)
             if hot_symbols:
@@ -2167,11 +2200,23 @@ def _fetch_snapshot(
                     hot_age,
                 )
 
+        # Compute optimal symbol count from the verified optimizer model.
+        # n* = max(1, ceil(beta/(1-beta))) = 1 at beta=0.12; practical use 3-5.
+        n_opt = compute_optimal_n()
+        if n_opt < 3:
+            LOGGER.info(
+                "Optimal n*=%d at beta=%.2f; using minimum practical n=3 for diversification",
+                n_opt,
+                BETA,
+            )
+            n_opt = 3
+
         enrich_symbols = select_enrichment_symbols(
             keyless_snapshot,
             list(TARGET_SYMBOLS),
             position_symbols or set(),
             settings,
+            top_n=n_opt,
         )
 
         # The paid MCP tool requires CMC ids (symbol-only requests are
