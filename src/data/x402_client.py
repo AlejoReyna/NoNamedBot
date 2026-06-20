@@ -29,6 +29,18 @@ MCP_HTTP_PROTOCOL_VERSION = "2024-11-05"
 MCP_METHODS_REQUIRING_SESSION = frozenset({"tools/call", "tools/list"})
 
 
+class X402HTTPError(RuntimeError):
+    """Raised when the x402-gated request returns a non-2xx HTTP status.
+
+    Carries the status code so callers can decide whether the payment likely
+    settled (5xx) or not (4xx).
+    """
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class X402Client:
     """Run CMC x402 requests through the official x402 SDK (sync requests client).
 
@@ -88,7 +100,12 @@ class X402Client:
                     response.status_code,
                     _short_text(response.text),
                 )
-                return None
+                # Fix #9: propagate HTTP status so the spend governor can decide
+                # whether to assume the payment settled (5xx) or not (4xx).
+                raise X402HTTPError(
+                    f"x402 SDK request returned HTTP {response.status_code}",
+                    response.status_code,
+                )
             parsed = _parse_mcp_response(response.text)
             if parsed is None:
                 LOGGER.warning("x402 SDK response was not parseable MCP JSON")
@@ -97,6 +114,8 @@ class X402Client:
         except PaymentError as exc:
             LOGGER.warning("x402 SDK payment flow failed: %s", exc)
             return None
+        except X402HTTPError:
+            raise
         except Exception as exc:
             LOGGER.warning("x402 SDK request failed: %s", exc)
             return None

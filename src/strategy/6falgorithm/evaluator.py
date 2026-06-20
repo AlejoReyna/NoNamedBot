@@ -35,6 +35,9 @@ def evaluate_universe_breakout(
     use_breakout_engine: bool = True,
     ml_bundle: Any | None = None,
     sentiment_tier1: Any | None = None,
+    x402_cost_usdc: float = 0.0,
+    enriched_symbols: set[str] | None = None,
+    position_symbols: set[str] | None = None,
 ) -> EntryCandidate | None:
     """Evaluate the universe using the 6-factor BreakoutEngine or legacy fallback."""
 
@@ -66,7 +69,14 @@ def evaluate_universe_breakout(
             LOGGER.warning("ML bundle context build failed; falling back to rule-only ranking: %s", exc)
             ml_contexts = {}
 
-    decisions = engine.evaluate_all(filtered_snapshot, portfolio_value, ml_contexts=ml_contexts)
+    decisions = engine.evaluate_all(
+        filtered_snapshot,
+        portfolio_value,
+        ml_contexts=ml_contexts,
+        x402_cost_usdc=x402_cost_usdc,
+        enriched_symbols=enriched_symbols,
+        position_symbols=position_symbols,
+    )
     passers = [decision for decision in decisions if decision.should_enter]
     selected: Any | None = None
     if not passers:

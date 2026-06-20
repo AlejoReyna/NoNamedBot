@@ -59,6 +59,15 @@ class Settings(BaseModel):
     # enrichment batch; still governor-gated. Set false to disable.
     x402_fetch_technicals: bool = True
     x402_technicals_max_symbols: int = 15
+    # Per-cycle cost tracking: maximum latency (seconds) between snapshot assembly
+    # and entry decision before the data is considered stale and entry is skipped.
+    max_decision_latency_seconds: float = 60.0
+    # Regime-aware TTL switching: when enabled, flat/ranging regimes use longer TTLs
+    # and breakout regimes use short TTLs instead of the fixed cmc_snapshot_ttl_seconds.
+    regime_aware_ttl: bool = True
+    # Pre-trade cost-benefit gate: skip entries where round-trip costs exceed half
+    # the expected gain from the position.
+    cost_benefit_check_enabled: bool = True
     # CMC provides RSI/MACD but not funding/open-interest, so derivatives_risk_clear
     # fails closed on every token and permanently caps the score at 5/6. When true,
     # treat the factor as neutral (pass) ONLY when its data is structurally missing,
@@ -339,6 +348,9 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
         "x402_enrich_top_n": _get_int("X402_ENRICH_TOP_N", 50),
         "x402_fetch_technicals": _get_bool("X402_FETCH_TECHNICALS", True),
         "x402_technicals_max_symbols": _get_int("X402_TECHNICALS_MAX_SYMBOLS", 15),
+        "max_decision_latency_seconds": _get_float("MAX_DECISION_LATENCY_SECONDS", 60.0),
+        "regime_aware_ttl": _get_bool("REGIME_AWARE_TTL", True),
+        "cost_benefit_check_enabled": _get_bool("COST_BENEFIT_CHECK_ENABLED", True),
         "derivatives_neutral_on_missing": _get_bool("DERIVATIVES_NEUTRAL_ON_MISSING", False),
         "use_keyless_primary": use_keyless_primary,
         "use_dual_market_data": use_dual_market_data,

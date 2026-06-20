@@ -295,6 +295,8 @@ def calculate_position_pct(
     max_position_pct: float = 0.05,
     base_risk_per_trade_pct: float = 0.0035,
     fallback_stop_pct: float = 0.06,
+    data_cost_pct: float = 0.0,
+    expected_alpha_per_cycle: float = 0.0,
 ) -> float:
     """Calculate volatility-scaled position size as a decimal percentage.
 
@@ -318,7 +320,16 @@ def calculate_position_pct(
     else:
         stop_distance_pct = max(0.015, min(0.08, float(atr_pct) * 2.0))
     raw_position_pct = base_risk_per_trade_pct / stop_distance_pct
-    position_pct = min(max_position_pct, raw_position_pct)
+    # Fix #2: subtract data cost from effective return before sizing.
+    effective_return = raw_position_pct - max(0.0, float(data_cost_pct))
+    if effective_return <= 0:
+        return 0.0
+    position_pct = min(max_position_pct, effective_return)
+    # Fix #7: expected alpha is wired into the cost-benefit pre-trade check in
+    # main.py; the volatility-based risk budget above already sizes the trade.
+    # We intentionally do not cap the risk-budgeted size to a tiny alpha
+    # estimate because the optimizer alpha is calibrated per-$2K-position and
+    # would otherwise prevent all viable entries at small AUMs.
     if loss_streak >= 2:
         position_pct *= 0.5
     position_pct *= regime_mult * risk_mult

@@ -69,6 +69,14 @@ def record_entry(
     regime: str | None = None,
     bnb_1h_pct: float | None = None,
     bnb_24h_pct: float | None = None,
+    # Fix #3: x402 feedback-loop fields (additive / backward-compat)
+    x402_enriched: bool | None = None,
+    x402_cost_usdc: float | None = None,
+    data_age_seconds: float | None = None,
+    keyless_only: bool | None = None,
+    technicals_available: bool | None = None,
+    enriched_symbols: list[str] | set[str] | None = None,
+    expected_alpha_usdc: float | None = None,
 ) -> str:
     """Record the factors an entry was taken on. Returns the ``trade_id``.
 
@@ -104,6 +112,14 @@ def record_entry(
             "regime": regime,
             "bnb_1h_pct": bnb_1h_pct,
             "bnb_24h_pct": bnb_24h_pct,
+            # Fix #3: x402 feedback-loop fields
+            "x402_enriched": x402_enriched,
+            "x402_cost_usdc": x402_cost_usdc,
+            "data_age_seconds": data_age_seconds,
+            "keyless_only": keyless_only,
+            "technicals_available": technicals_available,
+            "enriched_symbols": sorted({s.upper() for s in (enriched_symbols or [])}),
+            "expected_alpha_usdc": expected_alpha_usdc,
         },
     )
     return trade_id

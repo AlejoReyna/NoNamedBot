@@ -56,6 +56,10 @@ class X402SpendGovernor:
         self.daily_budget_usdc = max(0.0, float(daily_budget_usdc))
         self.total_budget_usdc = max(0.0, float(total_budget_usdc))
         self.cost_per_call_usdc = max(0.0, float(cost_per_call_usdc))
+        # Fix #9: exponential backoff state (starts at 30s, caps at 15min).
+        self._failure_cooldown_base = 30
+        self._failure_cooldown_max = 900
+        self._consecutive_failures = 0
         self.failure_cooldown_seconds = max(0, int(failure_cooldown_seconds))
         self.ledger_path = Path(ledger_path)
         self.call_log_path = Path(call_log_path)
@@ -108,6 +112,8 @@ class X402SpendGovernor:
         spent = self.cost_per_call_usdc if amount_usdc is None else max(0.0, float(amount_usdc))
         self._daily_spend += spent
         self._total_spend += spent
+        # Fix #9: reset consecutive failure counter on success.
+        self._consecutive_failures = 0
         self._last_failure_monotonic = None
         self._save()
         self._append_call_record(
@@ -126,15 +132,25 @@ class X402SpendGovernor:
         *,
         tool: str | None = None,
         reason: str | None = None,
+        http_status: int | None = None,
     ) -> None:
         """Record a failed paid call and start the retry cooldown.
 
         ``assume_charged`` budgets conservatively: a call that failed after the
         402 payment settled still spent money, so count it unless the failure
-        is known to have happened before payment.
+        is known to have happened before payment. ``http_status`` enables smart
+        assume_charged: 4xx client errors are assumed unpaid, while 5xx/timeouts
+        are assumed paid.
         """
 
         self._roll_day_if_needed()
+        # Fix #9: smart assume_charged from HTTP status when not explicitly set.
+        if http_status is not None:
+            if 400 <= http_status < 500:
+                assume_charged = False
+            elif http_status >= 500:
+                assume_charged = True
+        self._consecutive_failures += 1
         charged = self.cost_per_call_usdc if assume_charged else 0.0
         if charged:
             self._daily_spend += charged
@@ -145,7 +161,7 @@ class X402SpendGovernor:
             outcome="failure",
             amount_usdc=charged,
             tool=tool,
-            http_status=None,
+            http_status=http_status,
             reason=reason,
         )
         if self.budget_circuit is not None:
@@ -162,6 +178,7 @@ class X402SpendGovernor:
             "total_spend_usdc": round(self._total_spend, 4),
             "total_budget_usdc": self.total_budget_usdc,
             "failure_cooldown_active": self._in_failure_cooldown(),
+            "consecutive_failures": self._consecutive_failures,
         }
 
     # -- internals ----------------------------------------------------------
@@ -180,11 +197,23 @@ class X402SpendGovernor:
     def _in_failure_cooldown(self) -> bool:
         return self._cooldown_remaining() > 0
 
+    def _current_failure_cooldown(self) -> int:
+        """Fix #9: exponential backoff capped at _failure_cooldown_max."""
+        if self._consecutive_failures <= 0:
+            return 0
+        return min(
+            self._failure_cooldown_max,
+            self._failure_cooldown_base * (2 ** (self._consecutive_failures - 1)),
+        )
+
     def _cooldown_remaining(self) -> float:
-        if self._last_failure_monotonic is None or self.failure_cooldown_seconds <= 0:
+        if self._last_failure_monotonic is None:
+            return 0.0
+        cooldown = self._current_failure_cooldown()
+        if cooldown <= 0:
             return 0.0
         elapsed = time.monotonic() - self._last_failure_monotonic
-        return max(0.0, self.failure_cooldown_seconds - elapsed)
+        return max(0.0, cooldown - elapsed)
 
     def _load(self) -> None:
         if not self.ledger_path.exists():

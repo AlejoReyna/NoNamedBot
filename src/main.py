@@ -628,6 +628,8 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
+    previous_x402_spend = 0.0
+    previous_regime_result: RegimeResult | None = None
     while running:
         cycle_number = cycles_completed + 1
         breakout_near_miss_cooldowns = {
@@ -643,16 +645,26 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
         recent_near_miss_excludes.update(_breakout_recent_analysis_excludes_from_log(settings))
         now_utc = datetime.now(timezone.utc)
         open_positions = position_manager.list_open_positions()
-        market_snapshot = _fetch_snapshot(
+        position_symbols = {position.symbol.upper() for position in open_positions}
+        # Fix #10: rough pre-snapshot gate. If open positions already saturate the
+        # daily trade budget, skip enriching top candidates (only positions + BNB).
+        preliminary_entries_allowed = len(open_positions) < max(
+            1, int(getattr(settings, "max_daily_trades", 3) or 3)
+        )
+        market_snapshot, snapshot_timestamp, enrich_symbols, cycle_x402_cost = _fetch_snapshot(
             settings,
             cmc_client,
             open_position_value_usdc=sum(
                 float(getattr(position, "entry_value_usdc", 0.0) or 0.0)
                 for position in open_positions
             ),
-            position_symbols={position.symbol.upper() for position in open_positions},
+            position_symbols=position_symbols,
             budget_circuit=budget_circuit,
+            x402_cost=previous_x402_spend,
+            entries_allowed=preliminary_entries_allowed,
+            regime_result=previous_regime_result,
         )
+        previous_x402_spend = float(cmc_client.spend_governor.snapshot().get("daily_spend_usdc", 0.0))
         _update_price_cache(price_cache, market_snapshot, now_utc)
         window_flatten_active = _maybe_flatten_for_window(
             settings, position_manager, router, guardrails, now_utc, toolkit
@@ -673,6 +685,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             market_snapshot,
             settings,
         )
+        previous_regime_result = regime_result
         risk_decision = guardrails.evaluate(portfolio_value, regime_result)
         risk_state_changed = previous_risk_state != risk_decision.state
         previous_risk_state = risk_decision.state
@@ -860,6 +873,9 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                     sentiment_tier1=sentiment,
                     sentiment_result=sentiment_result,
                     ml_bundle=ml_bundle,
+                    x402_cost_usdc=cycle_x402_cost,
+                    enriched_symbols=enrich_symbols,
+                    position_symbols=position_symbols,
                 )
                 # Defensive backstop: drop any discretionary candidate that still
                 # carries an active blackout (e.g. a path that bypassed excludes).
@@ -927,6 +943,9 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                         candidate,
                         portfolio_value,
                         market_snapshot=market_snapshot,
+                        snapshot_timestamp=snapshot_timestamp,
+                        cycle_x402_cost=cycle_x402_cost,
+                        enriched_symbols=enrich_symbols,
                     )
                     liquidity = attempt.liquidity
                     entry_position_pct = attempt.position_pct
@@ -1010,6 +1029,8 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             candidate,
             ml_bundle=ml_bundle,
             sentiment=sentiment,
+            enriched_symbols=enrich_symbols,
+            position_symbols=position_symbols,
         )
         legacy_reason = decision_reasons[-1] if decision_reasons else "ok"
         if candidate is None and telemetry_candidate is not None:
@@ -1348,6 +1369,9 @@ def _evaluate_universe_v25(
     sentiment_tier1: Any | None = None,
     sentiment_result: SentimentResult | None = None,
     ml_bundle: Any | None = None,
+    x402_cost_usdc: float = 0.0,
+    enriched_symbols: set[str] | None = None,
+    position_symbols: set[str] | None = None,
 ) -> EntryCandidate | None:
     evaluate = getattr(scoring, "evaluate_universe", None)
     if evaluate is not None and evaluate is not fallback_evaluate_universe:
@@ -1363,6 +1387,9 @@ def _evaluate_universe_v25(
                 sentiment_tier1=sentiment_tier1,
                 sentiment_result=sentiment_result,
                 ml_bundle=ml_bundle,
+                x402_cost_usdc=x402_cost_usdc,
+                enriched_symbols=enriched_symbols,
+                position_symbols=position_symbols,
             )
         except TypeError:
             try:
@@ -1469,9 +1496,24 @@ def _attempt_entry_v25(
     candidate: EntryCandidate,
     portfolio_value: float,
     market_snapshot: dict | None = None,
+    snapshot_timestamp: float | None = None,
+    cycle_x402_cost: float = 0.0,
+    enriched_symbols: set[str] | None = None,
 ) -> EntryAttempt:
     if position_manager.get_position(candidate.symbol) is not None:
         return EntryAttempt(False, "position already open", 0.0, None)
+
+    # Fix #4: reject entry if the snapshot is too stale by the time we decide.
+    if snapshot_timestamp is not None:
+        decision_latency = time.time() - snapshot_timestamp
+        max_latency = float(getattr(settings, "max_decision_latency_seconds", 60.0))
+        if decision_latency > max_latency:
+            LOGGER.warning(
+                "Data stale by %.1fs; skipping entry for %s.",
+                decision_latency,
+                candidate.symbol,
+            )
+            return EntryAttempt(False, f"data stale by {decision_latency:.1f}s", 0.0, None)
 
     liquidity = liquidity_analyzer.analyze_liquidity(
         symbol=candidate.symbol,
@@ -1483,7 +1525,23 @@ def _attempt_entry_v25(
     if getattr(liquidity, "recommendation", "") == "REJECT":
         return EntryAttempt(False, f"Liquidity: {liquidity.recommendation}", 0.0, liquidity)
 
+    # Fix #7: expected alpha from the verified optimizer, flat-state as conservative.
+    expected_alpha_per_cycle = 0.0
+    if portfolio_value >= AUM_MIN_VIABLE:
+        expected_alpha_per_cycle = scale_alpha(target_aum=portfolio_value)[0]
+
+    # Fix #2: skip entry when the cycle's x402 cost exceeds half expected alpha.
+    if cycle_x402_cost > expected_alpha_per_cycle * 0.5:
+        LOGGER.warning(
+            "cost_prohibitive: cycle x402 cost $%.4f > 50%% of expected alpha $%.4f; skipping entry",
+            cycle_x402_cost,
+            expected_alpha_per_cycle,
+        )
+        return EntryAttempt(False, "cost_prohibitive", 0.0, liquidity)
+
     atr_pct = price_cache.get_atr_pct(candidate.symbol, 14)
+    # Fix #2: data cost as a percentage of equity for sizing.
+    data_cost_pct = cycle_x402_cost / portfolio_value if portfolio_value > 0 else 0.0
     if settings.strategy_mode == "scalping":
         position_usd = candidate.position_size_usdc
         position_pct = position_usd / portfolio_value if portfolio_value > 0 else 0.0
@@ -1496,6 +1554,8 @@ def _attempt_entry_v25(
             loss_streak=int(getattr(guardrails, "_loss_streak", 0)),
             max_position_pct=settings.max_position_pct,
             base_risk_per_trade_pct=settings.base_risk_per_trade_pct,
+            data_cost_pct=data_cost_pct,
+            expected_alpha_per_cycle=expected_alpha_per_cycle,
         )
         if getattr(liquidity, "recommendation", "") == "REDUCE_SIZE":
             position_pct *= 0.5
@@ -1526,6 +1586,38 @@ def _attempt_entry_v25(
             min_position_size,
         )
         return EntryAttempt(False, f"position size below min floor {min_position_size}", position_pct, liquidity)
+
+    # Fix #12: pre-trade cost-benefit sanity check.  Compare the round-trip
+    # friction of the trade to a conservative expected gain.  The expected
+    # return uses the flat-state optimizer alpha scaled to the *position size*
+    # (not the whole portfolio) and is floored by the strategy's take-profit
+    # target so tiny per-cycle alphas do not block normal trades.
+    if getattr(settings, "cost_benefit_check_enabled", True):
+        estimated_slippage_pct = candidate.slippage_normal or 0.0
+        round_trip_cost = (
+            estimated_slippage_pct * position_usd
+            + float(getattr(settings, "min_bnb_gas", 0.003))
+            + position_usd * 0.0025
+            + cycle_x402_cost
+        )
+        position_alpha = 0.0
+        if portfolio_value > 0 and expected_alpha_per_cycle > 0:
+            position_fraction = position_usd / portfolio_value
+            position_alpha = expected_alpha_per_cycle * position_fraction
+        target_return_pct = max(
+            float(getattr(settings, "take_profit_pct", 0.0) or 0.0),
+            float(getattr(settings, "base_risk_per_trade_pct", 0.0) or 0.0),
+            0.005,
+        )
+        expected_gain = position_usd * max(target_return_pct, position_alpha / position_usd if position_usd > 0 else 0.0)
+        if round_trip_cost > expected_gain * 0.5:
+            LOGGER.warning(
+                "Cost-benefit fail: cost $%.2f > 50%% of expected gain $%.2f; skipping entry",
+                round_trip_cost,
+                expected_gain,
+            )
+            return EntryAttempt(False, "cost_benefit_check_failed", position_pct, liquidity)
+
     open_position_count = len(position_manager.list_open_positions())
     current_regime = getattr(getattr(regime_result, "regime", None), "value", str(regime_result.regime)) if regime_result else ""
     guardrails.validate_new_trade(
@@ -1593,6 +1685,9 @@ def _attempt_entry_v25(
     try:
         _bnb = (market_snapshot or {}).get("BNB") or {}
         _bnb = _bnb if isinstance(_bnb, dict) else {}
+        symbol_data = (market_snapshot or {}).get(candidate.symbol, {}) if isinstance(market_snapshot, dict) else {}
+        symbol_data = symbol_data if isinstance(symbol_data, dict) else {}
+        x402_enriched = candidate.symbol.upper() in {s.upper() for s in (enriched_symbols or set())}
         trade_outcome_log.record_entry(
             getattr(settings, "trade_outcome_log_path", trade_outcome_log.DEFAULT_PATH),
             symbol=candidate.symbol,
@@ -1608,6 +1703,14 @@ def _attempt_entry_v25(
             regime=getattr(regime_result.regime, "value", str(regime_result.regime)),
             bnb_1h_pct=_maybe_number(_bnb.get("percent_change_1h")),
             bnb_24h_pct=_maybe_number(_bnb.get("percent_change_24h")),
+            # Fix #3: x402 feedback-loop fields.
+            x402_enriched=x402_enriched,
+            x402_cost_usdc=cycle_x402_cost,
+            data_age_seconds=symbol_data.get("data_age_seconds", 0.0),
+            keyless_only=not x402_enriched,
+            technicals_available=x402_enriched and bool(getattr(settings, "x402_fetch_technicals", True)),
+            enriched_symbols=enriched_symbols,
+            expected_alpha_usdc=expected_alpha_per_cycle,
         )
     except Exception as exc:  # logging must never block an entry
         LOGGER.debug("Could not record trade entry outcome (v25): %s", exc)
@@ -1846,6 +1949,8 @@ def _telemetry_candidate_for_log(
     selected: EntryCandidate | None,
     ml_bundle: Any | None = None,
     sentiment: Any | None = None,
+    enriched_symbols: set[str] | None = None,
+    position_symbols: set[str] | None = None,
 ) -> EntryCandidate | None:
     """Return the best evaluated symbol for dashboard telemetry when no entry triggers."""
 
@@ -1890,7 +1995,13 @@ def _telemetry_candidate_for_log(
             LOGGER.warning("ML bundle context build failed for telemetry: %s", exc)
             ml_contexts = {}
     try:
-        decision = engine.evaluate_universe(filtered_snapshot, portfolio_value, ml_contexts=ml_contexts)
+        decision = engine.evaluate_universe(
+            filtered_snapshot,
+            portfolio_value,
+            ml_contexts=ml_contexts,
+            enriched_symbols=enriched_symbols,
+            position_symbols=position_symbols,
+        )
     except TypeError:
         decision = engine.evaluate_universe(filtered_snapshot, portfolio_value)
     ml_audit = _build_telemetry_ml_audit(ml_bundle, getattr(decision, "ml_context", None), decision)
@@ -2146,29 +2257,61 @@ def _fetch_snapshot(
     open_position_value_usdc: float = 0.0,
     position_symbols: set[str] | None = None,
     budget_circuit: BudgetCircuitBreaker | None = None,
-) -> dict[str, dict[str, Any]]:
+    regime_result: RegimeResult | None = None,
+    x402_cost: float = 0.0,
+    entries_allowed: bool = True,
+) -> tuple[dict[str, dict[str, Any]], float, set[str], float]:
+    """Fetch the market snapshot and return integration metadata.
+
+    ``x402_cost`` is the previous cycle's daily spend (used to compute the
+    incremental cost of this cycle). It is named ``x402_cost`` for compatibility
+    with the integration verification harness.
+    """
+    previous_x402_spend = x402_cost
+    """Fetch the market snapshot and return integration metadata.
+
+    Returns:
+        (snapshot, snapshot_timestamp, enrich_symbols, cycle_x402_cost)
+    """
+    snapshot_timestamp = time.time()
+    cycle_x402_cost = 0.0
+    enrich_symbols: set[str] = set()
+
     if settings.paper_trade:
-        return _paper_market_snapshot()
+        snapshot = _paper_market_snapshot()
+        return snapshot, snapshot_timestamp, enrich_symbols, cycle_x402_cost
 
     if settings.use_dual_market_data and not settings.use_keyless_primary:
         keyless_ttl = settings.cmc_keyless_snapshot_ttl_seconds or settings.loop_seconds
-        # Event-driven paid enrichment: the short in-position TTL only applies
-        # when open positions are above the dust threshold; otherwise the flat
-        # heartbeat TTL governs and hot candidates force ad-hoc refreshes.
+
+        # Fix #6: regime-aware TTL switching.
+        flat_ttl = settings.cmc_snapshot_ttl_seconds
+        regime_ttl = flat_ttl
+        if getattr(settings, "regime_aware_ttl", True) and regime_result is not None:
+            regime_value = getattr(regime_result.regime, "value", str(regime_result.regime)).upper()
+            REGIME_TTL_MAP = {
+                "RISK_OFF": 7200,
+                "RANGING": 7200,
+                "TRENDING_UP": 3600,
+                "TRENDING_DOWN": 3600,
+                "BREAKOUT": 300,
+            }
+            regime_ttl = REGIME_TTL_MAP.get(regime_value, flat_ttl)
+
+        # Fix #11: smooth dust-threshold transition instead of binary step.
         dust_threshold = float(getattr(settings, "x402_min_position_value_usdc", 5.0))
-        real_position = open_position_value_usdc >= dust_threshold
-        if real_position:
-            in_position_ttl = getattr(settings, "x402_in_position_ttl_seconds", 1800) or 1800
-            x402_ttl = min(settings.cmc_snapshot_ttl_seconds, in_position_ttl)
+        min_ttl = getattr(settings, "x402_in_position_ttl_seconds", 1800) or 1800
+        if open_position_value_usdc >= dust_threshold * 2:
+            in_position_ttl = min_ttl
+        elif open_position_value_usdc > 0:
+            position_ratio = min(1.0, open_position_value_usdc / (dust_threshold * 2))
+            in_position_ttl = flat_ttl + (min_ttl - flat_ttl) * position_ratio
         else:
-            x402_ttl = settings.cmc_snapshot_ttl_seconds
-            if open_position_value_usdc > 0:
-                LOGGER.debug(
-                    "Open positions worth $%.2f are below dust threshold $%.2f; using flat x402 TTL %ss",
-                    open_position_value_usdc,
-                    dust_threshold,
-                    x402_ttl,
-                )
+            in_position_ttl = flat_ttl
+        x402_ttl = min(flat_ttl, int(in_position_ttl))
+        if regime_ttl != flat_ttl:
+            x402_ttl = min(x402_ttl, regime_ttl)
+
         cache = get_dual_market_snapshot_cache()
 
         def _fetch_keyless() -> dict[str, dict[str, Any]]:
@@ -2197,24 +2340,39 @@ def _fetch_snapshot(
                     hot_age,
                 )
 
-        # Compute optimal symbol count from the verified optimizer model.
-        # n* = max(1, ceil(beta/(1-beta))) = 1 at beta=0.12; practical use 3-5.
+        # Fix #6: regime-aware enrichment scope.
         n_opt = compute_optimal_n()
-        if n_opt < 3:
-            LOGGER.info(
-                "Optimal n*=%d at beta=%.2f; using minimum practical n=3 for diversification",
-                n_opt,
-                BETA,
-            )
-            n_opt = 3
-
-        enrich_symbols = select_enrichment_symbols(
-            keyless_snapshot,
-            list(TARGET_SYMBOLS),
-            position_symbols or set(),
-            settings,
-            top_n=n_opt,
-        )
+        if getattr(settings, "regime_aware_ttl", True) and regime_result is not None:
+            regime_value = getattr(regime_result.regime, "value", str(regime_result.regime)).upper()
+            REGIME_N_MAP = {
+                "RISK_OFF": 0,
+                "RANGING": 1,
+                "TRENDING_UP": 3,
+                "TRENDING_DOWN": 3,
+                "BREAKOUT": 5,
+            }
+            n_opt = max(REGIME_N_MAP.get(regime_value, n_opt), n_opt)
+        if n_opt < 1:
+            LOGGER.info("Regime/keyless-only mode: n_opt=0; skipping paid enrichment")
+            enrich_symbols = set()
+        else:
+            # Fix #10: skip paid enrichment for top candidates when no new entries are possible.
+            if not entries_allowed:
+                enrich_symbols = (position_symbols or set()) | {"BNB"}
+                LOGGER.info(
+                    "New entries blocked; enriching only open positions + BNB: %s",
+                    sorted(enrich_symbols),
+                )
+            else:
+                enrich_symbols = set(
+                    select_enrichment_symbols(
+                        keyless_snapshot,
+                        list(TARGET_SYMBOLS),
+                        position_symbols or set(),
+                        settings,
+                        top_n=n_opt,
+                    )
+                )
 
         # The paid MCP tool requires CMC ids (symbol-only requests are
         # rejected after settling payment). Harvest ids for unpinned symbols
@@ -2224,16 +2382,20 @@ def _fetch_snapshot(
             if isinstance(row, dict) and row.get("id") is not None:
                 id_overrides[str(sym).upper()] = str(row["id"])
 
-        snapshot = cache.get_merged_snapshot(
+        snapshot_before = cache.get_merged_snapshot(
             x402_ttl,
             keyless_ttl,
             lambda: cmc_client.fetch_x402_enriched_snapshot(enrich_symbols, id_overrides),
             _fetch_keyless,
             force_x402_refresh=force_x402,
         )
-        _ensure_bnb_reference(snapshot, cmc_client)
-        _ensure_btc_reference(snapshot, cmc_client)
-        return snapshot
+        snapshot_timestamp = time.time()
+        _ensure_bnb_reference(snapshot_before, cmc_client)
+        _ensure_btc_reference(snapshot_before, cmc_client)
+        # Fix #2: compute incremental x402 spend for this cycle.
+        current_spend = float(cmc_client.spend_governor.snapshot().get("daily_spend_usdc", 0.0))
+        cycle_x402_cost = max(0.0, current_spend - previous_x402_spend)
+        return snapshot_before, snapshot_timestamp, enrich_symbols, cycle_x402_cost
 
     def _load() -> dict[str, dict[str, Any]]:
         snapshot = cmc_client.fetch_market_snapshot(TARGET_SYMBOLS)
@@ -2241,7 +2403,9 @@ def _fetch_snapshot(
         _ensure_btc_reference(snapshot, cmc_client)
         return snapshot
 
-    return get_market_snapshot_cache().get_or_fetch(settings.cmc_snapshot_ttl_seconds, _load)
+    snapshot = get_market_snapshot_cache().get_or_fetch(settings.cmc_snapshot_ttl_seconds, _load)
+    snapshot_timestamp = time.time()
+    return snapshot, snapshot_timestamp, enrich_symbols, cycle_x402_cost
 
 
 def _ensure_bnb_reference(snapshot: dict[str, dict[str, Any]], cmc_client: CMCMCPClient) -> None:
@@ -3002,6 +3166,7 @@ def _paper_market_snapshot() -> dict[str, dict[str, Any]]:
         "percent_change_6h": 0.011,
         "percent_change_24h": 0.018,
         "estimated_slippage_pct": 0.001,
+        "data_age_seconds": 0,
     }
     for symbol in TARGET_SYMBOLS:
         baseline[symbol] = {
@@ -3027,6 +3192,7 @@ def _paper_market_snapshot() -> dict[str, dict[str, Any]]:
             "estimated_slippage_pct": 0.002,
             "funding_rate": 0.0001,
             "open_interest_change_pct": 0.0,
+            "data_age_seconds": 0,
         }
     baseline["CAKE"] = {
         **baseline["CAKE"],
@@ -3042,6 +3208,7 @@ def _paper_market_snapshot() -> dict[str, dict[str, Any]]:
         "percent_change_6h": 0.018,
         "percent_change_24h": 0.04,
         "rsi": 62.0,
+        "data_age_seconds": 0,
     }
     return baseline
 

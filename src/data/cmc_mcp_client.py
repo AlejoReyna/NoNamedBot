@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import uuid
 from typing import Any
 
@@ -356,13 +357,21 @@ class CMCMCPClient:
             normalized_symbols,
             self.get_crypto_market_metrics,
         )
-        return self._build_enriched_snapshot(
+        snapshot = self._build_enriched_snapshot(
             normalized_symbols,
             quotes,
             technicals,
             market_metrics,
             derivatives,
         )
+        # Fix #1: tag enriched rows as freshly fetched; the dual-cache merge will
+        # overwrite with the real age if the snapshot is reused from cache.
+        now = int(time.time())
+        for row in snapshot.values():
+            if isinstance(row, dict):
+                row["data_age_seconds"] = 0
+                row["data_fetched_at_epoch"] = now
+        return snapshot
 
     def fetch_keyless_quotes_snapshot(self, symbols: list[str]) -> dict[str, Any]:
         """Fetch trial REST quotes only (no x402 payment, no API key required)."""
@@ -379,6 +388,13 @@ class CMCMCPClient:
             LOGGER.warning("Keyless quotes unavailable")
             return {}
         snapshot = self._snapshot_from_quotes(normalized_symbols, quotes)
+        # Fix #1: keyless rows are freshly fetched; the dual-cache merge will
+        # overwrite with the real age if the snapshot is reused from cache.
+        now = int(time.time())
+        for row in snapshot.values():
+            if isinstance(row, dict):
+                row["data_age_seconds"] = 0
+                row["data_fetched_at_epoch"] = now
         fear_greed = self._fetch_keyless_fear_greed()
         if fear_greed is not None:
             for row in snapshot.values():
@@ -434,7 +450,7 @@ class CMCMCPClient:
             self._fetch_keyless_market_metrics_batch,
         )
         fear_greed = self._fetch_keyless_fear_greed()
-        return self._build_enriched_snapshot(
+        snapshot = self._build_enriched_snapshot(
             normalized_symbols,
             quotes,
             technicals,
@@ -442,6 +458,13 @@ class CMCMCPClient:
             derivatives,
             fear_greed_index=fear_greed,
         )
+        # Fix #1: x402-enriched rows are freshly paid-for at this instant.
+        now = int(time.time())
+        for row in snapshot.values():
+            if isinstance(row, dict):
+                row["data_age_seconds"] = 0
+                row["data_fetched_at_epoch"] = now
+        return snapshot
 
     def _fetch_keyless_quotes_batch(self, symbols: list[str]) -> dict[str, Any]:
         return self._fetch_keyless_id_preferred("get_crypto_quotes_latest", symbols)
@@ -804,6 +827,9 @@ class CMCMCPClient:
                 "low_24h": self._first_number_from_many([quote_data], ("low_24h", "low_24h_price")),
                 "bnb_1h_trend_pct": bnb_trend,
                 "estimated_slippage_pct": estimated_slippage_pct,
+                # Fix #1: quotes-only rows are fresh at fetch time.
+                "data_age_seconds": 0,
+                "data_fetched_at_epoch": int(time.time()),
             }
         LOGGER.info("Built %s quotes-only snapshot for %d symbols", source, len(snapshot))
         return snapshot
@@ -848,10 +874,17 @@ class CMCMCPClient:
             self.spend_governor.record_spend(tool=tool_name)
         except Exception as exc:
             LOGGER.warning("CMC MCP x402 call %s failed: %s", tool_name, exc)
-            # If the error is pre-payment (key missing, SDK init failure), don't charge
+            # Fix #9: extract HTTP status from the error so the governor can apply
+            # smart assume_charged (4xx = unpaid, 5xx/timeout = may have settled).
             reason = str(exc)
+            http_status = getattr(exc, "status_code", None) or self._extract_http_status(reason)
             assume_charged = "returned None" not in reason and "payment key missing" not in reason.lower()
-            self.spend_governor.record_failure(tool=tool_name, reason=reason, assume_charged=assume_charged)
+            self.spend_governor.record_failure(
+                tool=tool_name,
+                reason=reason,
+                assume_charged=assume_charged,
+                http_status=http_status,
+            )
             return self._fetch_keyless(tool_name, arguments)
 
         if not isinstance(payload, dict):
@@ -899,10 +932,17 @@ class CMCMCPClient:
             self.spend_governor.record_spend(tool=tool_name)
         except Exception as exc:
             LOGGER.warning("CMC MCP x402 call %s failed: %s", tool_name, exc)
-            # If the error is pre-payment (key missing, SDK init failure), don't charge
+            # Fix #9: extract HTTP status from the error so the governor can apply
+            # smart assume_charged (4xx = unpaid, 5xx/timeout = may have settled).
             reason = str(exc)
+            http_status = getattr(exc, "status_code", None) or self._extract_http_status(reason)
             assume_charged = "returned None" not in reason and "payment key missing" not in reason.lower()
-            self.spend_governor.record_failure(tool=tool_name, reason=reason, assume_charged=assume_charged)
+            self.spend_governor.record_failure(
+                tool=tool_name,
+                reason=reason,
+                assume_charged=assume_charged,
+                http_status=http_status,
+            )
             return {}
 
         if not isinstance(payload, dict):
@@ -915,6 +955,18 @@ class CMCMCPClient:
             return parsed
         LOGGER.warning("CMC MCP x402 call %s returned an unexpected result shape; using empty fallback", tool_name)
         return {}
+
+    @staticmethod
+    def _extract_http_status(reason: str) -> int | None:
+        """Fix #9: pull an HTTP status code out of an exception reason string."""
+        import re
+        match = re.search(r"\bHTTP\s+(\d{3})\b", str(reason))
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                pass
+        return None
 
     @staticmethod
     def _x402_shadow_enabled() -> bool:
