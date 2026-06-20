@@ -182,22 +182,7 @@ class Settings(BaseModel):
     trade_outcome_log_path: str = "logs/trade_outcomes.jsonl"
     # Verified-sell audit log written after the on-chain balance check passes.
     sell_history_log_path: str = "logs/sell_history.jsonl"
-    strategy_mode: Literal["breakout", "scalping"] = "breakout"
-    scalping_entry_score_min: float = 60.0
-    scalping_position_pct: float = 0.01
-    scalping_take_profit_pct: float = 0.015
-    scalping_stop_loss_pct: float = 0.008
-    scalping_max_hold_minutes: int = 30
-    scalping_time_stop_minutes: int = 20
-    scalping_symbol_cooldown_minutes: int = 15
-    scalping_daily_loss_cap_pct: float = 0.02
-    scalping_max_daily_trades: int = 10
-    scalping_max_gas_gwei: float = 5.0
-    scalping_max_slippage_pct: float = 0.005
-    scalping_pump_filter_15m_pct: float = 0.05
-    scalping_min_market_cap_usd: float = 1_000_000.0
-    scalping_consecutive_loss_limit: int = 3
-    scalping_consecutive_loss_cooldown_hours: float = 1.0
+    strategy_mode: Literal["breakout"] = "breakout"
     # Volume-breakout multipliers consumed by the rule-based breakout engine.
     ml_volume_breakout_multiplier: float = 2.0
     ml_volume_cache_multiplier: float = 1.2
@@ -450,22 +435,7 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
         "factor_matrix_log_path": os.getenv("FACTOR_MATRIX_LOG_PATH", "logs/factor_matrix.jsonl"),
         "trade_outcome_log_path": os.getenv("TRADE_OUTCOME_LOG_PATH", "logs/trade_outcomes.jsonl"),
         "sell_history_log_path": os.getenv("SELL_HISTORY_LOG_PATH", "logs/sell_history.jsonl"),
-        "strategy_mode": os.getenv("STRATEGY_MODE", "breakout"),
-        "scalping_entry_score_min": _get_float("SCALPING_ENTRY_SCORE_MIN", 60.0),
-        "scalping_position_pct": _get_float("SCALPING_POSITION_PCT", 0.01),
-        "scalping_take_profit_pct": _get_float("SCALPING_TAKE_PROFIT_PCT", 0.015),
-        "scalping_stop_loss_pct": _get_float("SCALPING_STOP_LOSS_PCT", 0.008),
-        "scalping_max_hold_minutes": _get_int("SCALPING_MAX_HOLD_MINUTES", 30),
-        "scalping_time_stop_minutes": _get_int("SCALPING_TIME_STOP_MINUTES", 20),
-        "scalping_symbol_cooldown_minutes": _get_int("SCALPING_SYMBOL_COOLDOWN_MINUTES", 15),
-        "scalping_daily_loss_cap_pct": _get_float("SCALPING_DAILY_LOSS_CAP_PCT", 0.02),
-        "scalping_max_daily_trades": _get_int("SCALPING_MAX_DAILY_TRADES", 10),
-        "scalping_max_gas_gwei": _get_float("SCALPING_MAX_GAS_GWEI", 5.0),
-        "scalping_max_slippage_pct": _get_float("SCALPING_MAX_SLIPPAGE_PCT", 0.005),
-        "scalping_pump_filter_15m_pct": _get_float("SCALPING_PUMP_FILTER_15M_PCT", 0.05),
-        "scalping_min_market_cap_usd": _get_float("SCALPING_MIN_MARKET_CAP_USD", 1_000_000.0),
-        "scalping_consecutive_loss_limit": _get_int("SCALPING_CONSECUTIVE_LOSS_LIMIT", 3),
-        "scalping_consecutive_loss_cooldown_hours": _get_float("SCALPING_CONSECUTIVE_LOSS_COOLDOWN_HOURS", 1.0),
+        "strategy_mode": "breakout",
         "ml_volume_breakout_multiplier": _get_float("ML_VOLUME_BREAKOUT_MULTIPLIER", 2.0),
         "ml_volume_cache_multiplier": _get_float("ML_VOLUME_CACHE_MULTIPLIER", 1.2),
         "ml_enabled": _get_bool("ML_ENABLED", False),
@@ -501,8 +471,5 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
     # Alias deprecated min_entry_factors into breakout_min_true_factor_count so
     # the engine actually respects the setting.
     values["breakout_min_true_factor_count"] = values.get("min_entry_factors", values.get("breakout_min_true_factor_count", 3))
-    mode = str(values.get("strategy_mode", "breakout")).strip().lower()
-    if mode not in {"breakout", "scalping"}:
-        mode = "breakout"
-    values["strategy_mode"] = mode
+    values["strategy_mode"] = "breakout"
     return Settings(**values)
