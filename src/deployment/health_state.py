@@ -17,6 +17,8 @@ class HealthState:
     daily_trades: int = 0
     drawdown_pct: float = 0.0
     status: str = "starting"
+    x402_wallet_address: str | None = None
+    x402_usdc_balance: float | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def update(self, **kwargs: Any) -> None:
@@ -34,6 +36,10 @@ class HealthState:
                 "positions": self.positions,
                 "daily_trades": self.daily_trades,
                 "drawdown_pct": round(self.drawdown_pct, 4),
+                "x402": {
+                    "walletAddress": self.x402_wallet_address,
+                    "walletUsdcBalance": self.x402_usdc_balance,
+                },
             }
 
     def is_stalled(self, stall_minutes: float = 15.0) -> bool:

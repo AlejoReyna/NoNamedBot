@@ -1057,6 +1057,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             guardrails=guardrails,
             portfolio_value=portfolio_value,
             position_manager=position_manager,
+            settings=settings,
         )
         cycles_completed += 1
         if max_cycles is not None and cycles_completed >= max_cycles:

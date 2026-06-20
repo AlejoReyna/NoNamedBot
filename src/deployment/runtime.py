@@ -68,6 +68,7 @@ def update_health_snapshot(
     guardrails: Any,
     portfolio_value: float,
     position_manager: Any,
+    settings: Settings | None = None,
 ) -> None:
     if health_state is None:
         return
@@ -75,10 +76,26 @@ def update_health_snapshot(
     drawdown = 0.0
     if ath > 0:
         drawdown = max(0.0, (ath - portfolio_value) / ath * 100.0)
+    
+    # Fetch x402 wallet balance if settings available
+    x402_address: str | None = None
+    x402_balance: float | None = None
+    if settings is not None:
+        try:
+            from src.data.x402_wallet_view import fetch_x402_wallet_view
+            view = fetch_x402_wallet_view(base_rpc_url=settings.base_rpc_url)
+            x402_address = view.address
+            if view.usdc_balance is not None:
+                x402_balance = float(view.usdc_balance)
+        except Exception as exc:
+            LOGGER.debug("x402 wallet snapshot failed: %s", exc)
+    
     health_state.update(
         last_cycle_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
         positions=len(position_manager.list_open_positions()),
         daily_trades=int(getattr(guardrails, "daily_trade_count", 0)),
         drawdown_pct=drawdown,
         status="ok",
+        x402_wallet_address=x402_address,
+        x402_usdc_balance=x402_balance,
     )
