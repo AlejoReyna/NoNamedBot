@@ -17,7 +17,7 @@ class DataSourceConfig:
     cmc_mcp_shadow_mode: bool = True
     cmc_mcp_url: str = CMC_MCP_URL
     cmc_x402_chain_id: int = 8453
-    cmc_x402_max_usdc_per_call: Decimal = Decimal("0.01")
+    cmc_x402_max_usdc_per_call: Decimal = Decimal("0.015")
 
 
 def load_data_source_config() -> DataSourceConfig:
@@ -28,7 +28,7 @@ def load_data_source_config() -> DataSourceConfig:
         cmc_mcp_shadow_mode=_get_bool("CMC_MCP_SHADOW_MODE", True),
         cmc_mcp_url=os.getenv("CMC_MCP_URL", CMC_MCP_URL),
         cmc_x402_chain_id=_get_int("CMC_X402_CHAIN_ID", 8453),
-        cmc_x402_max_usdc_per_call=_get_decimal("CMC_X402_MAX_USDC_PER_CALL", Decimal("0.01")),
+        cmc_x402_max_usdc_per_call=_get_decimal("CMC_X402_MAX_USDC_PER_CALL", Decimal("0.015")),
     )
 
 

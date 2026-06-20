@@ -142,11 +142,11 @@ class PositionManager:
             return "take_profit"
         if current_price <= position.trailing_stop_price:
             return "trailing_stop"
-        if self._time_stop_triggered(position):
+        if self._time_stop_triggered(position, current_price):
             return "time_stop"
         return None
 
-    def _time_stop_triggered(self, position: Position) -> bool:
+    def _time_stop_triggered(self, position: Position, current_price: float | None = None) -> bool:
         """Force an exit when a position has been held past max_hold_hours.
 
         Breakout positions otherwise sit indefinitely whenever neither the
@@ -154,6 +154,7 @@ class PositionManager:
         turnover so capital is recycled and the book does not arrive at the
         competition deadline full of stale, never-realized positions.
         Disabled when ``max_hold_hours`` is 0 or unset.
+        Winners (current_price >= entry_price) are NOT force-closed.
         """
 
         max_hold_hours = float(getattr(self.settings, "max_hold_hours", 0.0) or 0.0)
@@ -163,6 +164,8 @@ class PositionManager:
         if opened_at.tzinfo is None:
             opened_at = opened_at.replace(tzinfo=timezone.utc)
         age_hours = (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600.0
+        if current_price is not None and current_price >= position.entry_price:
+            return False
         return age_hours >= max_hold_hours
 
     def _active_trailing_stop_pct(self, position: Position) -> float:

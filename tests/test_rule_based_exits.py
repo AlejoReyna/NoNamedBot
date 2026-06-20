@@ -125,8 +125,8 @@ def test_time_stop_fires_after_max_hold(tmp_path: Path) -> None:
     )
     # Backdate the open so the position is stale.
     pos.opened_at = datetime.now(timezone.utc) - timedelta(hours=13)
-    # Price sits between stop and target -> only the time-stop can fire.
-    reason = manager.update_price("DOT", 1.0)
+    # Price is a small loser (below entry but above trailing stop) -> only the time-stop can fire.
+    reason = manager.update_price("DOT", 0.99)
     assert reason == "time_stop"
 
 

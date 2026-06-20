@@ -40,6 +40,14 @@ from src.config.tokens import (
 from src.data.cmc_mcp_client import CMCMCPClient
 from src.data.enrichment_planner import hot_candidate_symbols, select_enrichment_symbols
 from src.data.market_snapshot_cache import get_dual_market_snapshot_cache, get_market_snapshot_cache
+from src.data.x402_optimizer import (
+    AUM_MIN_VIABLE,
+    T0_MIN_EMPIRICAL,
+    T2_MIN_PRACTICAL,
+    compute_optimal_n,
+    scale_alpha,
+)
+from src.data.x402_spend_governor import BudgetCircuitBreaker
 from src.execution import liquidity_analyzer as liquidity_analyzer_module
 from src.execution.bnb_toolkit_wrapper import BnbToolkitWrapper
 from src.execution.decision_log import DecisionAction, log_decision
@@ -278,8 +286,8 @@ def _print_x402_wallet_section(settings: Settings) -> None:
         from src.data.x402_spend_governor import X402SpendGovernor
 
         ledger = X402SpendGovernor(
-            daily_budget_usdc=getattr(settings, "x402_daily_budget_usdc", 2.0),
-            total_budget_usdc=getattr(settings, "x402_total_budget_usdc", 15.0),
+            daily_budget_usdc=getattr(settings, "x402_daily_budget_usdc", round(5.0 / 7, 6)),
+            total_budget_usdc=getattr(settings, "x402_total_budget_usdc", 5.0),
             cost_per_call_usdc=settings.cmc_x402_amount,
             failure_cooldown_seconds=getattr(settings, "x402_failure_cooldown_seconds", 900),
         ).snapshot()
@@ -495,7 +503,12 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
 
     run_id = f"run-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
     Path("logs").mkdir(parents=True, exist_ok=True)
-    cmc_client = CMCMCPClient(settings)
+    # Budget circuit breaker: dynamic T2 throttling when daily spend exceeds plan
+    budget_circuit = BudgetCircuitBreaker(
+        daily_budget=settings.x402_daily_budget_usdc,
+        headroom=0.25,
+    )
+    cmc_client = CMCMCPClient(settings, budget_circuit=budget_circuit)
     if not settings.use_dual_market_data:
         has_key = bool(
             os.getenv("CMC_X402_EPHEMERAL_KEY", "").strip()
@@ -545,6 +558,16 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
     needs_balance_reconstruction = not positions_loaded and not settings.paper_trade
     if positions_loaded:
         LOGGER.info("Loaded %s persisted open positions", len(position_manager.list_open_positions()))
+
+    # Warn if AUM is below minimum viable for live trading profitability
+    portfolio_value = _portfolio_value_usdc(toolkit, settings, {}, position_manager)
+    if portfolio_value < AUM_MIN_VIABLE:
+        LOGGER.warning(
+            "AUM $%.2f below minimum viable $%.2f. This config is for competition "
+            "scoring, not live trading. Minimum viable AUM ≈ $5K–$10K.",
+            portfolio_value,
+            AUM_MIN_VIABLE,
+        )
 
     # Re-log the snapshot-cache restore here: the singleton loads at import
     # time, before logging is configured, so its own INFO line is dropped.
@@ -627,6 +650,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                 for position in open_positions
             ),
             position_symbols={position.symbol.upper() for position in open_positions},
+            budget_circuit=budget_circuit,
         )
         _update_price_cache(price_cache, market_snapshot, now_utc)
         window_flatten_active = _maybe_flatten_for_window(
@@ -656,7 +680,11 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
         liquidity: Any | None = None
         action = "WAIT"
         entry_position_pct = 0.0
-        entries_allowed = _risk_allows_new_entries(guardrails, risk_decision, portfolio_value, settings)
+        entries_allowed = _risk_allows_new_entries(
+            guardrails, risk_decision, portfolio_value, settings,
+            regime_result=regime_result,
+            position_manager=position_manager,
+        )
         if window_flatten_active:
             entries_allowed = False
         entries_blocked_reason = None if entries_allowed else _entries_blocked_reason(
@@ -664,6 +692,8 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             risk_decision,
             portfolio_value,
             settings,
+            regime_result=regime_result,
+            position_manager=position_manager,
         )
         if window_flatten_active:
             entries_blocked_reason = "competition_window_flatten"
@@ -1181,13 +1211,21 @@ def _risk_allows_new_entries(
     risk_decision: RiskDecision,
     portfolio_value: float,
     settings: Settings,
+    *,
+    regime_result: object | None = None,
+    position_manager: PositionManager | None = None,
 ) -> bool:
     if not risk_decision.allow_new_entries:
         return False
     if settings.strategy_mode == "scalping" and isinstance(guardrails, ScalpingGuardrails):
         return guardrails.scalping_entries_allowed(portfolio_value)
+    open_position_count = len(position_manager.list_open_positions()) if position_manager else 0
     daily_count = int(getattr(guardrails, "_daily_trade_count", 0))
-    return daily_count < risk_decision.max_daily_trades
+    max_daily = risk_decision.max_daily_trades
+    global_max = getattr(settings, "global_max_daily_trades", 0)
+    if global_max > 0 and daily_count >= global_max:
+        return False
+    return (open_position_count + daily_count) < max_daily
 
 
 def _entries_blocked_reason(
@@ -1195,6 +1233,9 @@ def _entries_blocked_reason(
     risk_decision: RiskDecision,
     portfolio_value: float,
     settings: Settings,
+    *,
+    regime_result: object | None = None,
+    position_manager: PositionManager | None = None,
 ) -> str | None:
     """Return a stable reason code when new entries are globally blocked."""
 
@@ -1203,8 +1244,15 @@ def _entries_blocked_reason(
     if settings.strategy_mode == "scalping" and isinstance(guardrails, ScalpingGuardrails):
         if not guardrails.scalping_entries_allowed(portfolio_value):
             return "scalping_guardrails"
+    open_position_count = len(position_manager.list_open_positions()) if position_manager else 0
     daily_count = int(getattr(guardrails, "_daily_trade_count", 0))
-    if daily_count >= risk_decision.max_daily_trades:
+    max_daily = risk_decision.max_daily_trades
+    global_max = getattr(settings, "global_max_daily_trades", 0)
+    if global_max > 0 and daily_count >= global_max:
+        if risk_decision.state == RiskState.REDUCED_RISK:
+            return "reduced_risk_daily_trade_limit"
+        return "daily_trade_limit"
+    if (open_position_count + daily_count) >= max_daily:
         if risk_decision.state == RiskState.REDUCED_RISK:
             return "reduced_risk_daily_trade_limit"
         return "daily_trade_limit"
@@ -1468,6 +1516,25 @@ def _attempt_entry_v25(
         position_pct = position_usd / portfolio_value if portfolio_value > 0 else 0.0
     if position_usd <= 0:
         return EntryAttempt(False, "portfolio floor prevents spend", position_pct, liquidity)
+    min_position_size = float(getattr(settings, "min_position_size_usd", 2.0) or 2.0)
+    if position_usd < min_position_size:
+        LOGGER.warning(
+            "Skipping %s entry: position size $%.2f below minimum floor $%.2f",
+            candidate.symbol,
+            position_usd,
+            min_position_size,
+        )
+        return EntryAttempt(False, f"position size below min floor {min_position_size}", position_pct, liquidity)
+    open_position_count = len(position_manager.list_open_positions())
+    current_regime = getattr(getattr(regime_result, "regime", None), "value", str(regime_result.regime)) if regime_result else ""
+    guardrails.validate_new_trade(
+        candidate.symbol,
+        position_usd,
+        portfolio_value,
+        risk_decision.max_slippage_pct,
+        open_position_count=open_position_count,
+        current_regime=current_regime,
+    )
 
     expected_amount_out = _decimal_div(position_usd, candidate.price)
     balance_before = _balance_before_for_reconciliation(toolkit, candidate.symbol)
@@ -2077,6 +2144,7 @@ def _fetch_snapshot(
     cmc_client: CMCMCPClient,
     open_position_value_usdc: float = 0.0,
     position_symbols: set[str] | None = None,
+    budget_circuit: BudgetCircuitBreaker | None = None,
 ) -> dict[str, dict[str, Any]]:
     if settings.paper_trade:
         return _paper_market_snapshot()
@@ -2100,6 +2168,9 @@ def _fetch_snapshot(
                     dust_threshold,
                     x402_ttl,
                 )
+        # Enforce operational constraints: empirical minimums for scan/monitor
+        # and practical minimum for hot-candidate refresh without bundles.
+        x402_ttl = max(T0_MIN_EMPIRICAL, x402_ttl)
 
         cache = get_dual_market_snapshot_cache()
 
@@ -2113,6 +2184,11 @@ def _fetch_snapshot(
         force_x402 = False
         x402_age = cache.x402_age_seconds()
         hot_age = getattr(settings, "x402_hot_refresh_age_seconds", 600)
+        # Clamp hot_age to the practical minimum (no bundles = 300s floor)
+        hot_age = max(T2_MIN_PRACTICAL, hot_age)
+        # Dynamic budget throttling: double T2 when over daily budget
+        if budget_circuit is not None:
+            hot_age = budget_circuit.throttled_refresh_age(hot_age)
         if x402_age is not None and x402_age > hot_age and x402_age < x402_ttl:
             hot_symbols = hot_candidate_symbols(keyless_snapshot, settings)
             if hot_symbols:
@@ -2124,11 +2200,23 @@ def _fetch_snapshot(
                     hot_age,
                 )
 
+        # Compute optimal symbol count from the verified optimizer model.
+        # n* = max(1, ceil(beta/(1-beta))) = 1 at beta=0.12; practical use 3-5.
+        n_opt = compute_optimal_n()
+        if n_opt < 3:
+            LOGGER.info(
+                "Optimal n*=%d at beta=%.2f; using minimum practical n=3 for diversification",
+                n_opt,
+                BETA,
+            )
+            n_opt = 3
+
         enrich_symbols = select_enrichment_symbols(
             keyless_snapshot,
             list(TARGET_SYMBOLS),
             position_symbols or set(),
             settings,
+            top_n=n_opt,
         )
 
         # The paid MCP tool requires CMC ids (symbol-only requests are
@@ -2750,6 +2838,8 @@ def _maybe_enter_position(
     market_snapshot: dict[str, dict[str, Any]],
     portfolio_value: float,
     twak_interface: TWAKInterface,
+    *,
+    regime_result: object | None = None,
 ) -> None:
     if not decision.should_enter or decision.symbol is None:
         LOGGER.info("No entry: %s", decision.reason)
@@ -2794,11 +2884,24 @@ def _maybe_enter_position(
     if decision.position_size_usdc <= 0:
         LOGGER.warning("Signal ignored for %s because portfolio floor prevents spend", decision.symbol)
         return
+    min_position_size = float(getattr(guardrails.settings, "min_position_size_usd", 2.0) or 2.0)
+    if decision.position_size_usdc < min_position_size:
+        LOGGER.warning(
+            "Skipping %s entry: position size $%.2f below minimum floor $%.2f",
+            decision.symbol,
+            decision.position_size_usdc,
+            min_position_size,
+        )
+        return
+    open_position_count = len(position_manager.list_open_positions())
+    current_regime = getattr(getattr(regime_result, "regime", None), "value", "") if regime_result else ""
     guardrails.validate_new_trade(
         decision.symbol,
         decision.position_size_usdc,
         portfolio_value,
         slippage,
+        open_position_count=open_position_count,
+        current_regime=current_regime,
     )
     price = _number(token_data.get("price"))
     if price <= 0:

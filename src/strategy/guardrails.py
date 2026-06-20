@@ -70,14 +70,16 @@ class Guardrails:
         position_value_usdc: float,
         portfolio_value_usdc: float,
         estimated_slippage_pct: float,
+        open_position_count: int | None = None,
+        current_regime: str = "",
     ) -> None:
         """Raise if a new trade violates the configured guardrails."""
 
-        self._reset_daily_if_needed()
+        self._reset_daily_if_needed(open_position_count=open_position_count or 0)
         assert_tradable_symbol(symbol)
         if self._kill_switch:
             raise RuntimeError("drawdown kill switch is active")
-        if not self.can_open_new_trade():
+        if not self.can_open_new_trade(open_position_count, current_regime):
             seconds = self.seconds_until_trading_resumes()
             raise RuntimeError(f"new trades are paused for {seconds} more seconds")
         max_position_value = portfolio_value_usdc * self.settings.max_position_pct
@@ -148,7 +150,7 @@ class Guardrails:
 
         self._state = state
         self._save_state()
-        return self._risk_decision(state, reasons)
+        return self._risk_decision(state, reasons, regime_result=regime_result)
 
     def record_trade_result(self, realized_pnl_pct: float) -> None:
         now = self._now()
@@ -184,15 +186,28 @@ class Guardrails:
         now = current_time or self._now()
         return self._last_compliance_trade_day == now.date()
 
-    def can_open_new_trade(self) -> bool:
-        """Return whether a new position may be opened now."""
+    def can_open_new_trade(self, open_position_count: int | None = None, current_regime: str = "") -> bool:
+        """Return whether a new position may be opened now.
 
-        self._reset_daily_if_needed()
+        When ``open_position_count`` is provided, the effective budget is
+        ``max_daily - open_position_count`` (rollover-safe). When omitted,
+        the legacy ``_daily_trade_count`` check is used for backwards
+        compatibility.
+        """
+
+        self._reset_daily_if_needed(open_position_count=open_position_count or 0)
         if self._kill_switch:
             return False
         if self._paused_until is not None and self._paused_until > self._now():
             return False
-        return self._daily_trade_count < self.settings.max_daily_trades
+        max_daily = self._max_daily_trades_for_regime(current_regime)
+        consumed = open_position_count if open_position_count is not None else self._daily_trade_count
+        if consumed >= max_daily:
+            return False
+        global_max = getattr(self.settings, "global_max_daily_trades", 0)
+        if global_max > 0 and self._daily_trade_count >= global_max:
+            return False
+        return True
 
     def update_portfolio_value(self, portfolio_value_usdc: float) -> bool:
         """Update all-time high tracking and return whether the kill switch is active."""
@@ -274,13 +289,13 @@ class Guardrails:
         remaining = self._paused_until - self._now()
         return max(0, int(remaining.total_seconds()))
 
-    def _reset_daily_if_needed(self, current_time: datetime | None = None) -> None:
+    def _reset_daily_if_needed(self, current_time: datetime | None = None, open_position_count: int = 0) -> None:
         now = current_time or self._now()
         if now.date() == self._daily_date:
             self._reset_recorded_loss_day_if_needed(now)
             return
         self._daily_date = now.date()
-        self._daily_trade_count = 0
+        self._daily_trade_count = open_position_count
         self._daily_realized_loss_usdc = 0.0
         self._daily_loss_pct = 0.0
         if self._paused_until is not None and self._paused_until <= now:
@@ -370,16 +385,20 @@ class Guardrails:
             reasons.append("volatility_breaker")
         return reasons
 
-    def _risk_decision(self, state: RiskState, reasons: list[str]) -> RiskDecision:
+    def _risk_decision(self, state: RiskState, reasons: list[str], regime_result: object | None = None) -> RiskDecision:
         base_risk = self.settings.base_risk_per_trade_pct
         strict_slippage = min(self.settings.max_slippage_pct, self.settings.risk_off_max_slippage_pct)
+        regime_str = ""
+        if regime_result is not None:
+            regime_str = getattr(getattr(regime_result, "regime", None), "value", str(regime_result)) or ""
+        max_daily = self._max_daily_trades_for_regime(regime_str)
         if state == RiskState.NORMAL:
             return RiskDecision(
                 state,
                 True,
                 1.0,
                 self.settings.max_slippage_pct,
-                self._configured_max_daily_trades(),
+                max_daily,
                 base_risk,
                 reasons,
             )
@@ -389,14 +408,20 @@ class Guardrails:
                 True,
                 0.5,
                 strict_slippage,
-                self._configured_max_daily_trades(),
+                max_daily,
                 base_risk * 0.5,
                 reasons,
             )
         return RiskDecision(state, False, 0.0, strict_slippage, 0, 0.0, reasons)
 
-    def _configured_max_daily_trades(self) -> int:
+    def _max_daily_trades_for_regime(self, current_regime: str = "") -> int:
+        by_regime = getattr(self.settings, "max_daily_trades_by_regime", None)
+        if isinstance(by_regime, dict) and current_regime in by_regime:
+            return max(0, int(by_regime.get(current_regime, self.settings.max_daily_trades) or 0))
         return max(0, int(getattr(self.settings, "max_daily_trades", 0) or 0))
+
+    def _configured_max_daily_trades(self) -> int:
+        return self._max_daily_trades_for_regime()
 
     def _reset_recorded_loss_day_if_needed(self, current_time: datetime | None = None) -> None:
         now = current_time or self._now()

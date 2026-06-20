@@ -86,15 +86,19 @@ def select_enrichment_symbols(
     target_symbols: list[str],
     position_symbols: set[str],
     settings: Settings,
+    top_n: int | None = None,
 ) -> list[str]:
     """Pick which symbols a paid refresh should enrich.
 
     Top-N targets by cheap rank (gates passed, 1h volume surge, 24h volume),
     always including open-position symbols and BNB (regime reference). With
     N <= 0 or no keyless data to rank on, fall back to the full target list.
+
+    ``top_n`` overrides the ``x402_enrich_top_n`` setting when provided,
+    e.g. from the optimizer's ``compute_optimal_n``.
     """
 
-    top_n = int(getattr(settings, "x402_enrich_top_n", 0) or 0)
+    top_n = int(top_n if top_n is not None else (getattr(settings, "x402_enrich_top_n", 0) or 0))
     targets = [str(symbol).upper() for symbol in target_symbols]
     if top_n <= 0 or top_n >= len(targets) or not keyless_snapshot:
         return targets

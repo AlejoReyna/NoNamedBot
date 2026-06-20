@@ -252,7 +252,7 @@ def _short_response_text(response: httpx.Response, limit: int = 500) -> str:
 class CMCMCPClient:
     """Small JSON-RPC/MCP client for CoinMarketCap AI Agent Hub data."""
 
-    def __init__(self, settings: Settings, x402_client: X402Client | None = None) -> None:
+    def __init__(self, settings: Settings, x402_client: X402Client | None = None, budget_circuit: Any | None = None) -> None:
         self.settings = settings
         self.endpoint = settings.cmc_x402_endpoint
         self.x402_client = x402_client or X402Client(
@@ -264,10 +264,11 @@ class CMCMCPClient:
         from src.data.x402_spend_governor import X402SpendGovernor
 
         self.spend_governor = X402SpendGovernor(
-            daily_budget_usdc=getattr(settings, "x402_daily_budget_usdc", 2.0),
-            total_budget_usdc=getattr(settings, "x402_total_budget_usdc", 15.0),
+            daily_budget_usdc=getattr(settings, "x402_daily_budget_usdc", round(5.0 / 7, 6)),
+            total_budget_usdc=getattr(settings, "x402_total_budget_usdc", 5.0),
             cost_per_call_usdc=settings.cmc_x402_amount,
             failure_cooldown_seconds=getattr(settings, "x402_failure_cooldown_seconds", 900),
+            budget_circuit=budget_circuit,
         )
 
     def get_crypto_quotes_latest(self, symbols: list[str]) -> dict[str, Any]:

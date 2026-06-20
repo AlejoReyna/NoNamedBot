@@ -15,9 +15,9 @@ def _jsonl(path: Path) -> list[dict[str, object]]:
 def test_x402_governor_appends_success_and_failure_call_records(tmp_path: Path) -> None:
     call_log_path = tmp_path / "logs" / "x402_calls.jsonl"
     governor = X402SpendGovernor(
-        daily_budget_usdc=2.0,
-        total_budget_usdc=15.0,
-        cost_per_call_usdc=0.01,
+        daily_budget_usdc=round(5.0 / 7, 6),
+        total_budget_usdc=5.0,
+        cost_per_call_usdc=0.015,
         ledger_path=tmp_path / "x402_spend.json",
         call_log_path=call_log_path,
     )
@@ -33,18 +33,18 @@ def test_x402_governor_appends_success_and_failure_call_records(tmp_path: Path) 
     assert len(records) == 2
     assert records[0]["outcome"] == "success"
     assert records[0]["tool"] == "get_crypto_quotes_latest"
-    assert records[0]["amount_usdc"] == 0.01
+    assert records[0]["amount_usdc"] == 0.015
     assert records[0]["http_status"] == 200
     assert records[0]["reason"] is None
-    assert records[0]["daily_spend_usdc"] == 0.01
-    assert records[0]["total_spend_usdc"] == 0.01
+    assert records[0]["daily_spend_usdc"] == 0.015
+    assert records[0]["total_spend_usdc"] == 0.015
 
     assert records[1]["outcome"] == "failure"
     assert records[1]["tool"] == "get_crypto_market_metrics"
-    assert records[1]["amount_usdc"] == 0.01
+    assert records[1]["amount_usdc"] == 0.015
     assert records[1]["http_status"] is None
-    assert records[1]["daily_spend_usdc"] == 0.02
-    assert records[1]["total_spend_usdc"] == 0.02
+    assert records[1]["daily_spend_usdc"] == 0.03
+    assert records[1]["total_spend_usdc"] == 0.03
     assert isinstance(records[1]["reason"], str)
     assert len(records[1]["reason"]) <= 200
     assert "0x" + "a" * 64 not in records[1]["reason"]

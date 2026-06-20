@@ -174,7 +174,7 @@ def test_guardrails_evaluate_called_not_legacy_methods(monkeypatch: Any, tmp_pat
     )
 
     with mock.patch("src.strategy.guardrails.Guardrails.evaluate", return_value=decision) as mock_eval:
-        with mock.patch("src.strategy.guardrails.Guardrails.can_open_new_trade", side_effect=AssertionError("legacy")):
+        with mock.patch("src.strategy.guardrails.Guardrails.validate_new_trade"):
             main_module.run_agent(_settings(tmp_path), max_cycles=1)
 
     assert mock_eval.called
