@@ -42,8 +42,6 @@ from src.data.enrichment_planner import hot_candidate_symbols, select_enrichment
 from src.data.market_snapshot_cache import get_dual_market_snapshot_cache, get_market_snapshot_cache
 from src.data.x402_optimizer import (
     AUM_MIN_VIABLE,
-    BETA,
-    T0_MIN_EMPIRICAL,
     T2_MIN_PRACTICAL,
     compute_optimal_n,
     scale_alpha,
@@ -70,8 +68,6 @@ from src.strategy.factory import create_strategy_bundle, fallback_evaluate_unive
 
 _fallback_scorer = importlib.import_module("src.strategy.6falgorithm.fallback_scorer")
 fallback_best_near_miss = _fallback_scorer.fallback_best_near_miss
-from src.strategy.scalping_guardrails import ScalpingGuardrails
-from src.strategy.scalping_position_manager import ScalpingPositionManager
 from src.strategy.guardrails import Guardrails, RiskDecision, RiskState, TradeRecord
 from src.strategy.position_manager import Position, PositionManager, calculate_position_pct
 from src.research import sell_history, trade_outcome_log
@@ -841,77 +837,69 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             else:
                 decision_reasons = decision_reasons or [f"Risk state: {risk_decision.state.value}"]
         else:
-            skip_entries = (
-                settings.strategy_mode == "scalping"
-                and len(position_manager.list_open_positions()) >= 1
+            exclude_symbols = {position.symbol for position in position_manager.list_open_positions()}
+            exclude_symbols.update(pending_swap_cooldowns)
+            exclude_symbols.update(recent_near_miss_excludes)
+            # RWEAL Phase 1: exclude symbols in an active event blackout from
+            # selection so a blacked-out top pick does not suppress otherwise
+            # valid alternatives (symbol-specific events block only that
+            # symbol, not the whole universe). GLOBAL/macro blackouts are
+            # handled at the cycle-top gate, not here.
+            rweal_blacked_out: set[str] = set()
+            if event_filter is not None:
+                rweal_blacked_out = event_filter.active_symbol_blackouts(now_utc)
+                if rweal_blacked_out:
+                    exclude_symbols.update(rweal_blacked_out)
+            candidate = _evaluate_universe_v25(
+                market_snapshot,
+                portfolio_value,
+                regime_result,
+                risk_decision,
+                settings,
+                twak_interface,
+                exclude_symbols=exclude_symbols,
+                sentiment_tier1=sentiment,
+                sentiment_result=sentiment_result,
+                ml_bundle=ml_bundle,
+                x402_cost_usdc=cycle_x402_cost,
+                enriched_symbols=enrich_symbols,
+                position_symbols=position_symbols,
             )
-            if skip_entries:
-                decision_reasons.append("Scalping mode: monitoring open position")
-            else:
-                exclude_symbols = {position.symbol for position in position_manager.list_open_positions()}
-                exclude_symbols.update(pending_swap_cooldowns)
-                if settings.strategy_mode == "breakout":
-                    exclude_symbols.update(recent_near_miss_excludes)
-                # RWEAL Phase 1: exclude symbols in an active event blackout from
-                # selection so a blacked-out top pick does not suppress otherwise
-                # valid alternatives (symbol-specific events block only that
-                # symbol, not the whole universe). GLOBAL/macro blackouts are
-                # handled at the cycle-top gate, not here.
-                rweal_blacked_out: set[str] = set()
-                if event_filter is not None:
-                    rweal_blacked_out = event_filter.active_symbol_blackouts(now_utc)
-                    if rweal_blacked_out:
-                        exclude_symbols.update(rweal_blacked_out)
-                candidate = _evaluate_universe_v25(
-                    market_snapshot,
-                    portfolio_value,
-                    regime_result,
-                    risk_decision,
-                    settings,
-                    twak_interface,
-                    exclude_symbols=exclude_symbols,
-                    sentiment_tier1=sentiment,
-                    sentiment_result=sentiment_result,
-                    ml_bundle=ml_bundle,
-                    x402_cost_usdc=cycle_x402_cost,
-                    enriched_symbols=enrich_symbols,
-                    position_symbols=position_symbols,
+            # Defensive backstop: drop any discretionary candidate that still
+            # carries an active blackout (e.g. a path that bypassed excludes).
+            if candidate is not None and event_filter is not None:
+                _rweal_symbol = event_filter.symbol_blackout(candidate.symbol, now_utc)
+                if _rweal_symbol:
+                    LOGGER.warning("Entry blocked by RWEAL: %s", _rweal_symbol)
+                    decision_reasons.append(f"RWEAL: {_rweal_symbol}")
+                    candidate = None
+            if candidate is None:
+                minimum_trade = check_daily_minimum_compliance(
+                    guardrails, regime_result, cycle_number, now_utc, settings
                 )
-                # Defensive backstop: drop any discretionary candidate that still
-                # carries an active blackout (e.g. a path that bypassed excludes).
-                if candidate is not None and event_filter is not None:
-                    _rweal_symbol = event_filter.symbol_blackout(candidate.symbol, now_utc)
-                    if _rweal_symbol:
-                        LOGGER.warning("Entry blocked by RWEAL: %s", _rweal_symbol)
-                        decision_reasons.append(f"RWEAL: {_rweal_symbol}")
-                        candidate = None
-                if candidate is None and settings.strategy_mode != "scalping":
-                    minimum_trade = check_daily_minimum_compliance(
-                        guardrails, regime_result, cycle_number, now_utc, settings
+                if minimum_trade is not None:
+                    candidate = _minimum_trade_candidate(
+                        minimum_trade,
+                        market_snapshot,
+                        portfolio_value,
+                        settings,
+                        risk_decision,
                     )
-                    if minimum_trade is not None:
-                        candidate = _minimum_trade_candidate(
-                            minimum_trade,
-                            market_snapshot,
-                            portfolio_value,
-                            settings,
-                            risk_decision,
+                    # A compliance trade should not be routed into a symbol
+                    # facing a scheduled event; fall through to the fixed
+                    # stable->token compliance swap instead.
+                    if (
+                        candidate is not None
+                        and event_filter is not None
+                        and event_filter.symbol_blackout(candidate.symbol, now_utc)
+                    ):
+                        LOGGER.warning(
+                            "RWEAL: compliance candidate %s is blacked out; "
+                            "falling back to fixed compliance swap",
+                            candidate.symbol,
                         )
-                        # A compliance trade should not be routed into a symbol
-                        # facing a scheduled event; fall through to the fixed
-                        # stable->token compliance swap instead.
-                        if (
-                            candidate is not None
-                            and event_filter is not None
-                            and event_filter.symbol_blackout(candidate.symbol, now_utc)
-                        ):
-                            LOGGER.warning(
-                                "RWEAL: compliance candidate %s is blacked out; "
-                                "falling back to fixed compliance swap",
-                                candidate.symbol,
-                            )
-                            decision_reasons.append("RWEAL: compliance symbol blacked out")
-                            candidate = None
+                        decision_reasons.append("RWEAL: compliance symbol blacked out")
+                        candidate = None
 
             # RWEAL Phase 1: final, instant halt guard. Re-check the control file
             # immediately before execution so a TRADING_HALT that appears mid-cycle
@@ -925,33 +913,32 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                 LOGGER.warning("RWEAL manual halt detected pre-entry; skipping execution")
                 decision_reasons.append("RWEAL: manual halt (pre-execution)")
                 candidate = None
-            if not skip_entries:
-                if candidate is None:
-                    decision_reasons.append("No candidate passed gates")
-                else:
-                    attempt = _attempt_entry_v25(
-                        settings,
-                        toolkit,
-                        router,
-                        execution_reconciler,
-                        liquidity_analyzer,
-                        position_manager,
-                        guardrails,
-                        price_cache,
-                        regime_result,
-                        risk_decision,
-                        candidate,
-                        portfolio_value,
-                        market_snapshot=market_snapshot,
-                        snapshot_timestamp=snapshot_timestamp,
-                        cycle_x402_cost=cycle_x402_cost,
-                        enriched_symbols=enrich_symbols,
-                    )
-                    liquidity = attempt.liquidity
-                    entry_position_pct = attempt.position_pct
-                    decision_reasons.extend([candidate.reason, attempt.reason])
-                    if attempt.entered:
-                        action = "ENTER"
+            if candidate is None:
+                decision_reasons.append("No candidate passed gates")
+            else:
+                attempt = _attempt_entry_v25(
+                    settings,
+                    toolkit,
+                    router,
+                    execution_reconciler,
+                    liquidity_analyzer,
+                    position_manager,
+                    guardrails,
+                    price_cache,
+                    regime_result,
+                    risk_decision,
+                    candidate,
+                    portfolio_value,
+                    market_snapshot=market_snapshot,
+                    snapshot_timestamp=snapshot_timestamp,
+                    cycle_x402_cost=cycle_x402_cost,
+                    enriched_symbols=enrich_symbols,
+                )
+                liquidity = attempt.liquidity
+                entry_position_pct = attempt.position_pct
+                decision_reasons.extend([candidate.reason, attempt.reason])
+                if attempt.entered:
+                    action = "ENTER"
 
         # Live halt re-check (not the cycle-top cache): this backstop runs at the
         # very end of the cycle, after all data work, so a halt set mid-cycle
@@ -1239,8 +1226,6 @@ def _risk_allows_new_entries(
 ) -> bool:
     if not risk_decision.allow_new_entries:
         return False
-    if settings.strategy_mode == "scalping" and isinstance(guardrails, ScalpingGuardrails):
-        return guardrails.scalping_entries_allowed(portfolio_value)
     open_position_count = len(position_manager.list_open_positions()) if position_manager else 0
     daily_count = int(getattr(guardrails, "_daily_trade_count", 0))
     max_daily = risk_decision.max_daily_trades
@@ -1263,9 +1248,6 @@ def _entries_blocked_reason(
 
     if not risk_decision.allow_new_entries:
         return f"risk_state:{risk_decision.state.value}"
-    if settings.strategy_mode == "scalping" and isinstance(guardrails, ScalpingGuardrails):
-        if not guardrails.scalping_entries_allowed(portfolio_value):
-            return "scalping_guardrails"
     open_position_count = len(position_manager.list_open_positions()) if position_manager else 0
     daily_count = int(getattr(guardrails, "_daily_trade_count", 0))
     max_daily = risk_decision.max_daily_trades
@@ -1542,25 +1524,21 @@ def _attempt_entry_v25(
     atr_pct = price_cache.get_atr_pct(candidate.symbol, 14)
     # Fix #2: data cost as a percentage of equity for sizing.
     data_cost_pct = cycle_x402_cost / portfolio_value if portfolio_value > 0 else 0.0
-    if settings.strategy_mode == "scalping":
-        position_usd = candidate.position_size_usdc
-        position_pct = position_usd / portfolio_value if portfolio_value > 0 else 0.0
-    else:
-        position_pct = calculate_position_pct(
-            equity_usd=portfolio_value,
-            atr_pct=atr_pct,
-            regime_multiplier=regime_result.position_multiplier,
-            risk_state_multiplier=risk_decision.position_multiplier,
-            loss_streak=int(getattr(guardrails, "_loss_streak", 0)),
-            max_position_pct=settings.max_position_pct,
-            base_risk_per_trade_pct=settings.base_risk_per_trade_pct,
-            data_cost_pct=data_cost_pct,
-            expected_alpha_per_cycle=expected_alpha_per_cycle,
-        )
-        if getattr(liquidity, "recommendation", "") == "REDUCE_SIZE":
-            position_pct *= 0.5
-        position_pct *= max(0.0, float(getattr(candidate, "position_size_multiplier", 1.0) or 1.0))
-        position_usd = portfolio_value * position_pct
+    position_pct = calculate_position_pct(
+        equity_usd=portfolio_value,
+        atr_pct=atr_pct,
+        regime_multiplier=regime_result.position_multiplier,
+        risk_state_multiplier=risk_decision.position_multiplier,
+        loss_streak=int(getattr(guardrails, "_loss_streak", 0)),
+        max_position_pct=settings.max_position_pct,
+        base_risk_per_trade_pct=settings.base_risk_per_trade_pct,
+        data_cost_pct=data_cost_pct,
+        expected_alpha_per_cycle=expected_alpha_per_cycle,
+    )
+    if getattr(liquidity, "recommendation", "") == "REDUCE_SIZE":
+        position_pct *= 0.5
+    position_pct *= max(0.0, float(getattr(candidate, "position_size_multiplier", 1.0) or 1.0))
+    position_usd = portfolio_value * position_pct
     if candidate.factor_scores.get("regime_not_risk_off") is False:
         position_pct *= 0.5
         position_usd = portfolio_value * position_pct
@@ -1957,29 +1935,6 @@ def _telemetry_candidate_for_log(
     if selected is not None:
         return selected
 
-    if settings.strategy_mode == "scalping" and strategy_bundle.scalping_engine is not None:
-        cooldown_checker = getattr(strategy_bundle.position_manager, "is_symbol_on_cooldown", None)
-        near_miss = strategy_bundle.scalping_engine.best_near_miss(
-            market_snapshot,
-            portfolio_value,
-            regime_result,
-            risk_decision,
-            sentiment_result=sentiment_result,
-            exclude_symbols=exclude_symbols,
-            cooldown_checker=cooldown_checker,
-        )
-        if near_miss is not None:
-            return near_miss
-        return _telemetry_candidate_from_priced_targets(
-            settings,
-            market_snapshot,
-            portfolio_value,
-            regime_result,
-            risk_decision,
-            sentiment_result,
-            strategy_bundle,
-        )
-
     engine = BreakoutEngine(settings, twak_interface, sentiment_tier1=sentiment)
     filtered_snapshot = {
         symbol: data
@@ -2067,52 +2022,7 @@ def _telemetry_candidate_from_priced_targets(
 ) -> EntryCandidate | None:
     """Last-resort telemetry: score the highest-volume priced tradable symbol."""
 
-    if settings.strategy_mode != "scalping" or strategy_bundle.scalping_engine is None:
-        return None
-
-    ranked: list[tuple[float, EntryCandidate]] = []
-    for symbol in _priced_target_symbols(market_snapshot):
-        if not is_momentum_candidate_symbol(symbol):
-            continue
-        data = market_snapshot.get(symbol, {})
-        if not isinstance(data, dict):
-            continue
-        candidate = strategy_bundle.scalping_engine._score_symbol_for_telemetry(
-            symbol,
-            {"symbol": symbol, **data},
-            portfolio_value,
-            regime_result,
-            risk_decision,
-            sentiment_result,
-        )
-        if candidate is None:
-            continue
-        volume = _first_market_number(data, ("volume_24h", "market_cap"), 0.0)
-        ranked.append((volume, candidate))
-
-    if not ranked:
-        return None
-
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    best = ranked[0][1]
-    score = best.entry_score or 0.0
-    minimum = settings.scalping_entry_score_min
-    if score >= minimum:
-        return best
-    return EntryCandidate(
-        symbol=best.symbol,
-        price=best.price,
-        position_size_usdc=0.0,
-        expected_amount_out=best.expected_amount_out,
-        slippage_small=best.slippage_small,
-        slippage_normal=best.slippage_normal,
-        reason=f"best {best.symbol} scalping score {score:.0f}/100 < {minimum:.0f}",
-        factor_scores=best.factor_scores,
-        true_factor_count=best.true_factor_count,
-        source=best.source,
-        entry_score=score,
-        strategy_mode=best.strategy_mode,
-    )
+    return None
 
 
 def _log_legacy_cycle_from_v25(
@@ -2763,21 +2673,6 @@ def _process_position_exits(
             check_exits(market_snapshot, price_cache)
         except TypeError:
             check_exits(market_snapshot)
-        if isinstance(position_manager, ScalpingPositionManager):
-            while True:
-                signal = position_manager.pop_pending_exit()
-                if signal is None:
-                    break
-                _execute_position_exit(
-                    position_manager,
-                    router,
-                    guardrails,
-                    signal.symbol,
-                    signal.current_price,
-                    portfolio_value,
-                    exit_reason=signal.reason,
-                    toolkit=toolkit,
-                )
         return
 
     for position in list(position_manager.list_open_positions()):
@@ -2930,9 +2825,7 @@ def _execute_position_exit(
             _PENDING_EXIT_HASHES.pop(symbol, None)
             return
 
-    hold_time_seconds = None
-    if isinstance(position_manager, ScalpingPositionManager):
-        hold_time_seconds = position_manager.hold_time_seconds(symbol)
+    hold_time_seconds = getattr(position_manager, "hold_time_seconds", lambda s: None)(symbol)
     closed = position_manager.close_position(symbol)
     if closed is not None:
         _PENDING_EXIT_HASHES.pop(symbol, None)
@@ -2975,14 +2868,7 @@ def _execute_position_exit(
             realized_pnl_usdc=realized_pnl,
             timestamp=datetime.now().astimezone(),
         )
-        if isinstance(guardrails, ScalpingGuardrails):
-            guardrails.record_scalping_trade(
-                trade,
-                portfolio_value,
-                exit_reason=exit_reason,
-            )
-        else:
-            guardrails.record_trade(trade, portfolio_value)
+        guardrails.record_trade(trade, portfolio_value)
         if hold_time_seconds is not None:
             setattr(_execute_position_exit, "_last_exit_meta", {
                 "symbol": closed.symbol,
@@ -3247,15 +3133,7 @@ def _print_demo_cycle_summary(
     print(f"  Status: {status}")
     print(f"  Portfolio: ${portfolio_value:,.2f}")
     print(f"  Market: {priced_targets} priced target(s)")
-    if settings is not None and settings.strategy_mode == "scalping":
-        score_label = f"{int(entry_score)}/100" if entry_score is not None else "-/100"
-        tp_pct = settings.scalping_take_profit_pct * 100
-        sl_pct = settings.scalping_stop_loss_pct * 100
-        max_hold = settings.scalping_max_hold_minutes
-        print(f"  [SCALP] Score: {score_label} | Symbol: {symbol} | Action: {action}")
-        print(f"  [SCALP] TP: +{tp_pct:.1f}% | SL: -{sl_pct:.1f}% | Max Hold: {max_hold}min")
-    else:
-        print(f"  Signal: {action} {symbol} factors={factors} slippage={slippage}")
+    print(f"  Signal: {action} {symbol} factors={factors} slippage={slippage}")
     print(f"  Positions: {position_count} open")
     print(f"  Reason: {reason}")
 
@@ -3329,8 +3207,6 @@ def _log_cycle_decision(
     )
 
     factors = f"{true_factor_count}/6" if decision is not None else "-"
-    if strategy_mode == "scalping" and entry_score is not None:
-        factors = f"{int(entry_score)}/100"
     LOGGER.info(
         'Decision cycle=%s action=%s symbol=%s factors=%s slippage=%s reason="%s"',
         cycle_number,
