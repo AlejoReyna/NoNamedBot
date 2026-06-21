@@ -170,11 +170,11 @@ def test_derivatives_neutral_still_strict_when_data_present() -> None:
 
 
 def test_unquotable_symbol_without_verified_contract_is_skipped() -> None:
-    # TRIA is in the target allowlist but has no verified BSC contract, so TWAK
-    # cannot quote it; it must be rejected before selection, not picked and then
-    # failed on the quote.
-    engine = _engine_with_price_high("TRIA", 10.0)
-    decision = engine.evaluate_token(_token(symbol="TRIA"), 10000.0)
+    # RAY (Raydium) is in the target allowlist but has no verified BSC contract
+    # (it is Solana-native), so TWAK cannot quote it; it must be rejected before
+    # selection, not picked and then failed on the quote.
+    engine = _engine_with_price_high("RAY", 10.0)
+    decision = engine.evaluate_token(_token(symbol="RAY"), 10000.0)
 
     assert decision.should_enter is False
     assert "verified BSC contract" in decision.reason
@@ -188,9 +188,9 @@ def test_verified_contract_symbol_still_evaluates() -> None:
 
 
 def test_contract_gate_can_be_disabled_via_setting() -> None:
-    engine = _engine_with_price_high("TRIA", 10.0, settings=Settings(require_verified_bsc_contract=False))
-    decision = engine.evaluate_token(_token(symbol="TRIA"), 10000.0)
-    # With the gate off, TRIA is evaluated normally (and only blocked later by
+    engine = _engine_with_price_high("RAY", 10.0, settings=Settings(require_verified_bsc_contract=False))
+    decision = engine.evaluate_token(_token(symbol="RAY"), 10000.0)
+    # With the gate off, RAY is evaluated normally (and only blocked later by
     # the slippage/quote stage, not by the contract gate).
     assert "verified BSC contract" not in (decision.reason or "")
 

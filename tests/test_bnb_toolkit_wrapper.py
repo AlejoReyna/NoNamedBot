@@ -130,9 +130,9 @@ def test_configured_contracts_belong_to_target_universe() -> None:
 
 
 def test_hackathon_tradable_symbols_count_as_bsc_even_without_static_address() -> None:
-    assert has_bsc_contract("PENGU") is True
+    assert has_bsc_contract("RAY") is True  # Solana-native, tradable but no BSC address
     assert has_bsc_contract("CAKE") is True
-    assert has_verified_bsc_contract("PENGU") is False
+    assert has_verified_bsc_contract("RAY") is False
 
 
 def test_verified_bsc_contract_requires_static_address() -> None:
@@ -142,8 +142,8 @@ def test_verified_bsc_contract_requires_static_address() -> None:
     assert has_verified_bsc_contract("TRX") is True
     assert has_verified_bsc_contract("TON") is True
     assert has_verified_bsc_contract("AVAX") is True
-    assert has_verified_bsc_contract("U") is False
-    assert has_verified_bsc_contract("PENGU") is False
+    assert has_verified_bsc_contract("RAY") is False  # Solana-native, no BSC address
+    assert has_verified_bsc_contract("IP") is False  # ETH-native, no BSC address
 
 
 def test_stables_remain_available_but_not_directionally_tradable() -> None:
@@ -213,13 +213,13 @@ def test_live_get_balance_accepts_explicit_account_and_contract_token() -> None:
 def test_live_get_balance_symbol_without_verified_contract_returns_zero() -> None:
     wrapper = _wrapper_with_web3(FakeWeb3())
 
-    result = wrapper.get_balance("U")
+    result = wrapper.get_balance("RAY")  # Solana-native: no BSC contract
 
     assert result["mode"] == "live"
-    assert result["symbol"] == "U"
-    assert result["token"] == "U"
+    assert result["symbol"] == "RAY"
+    assert result["token"] == "RAY"
     assert result["balance"] == 0.0
-    assert result["balances"] == {"U": 0.0}
+    assert result["balances"] == {"RAY": 0.0}
 
 
 def test_agentkit_swap_path_is_disabled() -> None:
