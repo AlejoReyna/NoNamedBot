@@ -795,6 +795,10 @@ class CMCMCPClient:
             )
             snapshot[symbol] = {
                 "symbol": symbol,
+                "id": self._first_number_from_many(
+                    [quote_data],
+                    ("id",),
+                ),
                 "price": self._first_number_from_many(
                     [quote_data],
                     ("price", "last_price", "quote.USD.price"),
