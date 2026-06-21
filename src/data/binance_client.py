@@ -1,8 +1,9 @@
-"""Free Binance REST OHLCV feed for ML feature engineering."""
+"""Free Binance REST OHLCV feed for ML feature engineering and RSI fallback."""
 
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any
 
@@ -114,3 +115,30 @@ class BinanceClient:
 
         limit = min(max(candles, 1), 1000)
         return self.fetch_klines(symbol, interval=interval, limit=limit)
+
+    def get_rsi14(self, symbol: str, interval: str = "1h") -> float | None:
+        """Return the latest RSI-14 for a symbol using free Binance klines.
+
+        Used as a fallback when the CMC x402 technical feed does not return
+        RSI (budget exhausted, API error, or symbol outside enrichment scope).
+        Returns None if the pair does not exist on Binance or data is insufficient.
+        """
+        try:
+            frame = self.fetch_klines(symbol, interval=interval, limit=20)
+            if frame.empty or len(frame) < 15:
+                return None
+            close = frame["close"]
+            delta = close.diff()
+            gain = delta.clip(lower=0)
+            loss = -delta.clip(upper=0)
+            avg_gain = gain.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+            avg_loss = loss.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+            last_gain = avg_gain.iloc[-1]
+            last_loss = avg_loss.iloc[-1]
+            if last_loss == 0:
+                return 100.0
+            rsi = 100 - (100 / (1 + last_gain / last_loss))
+            return float(rsi) if not math.isnan(rsi) else None
+        except Exception as exc:
+            LOGGER.debug("Binance RSI fallback failed for %s: %s", symbol, exc)
+            return None
