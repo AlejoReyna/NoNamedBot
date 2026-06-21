@@ -116,6 +116,10 @@ def test_load_settings_allows_keyless_primary_without_api_key(monkeypatch: objec
     env_path = tmp_path / ".env"
     env_path.write_text("USE_KEYLESS_PRIMARY=true\n", encoding="utf-8")
     monkeypatch.delenv("CMC_API_KEY", raising=False)
+    monkeypatch.delenv("USE_KEYLESS_PRIMARY", raising=False)
+    monkeypatch.delenv("USE_DUAL_MARKET_DATA", raising=False)
+    monkeypatch.delenv("CMC_X402_EPHEMERAL_KEY", raising=False)
+    monkeypatch.delenv("EVM_PRIVATE_KEY", raising=False)
 
     settings = load_settings(str(env_path))
 

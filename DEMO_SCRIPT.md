@@ -1,39 +1,38 @@
-# Demo Video Script — Plan B+ (3 minutes)
+# Demo Video Script — NoNamedYet_Bot (3 minutes)
 
 ## 0:00–0:30 — Architecture overview
 
-- Show repo structure: `src/main.py`, `src/execution/twak_interface.py`, `src/ml/`
+- Show repo structure: `src/main.py`, `src/execution/twak_interface.py`, `src/data/`
 - Emphasize: **no private key in Python** — all signing via TWAK CLI subprocess
-- CMC data: Keyless primary + x402 premium collector (`scripts/cmc_feature_collector.py`)
-- ML: local LightGBM, CPU inference <5ms, offline training only
+- CMC data: Keyless primary + x402 premium enrichment (`src/data/cmc_mcp_client.py`)
+- Strategy: rule-based six-factor breakout engine with regime-aware guardrails
 
-## 0:30–1:00 — AUC gate blocks bad model
+## 0:30–1:00 — TWAK self-custody + live preflight
 
-- Open `MODEL_QUALITY_REPORT.md`
-- Point to worst-fold AUC (e.g. 0.48) vs gate (0.65)
-- Show `ML_SHADOW_MODE=true` in `.env`
-- Explain: ML ranking disabled; regime-only fallback active (0.3× chop sizing)
+- Run `python -m src.main --live --preflight`
+- Show wallet unlock, balance read, TWAK quote-only, and CMC snapshot all passing
+- Open `demo_artifacts/ON_CHAIN_PROOF.md` and point to real BSC swap hashes
 
-## 1:00–1:30 — Shadow mode logs
+## 1:00–1:30 — Live loop telemetry
 
-- `tail decision_log.jsonl` — show `ml_active: false`, `ml_selected_symbol` vs `executed_symbol`
-- `curl localhost:8080/logs` — mobile-friendly last 50 decisions
-- Open `dashboard.html` — timeline with ML scores overlaid but rule-based execution
+- `tail logs/decision_live.jsonl` — show live `mode: "live"` decisions
+- `curl localhost:8080/health` — status, positions, drawdown
+- Filter out any `mode: "paper"` rows as test artifacts
 
-## 1:30–2:00 — Health check + real swap
+## 1:30–2:00 — Guardrails demo
 
-- `curl localhost:8080/health` — status, positions, drawdown, ml_mode=regime_fallback
-- Show BSCScan link from `demo_artifacts/ON_CHAIN_PROOF.md`
-- Mention registration tx from `twak compete register`
+- Decision log entry with `action: WAIT` and `reasons: ["No candidate passed gates"]`
+- Slippage block from TWAK quote-only (`slippage_quote_state`)
+- Risk events in `logs/risk_events.jsonl`
 
-## 2:00–2:30 — Guardrails demo
+## 2:00–2:30 — x402 paid data flow
 
-- Decision log entry with `action: BLOCKED` or daily limit
-- Slippage block from TWAK quote-only
-- Kill switch / drawdown pause in `risk_events.jsonl`
+- Show `src/data/x402_client.py` signing USDC on Base
+- Point to `bot_live.log` lines: `Built enriched x402 snapshot for N symbols`
+- Note the x402 data wallet is isolated from the TWAK trading wallet
 
-## 2:30–3:00 — Regime fallback in action
+## 2:30–3:00 — Competition readiness
 
-- Log line showing `ml_regime: chop` and reduced `position_size_usdc`
-- Compare momentum vs chop multiplier (1.0× vs 0.3×)
-- Close: 4 core factors still mandatory; ML additive only
+- `data/compete_registered.json`: `registered: true`
+- Agent wallet holds non-zero USDC + BNB + in-scope asset (ETH)
+- Compliance trade already proven: USDC → TWT tx `0x4a0f...8d43`

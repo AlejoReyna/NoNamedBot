@@ -238,8 +238,13 @@ class TestMaxHoldLosersOnly:
 class TestTighterKillSwitch:
     """max_daily_loss_pct lowered from 3.0 % to 2.0 %."""
 
-    def test_default_max_daily_loss_pct_is_two_percent(self) -> None:
-        settings = load_settings()
+    def test_default_max_daily_loss_pct_is_two_percent(
+        self, tmp_path: Path, monkeypatch: object
+    ) -> None:
+        env_path = tmp_path / ".env"
+        env_path.write_text("", encoding="utf-8")
+        monkeypatch.delenv("MAX_DAILY_LOSS_PCT", raising=False)
+        settings = load_settings(str(env_path))
         assert settings.max_daily_loss_pct == 0.02
 
     def test_daily_loss_limit_usd_for_twenty_dollar_book(self) -> None:
