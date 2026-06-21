@@ -170,11 +170,11 @@ def test_derivatives_neutral_still_strict_when_data_present() -> None:
 
 
 def test_unquotable_symbol_without_verified_contract_is_skipped() -> None:
-    # RAY (Raydium) is in the target allowlist but has no verified BSC contract
-    # (it is Solana-native), so TWAK cannot quote it; it must be rejected before
-    # selection, not picked and then failed on the quote.
-    engine = _engine_with_price_high("RAY", 10.0)
-    decision = engine.evaluate_token(_token(symbol="RAY"), 10000.0)
+    # GOMINING is in the target allowlist but has no verified BSC contract
+    # (onchain symbol() returns GMT/StepN mismatch, intentionally excluded),
+    # so TWAK cannot quote it; it must be rejected before selection.
+    engine = _engine_with_price_high("GOMINING", 10.0)
+    decision = engine.evaluate_token(_token(symbol="GOMINING"), 10000.0)
 
     assert decision.should_enter is False
     assert "verified BSC contract" in decision.reason

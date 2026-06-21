@@ -2305,7 +2305,6 @@ def _fetch_snapshot(
             _fetch_keyless,
             force_x402_refresh=force_x402,
         )
-        snapshot_timestamp = time.time()
         _ensure_bnb_reference(snapshot_before, cmc_client)
         _ensure_btc_reference(snapshot_before, cmc_client)
         # Fix #2: compute incremental x402 spend for this cycle.
@@ -2314,8 +2313,12 @@ def _fetch_snapshot(
 
         # Binance RSI fallback: for symbols selected for enrichment that still
         # have no RSI after x402 (budget exhausted, API error, or not in scope),
-        # fetch 20 1h candles from Binance and compute RSI-14 locally for free.
+        # fetch RSI-14 from Binance in parallel (up to 20 threads).
+        # snapshot_timestamp is set AFTER this fill so the staleness check in
+        # _attempt_entry_v25 measures latency from when the full dataset
+        # (prices + RSI) was ready, not just when prices were cached.
         _fill_missing_rsi_from_binance(snapshot_before, enrich_symbols)
+        snapshot_timestamp = time.time()
 
         return snapshot_before, snapshot_timestamp, enrich_symbols, cycle_x402_cost
 
@@ -2350,9 +2353,14 @@ def _fill_missing_rsi_from_binance(
 
     Results are cached for _BINANCE_RSI_TTL seconds so a process restart or
     rapid successive calls do not re-fetch within the same keyless window.
+
+    Fetches are parallelized (up to 20 threads) so a cold-cache restart fills
+    100+ symbols in ~5s instead of ~3 minutes of sequential HTTP calls.
     """
     now = time.time()
-    filled = 0
+
+    # Split into cache-hits (instant) and symbols that need a live fetch.
+    need_fetch: list[str] = []
     for symbol, token_data in snapshot.items():
         if not isinstance(token_data, dict):
             continue
@@ -2363,14 +2371,25 @@ def _fill_missing_rsi_from_binance(
         cached = _binance_rsi_cache.get(symbol)
         if cached is not None and (now - cached[1]) < _BINANCE_RSI_TTL:
             token_data["rsi"] = cached[0]
-            continue
-        rsi = _binance_rsi_client.get_rsi14(symbol)
-        if rsi is not None:
-            token_data["rsi"] = rsi
-            _binance_rsi_cache[symbol] = (rsi, now)
-            filled += 1
+        else:
+            need_fetch.append(symbol)
+
+    if not need_fetch:
+        return
+
+    def _fetch_one(symbol: str) -> tuple[str, float | None]:
+        return symbol, _binance_rsi_client.get_rsi14(symbol)
+
+    filled = 0
+    with ThreadPoolExecutor(max_workers=min(20, len(need_fetch))) as pool:
+        for symbol, rsi in pool.map(_fetch_one, need_fetch):
+            if rsi is not None:
+                snapshot[symbol]["rsi"] = rsi
+                _binance_rsi_cache[symbol] = (rsi, now)
+                filled += 1
+
     if filled:
-        LOGGER.info("RSI fallback (Binance): filled %d symbols", filled)
+        LOGGER.info("RSI fallback (Binance): filled %d symbols (parallel)", filled)
 
 
 def _ensure_bnb_reference(snapshot: dict[str, dict[str, Any]], cmc_client: CMCMCPClient) -> None:
