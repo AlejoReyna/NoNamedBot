@@ -109,7 +109,10 @@ def start_health_server(
             )
             self._send_json(reply)
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    class _ReuseAddrServer(ThreadingHTTPServer):
+        allow_reuse_address = True
+
+    server = _ReuseAddrServer((host, port), Handler)
     thread = threading.Thread(target=server.serve_forever, name="health-server", daemon=True)
     thread.start()
     LOGGER.info("Health server listening on %s:%s", host, port)
