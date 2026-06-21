@@ -275,6 +275,8 @@ class TestCompetitionConfigFeasibility:
     """The $20 AUM competition config must allow the bot to enter positions."""
 
     def test_twenty_dollar_aum_can_enter_position(self) -> None:
+        if not Path(".env").exists():
+            pytest.skip(".env not present — config feasibility only checked in deployment environment")
         # Load the actual project .env as a dict without mutating os.environ.
         env = dotenv_values(".env")  # type: ignore[arg-type]
         settings = load_settings(str(".env"))
