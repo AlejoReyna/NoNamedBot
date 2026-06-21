@@ -99,3 +99,24 @@ def update_health_snapshot(
         x402_wallet_address=x402_address,
         x402_usdc_balance=x402_balance,
     )
+
+    # Persist x402 wallet snapshot for dashboard exporter
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+
+        wallet_path = _Path("logs/x402_wallet.json")
+        wallet_path.parent.mkdir(parents=True, exist_ok=True)
+        wallet_path.write_text(
+            _json.dumps(
+                {
+                    "address": x402_address,
+                    "usdc_balance": x402_balance,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        LOGGER.debug("x402 wallet snapshot file write failed: %s", exc)
+
