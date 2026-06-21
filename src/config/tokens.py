@@ -347,6 +347,11 @@ TOKEN_CONTRACTS_BSC: dict[str, str] = {
     "BRETT": "0xA7440029ecA41dEaBd8775Ef1D6086b37d4dF8D6",
     "SUSHI": "0x947950BcC74888a40Ffa2593C5798F11Fc9124C4",
     "TAC": "0x1219c409faBe2C27Bd0D1A565daeed9Bd9f271dE",
+    # Previously missing — verified onchain via symbol() on BSC RPC
+    "XAUt": "0x21cAef8A43163Eea865baeE23b9C2E327696A3bf",
+    "RAY": "0x586A618d4b9DF704EcF11aeFa13D21b35959811D",
+    "IP": "0x5949Bbb8DF3cc428a689422D5d8c26442AB3B1e8",
+    "币安人生": "0x924fa68a0FC644485b8df8AbfA0A41C2e7744444",
 }
 
 # TWAK/LiquidMesh token identifiers (symbols resolved to BSC contract addresses).
