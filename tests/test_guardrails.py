@@ -52,7 +52,7 @@ def test_accepts_zero_slippage_from_dex_price_impact(tmp_path: Path) -> None:
 
 
 def test_max_daily_trades_blocks_fourth_trade(tmp_path: Path) -> None:
-    guardrails = Guardrails(_settings(tmp_path))
+    guardrails = Guardrails(_settings(tmp_path, max_daily_trades=3))
     now = datetime.now(timezone.utc)
     for _ in range(3):
         guardrails.record_trade(

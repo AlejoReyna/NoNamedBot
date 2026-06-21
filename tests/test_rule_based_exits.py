@@ -41,8 +41,8 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
 
 def test_open_position_with_regime_uses_volatility_aware_levels(tmp_path: Path) -> None:
     # ETH-style: ATR cold, but regime context supplied -> target must NOT be
-    # the flat +15%. calculate_exit_levels falls back to 8% TP, not 15%.
-    settings = _settings(tmp_path, take_profit_pct=0.15, trailing_stop_pct=0.06)
+    # the flat +15%. calculate_exit_levels falls back to settings TP, not 15%.
+    settings = _settings(tmp_path, take_profit_pct=0.08, trailing_stop_pct=0.06)
     manager = PositionManager(settings)
     pos = manager.open_position(
         "ETH",
