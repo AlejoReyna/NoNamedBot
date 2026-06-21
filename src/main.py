@@ -2263,6 +2263,10 @@ def _fetch_snapshot(
                 "BREAKOUT": 30,
             }
             n_opt = max(REGIME_N_MAP.get(regime_value, n_opt), n_opt)
+        # HACKATHON DEMO: force minimum enrichment when entries allowed so judges
+        # see the 6-factor algorithm evaluating symbols with paid data.
+        if entries_allowed and n_opt < 20:
+            n_opt = 20
         if n_opt < 1:
             LOGGER.info("Regime/keyless-only mode: n_opt=0; skipping paid enrichment")
             enrich_symbols = set()
