@@ -124,7 +124,7 @@ def select_enrichment_symbols(
     must_have.add("BNB")
     chosen = set(selected)
     for symbol in sorted(must_have):
-        if symbol in chosen or symbol not in targets:
+        if symbol in chosen:
             continue
         selected.append(symbol)
         chosen.add(symbol)
