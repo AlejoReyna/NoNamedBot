@@ -787,16 +787,14 @@ class BreakoutEngine:
             enriched_data = {"symbol": normalized, **token_data}
             if not is_liquid(enriched_data):
                 continue
-            # Fix #8: technicals are "available" when the snapshot actually
-            # contains them (keyless/paper often does) or when we paid for x402
-            # enrichment this cycle.  Do not disable the RSI weight just because
-            # the enrichment scope is wider/narrower.
+            # Fix #8: technicals are "available" only when RSI data actually
+            # arrived in the snapshot. Selecting a symbol for paid enrichment
+            # does not guarantee the API call succeeds; if the call fails or
+            # the budget is exhausted, rsi is still None and treating
+            # technicals as "available" incorrectly hard-blocks entry via the
+            # RSI gate. Base availability solely on whether rsi was received.
             has_rsi = token_data.get("rsi") is not None
-            paid_technicals = (
-                normalized in enriched_symbols
-                and bool(getattr(self.settings, "x402_fetch_technicals", True))
-            )
-            technicals_available = bool(has_rsi or paid_technicals)
+            technicals_available = has_rsi
             data_age_seconds = float(token_data.get("data_age_seconds", 0.0) or 0.0)
             candidate = self._evaluate_cheap_candidate(
                 enriched_data,
