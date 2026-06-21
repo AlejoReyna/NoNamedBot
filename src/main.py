@@ -3126,7 +3126,8 @@ def _print_demo_cycle_summary(
     if decision is not None:
         action = "ENTER" if decision.should_enter else "WAIT"
         symbol = decision.symbol or "-"
-        factors = f"{decision.true_factor_count}/6"
+        _factor_denom = len(decision.factor_scores) if decision.factor_scores else 6
+        factors = f"{decision.true_factor_count}/{_factor_denom}"
         slippage = _format_fraction_pct(decision.estimated_slippage_pct)
 
     if decision is None:
@@ -3211,7 +3212,8 @@ def _log_cycle_decision(
         ml_audit=ml_audit,
     )
 
-    factors = f"{true_factor_count}/6" if decision is not None else "-"
+    _factor_denom = len(factor_scores) if factor_scores else 6
+    factors = f"{true_factor_count}/{_factor_denom}" if decision is not None else "-"
     LOGGER.info(
         'Decision cycle=%s action=%s symbol=%s factors=%s slippage=%s reason="%s"',
         cycle_number,
