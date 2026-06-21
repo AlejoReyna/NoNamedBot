@@ -2257,10 +2257,10 @@ def _fetch_snapshot(
             regime_value = getattr(regime_result.regime, "value", str(regime_result.regime)).upper()
             REGIME_N_MAP = {
                 "RISK_OFF": 0,
-                "RANGING": 1,
-                "TRENDING_UP": 3,
-                "TRENDING_DOWN": 3,
-                "BREAKOUT": 5,
+                "RANGING": 10,
+                "TRENDING_UP": 20,
+                "TRENDING_DOWN": 20,
+                "BREAKOUT": 30,
             }
             n_opt = max(REGIME_N_MAP.get(regime_value, n_opt), n_opt)
         if n_opt < 1:
