@@ -1,0 +1,14 @@
+[Unit]
+Description=Sync Cascade AI logs to S3
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ec2-user/cascade-ai
+ExecStart=/home/ec2-user/cascade-ai/.venv/bin/python /home/ec2-user/cascade-ai/scripts/sync_logs_to_s3.py --dir /home/ec2-user/cascade-ai/logs
+User=ec2-user
+Group=ec2-user
+Environment=HOME=/home/ec2-user
+Environment=PATH=/home/ec2-user/cascade-ai/.venv/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/home/ec2-user/cascade-ai/.env

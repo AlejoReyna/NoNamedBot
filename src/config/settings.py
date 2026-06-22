@@ -232,6 +232,15 @@ class Settings(BaseModel):
     # How long after a scheduled event entries stay blocked (minutes), unless
     # the event carries its own symmetric blackout_minutes window.
     rweal_post_event_minutes: int = 60
+    # S3 log offloading. When enabled, the sync script uploads logs/ to S3.
+    s3_logs_enabled: bool = False
+    s3_logs_bucket: str = ""
+    s3_logs_prefix: str = "logs/"
+    s3_logs_region: str = "us-east-1"
+    s3_logs_endpoint_url: str = ""
+    aws_access_key_id: Optional[str] = None
+    aws_secret_access_key: Optional[str] = None
+    aws_session_token: Optional[str] = None
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -471,6 +480,14 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
         "rweal_control_file": os.getenv("RWEAL_CONTROL_FILE", "TRADING_HALT"),
         "rweal_blackout_horizon_hours": _get_float("RWEAL_BLACKOUT_HORIZON_HOURS", 6.0),
         "rweal_post_event_minutes": _get_int("RWEAL_POST_EVENT_MINUTES", 60),
+        "s3_logs_enabled": _get_bool("S3_LOGS_ENABLED", False),
+        "s3_logs_bucket": os.getenv("S3_LOGS_BUCKET", ""),
+        "s3_logs_prefix": os.getenv("S3_LOGS_PREFIX", "logs/"),
+        "s3_logs_region": os.getenv("S3_LOGS_REGION", os.getenv("AWS_REGION", "us-east-1")),
+        "s3_logs_endpoint_url": os.getenv("S3_LOGS_ENDPOINT_URL", ""),
+        "aws_access_key_id": _none_if_blank(os.getenv("AWS_ACCESS_KEY_ID")),
+        "aws_secret_access_key": _none_if_blank(os.getenv("AWS_SECRET_ACCESS_KEY")),
+        "aws_session_token": _none_if_blank(os.getenv("AWS_SESSION_TOKEN")),
     }
     # Alias deprecated min_entry_factors into breakout_min_true_factor_count so
     # the engine actually respects the setting.

@@ -1,0 +1,18 @@
+[Unit]
+Description=Run S3 logs sync every 5 minutes
+Requires=cascade-ai-s3-logs.service
+
+[Timer]
+OnCalendar=*:0/5
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+
+# Install (run on EC2 as ec2-user):
+#   sudo cp /home/ec2-user/cascade-ai/systemd/cascade-ai-s3-logs.service /etc/systemd/system/
+#   sudo cp /home/ec2-user/cascade-ai/systemd/cascade-ai-s3-logs.timer  /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now cascade-ai-s3-logs.timer
+#   systemctl status cascade-ai-s3-logs.timer

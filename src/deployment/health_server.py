@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from src.deployment.chat_api import build_chat_reply
+from src.research.hourly_pnl import read_hourly_pnl
 
 if TYPE_CHECKING:
     from src.deployment.health_state import HealthState
@@ -78,6 +79,9 @@ def start_health_server(
             elif path.startswith("/status"):
                 payload = state.snapshot()
                 self._send_json(payload, status=200)
+            elif path == "/logs/hourly-pnl":
+                records = read_hourly_pnl()
+                self._send_json({"records": records, "count": len(records)})
             elif path.startswith("/logs"):
                 lines = _tail_lines(decision_path, 50)
                 self._send_json({"lines": lines})
