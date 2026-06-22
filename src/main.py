@@ -30,6 +30,7 @@ from src.common.logging_schema import (
 )
 from src.config.settings import Settings, load_settings
 from src.deployment.runtime import deployment_startup, disk_allows_entries, update_health_snapshot
+from src.research.hourly_pnl import HourlyPnlTracker, backfill_from_snapshots
 from src.config.tokens import (
     TARGET_SYMBOLS,
     TRADABLE_TARGET_SYMBOLS,
@@ -557,6 +558,12 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
     if positions_loaded:
         LOGGER.info("Loaded %s persisted open positions", len(position_manager.list_open_positions()))
 
+    hourly_pnl_tracker = HourlyPnlTracker()
+    try:
+        backfill_from_snapshots()
+    except Exception as exc:
+        LOGGER.warning("Hourly PnL backfill failed: %s", exc)
+
     # Warn if AUM is below minimum viable for live trading profitability
     portfolio_value = _portfolio_value_usdc(toolkit, settings, {}, position_manager)
     if portfolio_value < AUM_MIN_VIABLE:
@@ -755,6 +762,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                 entry_position_pct,
                 decision_reasons,
                 risk_state_changed,
+                hourly_pnl_tracker=hourly_pnl_tracker,
             )
             _log_legacy_cycle_from_v25(
                 settings,
@@ -998,6 +1006,7 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             entry_position_pct,
             decision_reasons,
             risk_state_changed,
+            hourly_pnl_tracker=hourly_pnl_tracker,
         )
         open_symbols = {position.symbol for position in position_manager.list_open_positions()}
         telemetry_exclude_symbols = set(open_symbols)
@@ -1811,6 +1820,7 @@ def _write_v25_cycle_logs(
     position_pct: float,
     reasons: list[str],
     risk_state_changed: bool,
+    hourly_pnl_tracker: HourlyPnlTracker | None = None,
 ) -> None:
     mode = "paper" if settings.paper_trade else "live"
     symbol = candidate.symbol if candidate else None
@@ -1912,6 +1922,14 @@ def _write_v25_cycle_logs(
             open_positions=_open_positions_payload(position_manager),
         ),
     )
+    if hourly_pnl_tracker is not None:
+        try:
+            hourly_pnl_tracker.maybe_record(
+                portfolio_value,
+                open_position_count=len(position_manager.list_open_positions()),
+            )
+        except Exception as exc:
+            LOGGER.debug("Hourly PnL write failed: %s", exc)
 
 
 def _guardrail_all_time_high(guardrails: Guardrails) -> float:
