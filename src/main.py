@@ -76,6 +76,7 @@ from src.research import sell_history, trade_outcome_log
 from src.strategy.regime_detector import MarketRegime, RegimeDetector, RegimeResult
 from src.strategy.sentiment_tier1 import SentimentResult, SentimentTier1
 from src.strategy.volatility import PriceCache
+from src.common.telegram_notifier import TelegramNotifier
 
 LOGGER = logging.getLogger(__name__)
 LIVE_WINDOW_MONTH = 6
@@ -592,6 +593,16 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
     if pending_swap_cooldowns:
         LOGGER.warning("Pending swap cooldown symbols: %s", sorted(pending_swap_cooldowns))
 
+    notifier = TelegramNotifier(
+        settings.telegram_bot_token,
+        settings.telegram_chat_id,
+        base_rpc_url=settings.base_rpc_url,
+    )
+    if notifier._enabled:
+        LOGGER.info("TelegramNotifier initialized")
+    else:
+        LOGGER.info("TelegramNotifier disabled (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to enable)")
+
     # RWEAL Phase 1: static, entry-only event gate. Built once; disabled by
     # default. from_settings() raises on a present-but-malformed events file so a
     # bad calendar fails fast at startup rather than silently going blind.
@@ -669,6 +680,17 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             regime_result=previous_regime_result,
         )
         previous_x402_spend = float(cmc_client.spend_governor.snapshot().get("daily_spend_usdc", 0.0))
+        # --- Telegram Hook 2: x402 data wallet spend / balance ---
+        if notifier._enabled:
+            try:
+                notifier.notify_x402_balance_if_changed(
+                    cycle_x402_cost=cycle_x402_cost,
+                    daily_spend_usdc=previous_x402_spend,
+                    total_budget_usdc=getattr(settings, "x402_total_budget_usdc", 5.0),
+                    daily_budget_usdc=getattr(settings, "x402_daily_budget_usdc", 1.0),
+                )
+            except Exception as exc:
+                LOGGER.debug("Telegram x402 notification failed: %s", exc)
         _update_price_cache(price_cache, market_snapshot, now_utc)
         window_flatten_active = _maybe_flatten_for_window(
             settings, position_manager, router, guardrails, now_utc, toolkit
@@ -694,6 +716,26 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
         risk_state_changed = previous_risk_state != risk_decision.state
         previous_risk_state = risk_decision.state
 
+        # --- Telegram Hook 1: BNB momentum / regime shift ---
+        if (
+            notifier._enabled
+            and regime_result.regime == MarketRegime.TRENDING_UP
+            and risk_state_changed
+        ):
+            try:
+                bnb_data = market_snapshot.get("BNB", {}) if isinstance(market_snapshot, dict) else {}
+                bnb_data = bnb_data if isinstance(bnb_data, dict) else {}
+                notifier.notify_bnb_momentum(
+                    bnb_1h=_maybe_number(bnb_data.get("percent_change_1h")),
+                    bnb_6h=_maybe_number(bnb_data.get("percent_change_6h")),
+                    bnb_24h=_maybe_number(bnb_data.get("percent_change_24h")),
+                    regime=regime_result.regime.value,
+                    score=regime_result.score,
+                    breadth=None,
+                )
+            except Exception as exc:
+                LOGGER.debug("Telegram regime notification failed: %s", exc)
+
         candidate: EntryCandidate | None = None
         liquidity: Any | None = None
         action = "WAIT"
@@ -715,6 +757,20 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
         )
         if window_flatten_active:
             entries_blocked_reason = "competition_window_flatten"
+        # --- Telegram Hook 5: daily trade limit reached ---
+        if (
+            notifier._enabled
+            and entries_blocked_reason
+            and "daily_trade_limit" in entries_blocked_reason
+        ):
+            try:
+                notifier.notify_daily_limit(
+                    daily_trade_count=int(getattr(guardrails, "_daily_trade_count", 0)),
+                    max_daily=int(getattr(risk_decision, "max_daily_trades", getattr(settings, "max_daily_trades", 3))),
+                    portfolio_value=portfolio_value,
+                )
+            except Exception as exc:
+                LOGGER.debug("Telegram daily-limit notification failed: %s", exc)
         decision_reasons_pre: list[str] = []
         if entries_allowed and not disk_allows_entries(settings):
             entries_allowed = False
@@ -744,6 +800,17 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
             action = "HALT"
             cycle_status = "kill switch"
             decision_reasons = decision_reasons or ["drawdown_kill_switch"]
+            # --- Telegram Hook 3: kill switch / risk event ---
+            if notifier._enabled:
+                try:
+                    notifier.notify_risk_event(
+                        event_type="KILL_SWITCH",
+                        portfolio_value=portfolio_value,
+                        drawdown_pct=getattr(guardrails, "drawdown_pct", 0.0) * 100,
+                        details="drawdown exceeded kill-switch threshold; liquidating all positions",
+                    )
+                except Exception as exc:
+                    LOGGER.debug("Telegram risk notification failed: %s", exc)
             _write_v25_cycle_logs(
                 settings,
                 run_id,
@@ -948,6 +1015,25 @@ def run_agent(settings: Settings, max_cycles: int | None = None) -> None:
                 decision_reasons.extend([candidate.reason, attempt.reason])
                 if attempt.entered:
                     action = "ENTER"
+                    # --- Telegram Hook 4: successful buy entry ---
+                    if notifier._enabled and candidate is not None:
+                        try:
+                            tx_hash = _execution_tx_hash(
+                                getattr(attempt, "reconcile_result", None) or {}
+                            )
+                            notifier.notify_buy(
+                                symbol=candidate.symbol,
+                                amount_usdc=float(entry_position_pct * portfolio_value),
+                                price=candidate.price,
+                                tx_hash=tx_hash,
+                                regime=regime_result.regime.value,
+                                entry_score=candidate.entry_score,
+                                daily_trade_count=int(getattr(guardrails, "_daily_trade_count", 0)),
+                                max_daily=int(getattr(risk_decision, "max_daily_trades", getattr(settings, "max_daily_trades", 3))),
+                                slippage_pct=candidate.slippage_normal,
+                            )
+                        except Exception as exc:
+                            LOGGER.debug("Telegram buy notification failed: %s", exc)
 
         # Live halt re-check (not the cycle-top cache): this backstop runs at the
         # very end of the cycle, after all data work, so a halt set mid-cycle

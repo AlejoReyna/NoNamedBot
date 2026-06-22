@@ -1,3 +1,6 @@
 [submodule "dashboard"]
 	path = dashboard
 	url = https://github.com/AlejoReyna/michelobUltraSecretDashboard.git
+[submodule "src/common/telegram_notifier"]
+	path = src/common/telegram_notifier
+	url = https://github.com/AlejoReyna/ANoNamed_bot.git
