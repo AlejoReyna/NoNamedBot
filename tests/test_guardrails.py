@@ -12,8 +12,8 @@ from src.config.settings import Settings
 from src.strategy.guardrails import Guardrails, TradeRecord
 
 
-def _settings(tmp_path: Path) -> Settings:
-    return Settings(guardrail_state_path=str(tmp_path / "guardrail_state.json"))
+def _settings(tmp_path: Path, **kwargs) -> Settings:
+    return Settings(guardrail_state_path=str(tmp_path / "guardrail_state.json"), **kwargs)
 
 
 def test_rejects_symbol_not_in_target_allowlist(tmp_path: Path) -> None:
