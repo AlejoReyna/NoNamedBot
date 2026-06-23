@@ -59,8 +59,7 @@ jobs:
               git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
               git fetch origin
               git checkout main
-              git reset --hard HEAD
-              git pull --ff-only
+              git reset --hard origin/main
               if [ ! -d .venv ]; then
                 python3 -m venv .venv
               fi
