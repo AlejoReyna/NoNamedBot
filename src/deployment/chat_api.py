@@ -22,6 +22,7 @@ LOGGER = logging.getLogger(__name__)
 _client: OpenAI | None = None
 _sessions: dict[str, list[dict]] = {}
 _session_lock = threading.Lock()
+_MAX_SESSIONS = 100
 
 _LEGACY_KEYWORDS = {
     "health", "status", "fear", "greed", "funding", "dominance",
@@ -123,6 +124,11 @@ def _read_cmc_cache(db_path: Path) -> dict[str, Any]:
     return out
 
 
+def _safe_field(value: object, max_len: int = 200) -> str:
+    """Truncate and strip LLM heading markers to reduce prompt injection surface."""
+    return str(value)[:max_len].replace("###", "---")
+
+
 def _build_context(
     health_snapshot: dict[str, Any] | None,
     decision_log_path: Path,
@@ -182,13 +188,13 @@ def _build_context(
     else:
         lines = []
         for row in decisions:
-            ts = row.get("timestamp", "?")
-            action = row.get("action", "WAIT")
-            symbol = row.get("symbol", "-")
+            ts = _safe_field(row.get("timestamp", "?"), 30)
+            action = _safe_field(row.get("action", "WAIT"), 20)
+            symbol = _safe_field(row.get("symbol", "-"), 20)
             reasons = row.get("reasons", [])
-            reason = reasons[0] if reasons else row.get("reason", "")
-            regime = row.get("regime", "unknown")
-            lines.append(f"- {ts}: {action} {symbol} — {reason[:80]} (regime: {regime})")
+            reason = _safe_field(reasons[0] if reasons else row.get("reason", ""), 80)
+            regime = _safe_field(row.get("regime", "unknown"), 30)
+            lines.append(f"- {ts}: {action} {symbol} — {reason} (regime: {regime})")
         sections.append("### Latest Trading Decisions\n" + "\n".join(lines))
 
     # 4. x402 payments
@@ -417,6 +423,8 @@ def build_chat_reply(
         # Store turn
         with _session_lock:
             if session_id not in _sessions:
+                if len(_sessions) >= _MAX_SESSIONS:
+                    _sessions.pop(next(iter(_sessions)))  # evict oldest (insertion-order)
                 _sessions[session_id] = []
             _sessions[session_id].append({"role": "user", "content": message})
             _sessions[session_id].append({"role": "assistant", "content": assistant_text})

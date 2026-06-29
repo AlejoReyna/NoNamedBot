@@ -18,7 +18,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 def _make_boto3_session(settings: Any) -> Any:
-    """Return a boto3 session configured from settings or env/IAM."""
+    """Return a boto3 session using the standard credential chain (env → ~/.aws → IAM role)."""
 
     try:
         import boto3  # type: ignore
@@ -26,17 +26,12 @@ def _make_boto3_session(settings: Any) -> Any:
         LOGGER.warning("boto3 not installed; S3 uploads disabled: %s", exc)
         return None
 
+    # Credentials are intentionally NOT taken from settings. boto3 discovers
+    # them via its standard chain: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+    # env vars, ~/.aws/credentials, or EC2 instance metadata / IAM role.
     kwargs: dict[str, Any] = {"region_name": settings.s3_logs_region}
     if settings.s3_logs_endpoint_url:
         kwargs["endpoint_url"] = settings.s3_logs_endpoint_url
-
-    credentials: dict[str, str | None] = {
-        "aws_access_key_id": settings.aws_access_key_id,
-        "aws_secret_access_key": settings.aws_secret_access_key,
-        "aws_session_token": settings.aws_session_token,
-    }
-    if all(credentials.values()):
-        kwargs.update({k: v for k, v in credentials.items() if v})
 
     return boto3.Session(**kwargs)
 
