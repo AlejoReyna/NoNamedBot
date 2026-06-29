@@ -217,3 +217,31 @@ def test_load_settings_reads_model_shadow_flags(monkeypatch: object, tmp_path: P
     assert settings.model_shadow_path == "models/custom.pkl"
     assert settings.model_shadow_threshold == 0.61
     assert settings.ml_universe_symbols == ["BNB", "CAKE"]
+
+
+def test_malformed_int_env_var_raises_descriptive_error(monkeypatch: object, tmp_path: Path) -> None:
+    """A non-integer value for an integer setting raises a ValueError naming the variable."""
+    monkeypatch.setenv("LOOP_SECONDS", "abc")  # type: ignore[attr-defined]
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match="LOOP_SECONDS"):
+        load_settings(str(env_path))
+    monkeypatch.delenv("LOOP_SECONDS", raising=False)  # type: ignore[attr-defined]
+
+
+def test_malformed_float_env_var_raises_descriptive_error(monkeypatch: object, tmp_path: Path) -> None:
+    """A non-float value for a float setting raises a ValueError naming the variable."""
+    monkeypatch.setenv("DRAWDOWN_KILL_SWITCH_PCT", "0,18")  # type: ignore[attr-defined]
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match="DRAWDOWN_KILL_SWITCH_PCT"):
+        load_settings(str(env_path))
+    monkeypatch.delenv("DRAWDOWN_KILL_SWITCH_PCT", raising=False)  # type: ignore[attr-defined]
+
+
+def test_aws_credentials_not_in_settings() -> None:
+    """AWS credentials must not appear in the Settings model — boto3 uses its own discovery chain."""
+    s = Settings()
+    assert not hasattr(s, "aws_access_key_id"), "aws_access_key_id must not be in Settings"
+    assert not hasattr(s, "aws_secret_access_key"), "aws_secret_access_key must not be in Settings"
+    assert not hasattr(s, "aws_session_token"), "aws_session_token must not be in Settings"

@@ -464,14 +464,27 @@ def _priced_target_symbols(snapshot: dict[str, Any]) -> list[str]:
     return priced
 
 
+def _redact_secrets(text: str) -> str:
+    # env-style: KEY=value
+    text = re.sub(
+        r"(?i)(password|secret|api[_-]?key|access[_-]?secret|token|private[_-]?key)=([^,\s\"']+)",
+        r"\1=<redacted>",
+        text,
+    )
+    # JSON-style: "key": "value"
+    text = re.sub(
+        r'(?i)"(password|secret|api[_-]?key|access[_-]?secret|token|private[_-]?key)"\s*:\s*"([^"]+)"',
+        r'"\1": "<redacted>"',
+        text,
+    )
+    # 64-char hex strings (EVM private keys, optionally 0x-prefixed)
+    text = re.sub(r"\b(0x)?[0-9a-fA-F]{64}\b", "<hex-key-redacted>", text)
+    return text
+
+
 def _safe_error(exc: Exception) -> str:
     message = str(exc).strip() or exc.__class__.__name__
-    message = re.sub(
-        r"(?i)(password|secret|api[_-]?key|access[_-]?secret|token)=([^,\s]+)",
-        r"\1=<redacted>",
-        message,
-    )
-    return message[:180]
+    return _redact_secrets(message)[:180]
 
 
 def _print_preflight_report(checks: list[PreflightCheck]) -> None:

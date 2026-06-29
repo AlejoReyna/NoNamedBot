@@ -238,9 +238,10 @@ class Settings(BaseModel):
     s3_logs_prefix: str = "logs/"
     s3_logs_region: str = "us-east-1"
     s3_logs_endpoint_url: str = ""
-    aws_access_key_id: Optional[str] = None
-    aws_secret_access_key: Optional[str] = None
-    aws_session_token: Optional[str] = None
+    # AWS credentials are NOT stored here. boto3 discovers them via its
+    # standard chain: env vars (AWS_ACCESS_KEY_ID etc.), ~/.aws/credentials,
+    # or EC2 instance metadata. Keeping credentials out of Settings prevents
+    # them from appearing in debug snapshots or being passed to untrusted code.
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -267,14 +268,20 @@ def _get_float(name: str, default: float) -> float:
     value = os.getenv(name)
     if value is None or value.strip() == "":
         return default
-    return float(value)
+    try:
+        return float(value)
+    except ValueError:
+        raise ValueError(f"Environment variable {name}={value!r} is not a valid float")
 
 
 def _get_int(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None or value.strip() == "":
         return default
-    return int(value)
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"Environment variable {name}={value!r} is not a valid integer")
 
 
 def _none_if_blank(value: str | None) -> str | None:
@@ -294,7 +301,10 @@ def _get_int_list(name: str, default: list[int]) -> list[int]:
     value = os.getenv(name)
     if value is None or value.strip() == "":
         return list(default)
-    return [int(item.strip()) for item in value.split(",") if item.strip()]
+    try:
+        return [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError:
+        raise ValueError(f"Environment variable {name}={value!r} contains a non-integer value")
 
 
 def load_settings(dotenv_path: str | None = None) -> Settings:
@@ -485,9 +495,8 @@ def load_settings(dotenv_path: str | None = None) -> Settings:
         "s3_logs_prefix": os.getenv("S3_LOGS_PREFIX", "logs/"),
         "s3_logs_region": os.getenv("S3_LOGS_REGION", os.getenv("AWS_REGION", "us-east-1")),
         "s3_logs_endpoint_url": os.getenv("S3_LOGS_ENDPOINT_URL", ""),
-        "aws_access_key_id": _none_if_blank(os.getenv("AWS_ACCESS_KEY_ID")),
-        "aws_secret_access_key": _none_if_blank(os.getenv("AWS_SECRET_ACCESS_KEY")),
-        "aws_session_token": _none_if_blank(os.getenv("AWS_SESSION_TOKEN")),
+        # AWS credentials are intentionally omitted. boto3 uses its standard
+        # discovery chain (env vars → ~/.aws/credentials → instance metadata).
     }
     # Alias deprecated min_entry_factors into breakout_min_true_factor_count so
     # the engine actually respects the setting.

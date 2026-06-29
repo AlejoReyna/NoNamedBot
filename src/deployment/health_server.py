@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
+import os
+import re
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -16,6 +20,33 @@ if TYPE_CHECKING:
     from src.deployment.health_state import HealthState
 
 LOGGER = logging.getLogger(__name__)
+
+# Request body limits
+_MAX_BODY_BYTES = 8_192
+_MAX_MESSAGE_BYTES = 4_096
+
+# Per-IP rate limit for POST /api/chat: 30 requests per 60 seconds
+_RATE_LIMIT = 30
+_RATE_WINDOW = 60.0
+_rate_data: dict[str, tuple[int, float]] = {}
+_rate_lock = threading.Lock()
+
+# session_id must be alphanumeric + hyphen/underscore, max 64 chars
+_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
+
+
+def _check_rate(ip: str) -> bool:
+    """Return True if the IP is within the rate limit window."""
+    now = time.monotonic()
+    with _rate_lock:
+        count, start = _rate_data.get(ip, (0, now))
+        if now - start > _RATE_WINDOW:
+            _rate_data[ip] = (1, now)
+            return True
+        if count >= _RATE_LIMIT:
+            return False
+        _rate_data[ip] = (count + 1, start)
+        return True
 
 
 def _tail_lines(path: Path, n: int = 50) -> list[str]:
@@ -44,11 +75,29 @@ def start_health_server(
         def log_message(self, format: str, *args: object) -> None:
             LOGGER.debug("health %s - %s", self.address_string(), format % args)
 
+        def _check_auth(self) -> bool:
+            """Timing-safe Bearer token check. Passes when HEALTH_API_TOKEN is unset (dev mode)."""
+            token = os.getenv("HEALTH_API_TOKEN", "").strip()
+            if not token:
+                return True
+            header = self.headers.get("Authorization", "")
+            provided = header.removeprefix("Bearer ").strip()
+            if not provided:
+                return False
+            return hmac.compare_digest(token.encode(), provided.encode())
+
+        def _send_security_headers(self) -> None:
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+
         def _send_json(self, payload: dict, status: int = 200) -> None:
             body = json.dumps(payload, indent=2).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self._send_security_headers()
             self.end_headers()
             self.wfile.write(body)
 
@@ -57,6 +106,7 @@ def start_health_server(
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(encoded)))
+            self._send_security_headers()
             self.end_headers()
             self.wfile.write(encoded)
 
@@ -67,6 +117,9 @@ def start_health_server(
                 self._send_json({"error": "static/chat.html not found"}, status=404)
 
         def do_GET(self) -> None:
+            if not self._check_auth():
+                self._send_json({"error": "unauthorized"}, status=401)
+                return
             path = self.path.split("?", 1)[0]
             if path in ("/", "/chat"):
                 self._serve_chat()
@@ -98,16 +151,43 @@ def start_health_server(
             if not path.startswith("/api/chat"):
                 self._send_json({"error": "not found"}, status=404)
                 return
-            length = int(self.headers.get("Content-Length", "0") or "0")
+
+            # Rate limit before auth to prevent timing oracle on auth check
+            if not _check_rate(self.client_address[0]):
+                self._send_json({"error": "too many requests"}, status=429)
+                return
+
+            if not self._check_auth():
+                self._send_json({"error": "unauthorized"}, status=401)
+                return
+
+            try:
+                raw_length = int(self.headers.get("Content-Length", "0") or "0")
+            except ValueError:
+                raw_length = 0
+            length = min(raw_length, _MAX_BODY_BYTES)
             raw = self.rfile.read(length) if length > 0 else b"{}"
+
             try:
                 body = json.loads(raw.decode("utf-8"))
             except json.JSONDecodeError:
                 self._send_json({"error": "invalid json"}, status=400)
                 return
+
+            # Validate session_id format before using it as a dict key
+            session_id = str(body.get("session_id", "default"))
+            if not _SESSION_ID_RE.match(session_id):
+                self._send_json({"error": "invalid session_id"}, status=400)
+                return
+
+            msg = str(body.get("message", ""))
+            if len(msg.encode("utf-8")) > _MAX_MESSAGE_BYTES:
+                self._send_json({"error": "message too long"}, status=413)
+                return
+
             reply = build_chat_reply(
-                str(body.get("message", "")),
-                session_id=str(body.get("session_id", "default")),
+                msg,
+                session_id=session_id,
                 health_snapshot=state.snapshot(),
                 decision_log_path=decision_path,
             )
